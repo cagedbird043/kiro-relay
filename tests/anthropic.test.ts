@@ -148,3 +148,18 @@ describe("Anthropic request validation", () => {
     }).messages).toBeDefined();
   });
 });
+
+test("keeps contiguous tool indexes distinct and reuses duplicate starts", async () => {
+  const out = await openAIStreamToAnthropic(upstream([
+    JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "one", function: { name: "first", arguments: "A" } }] } }] }),
+    JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: "1" } }, { index: 1, id: "two", function: { name: "second", arguments: "B" } }] } }] }),
+    JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 1, function: { arguments: "2" } }] } }] }), "[DONE]",
+  ])).text();
+  const es = events(out); const starts = es.filter((e) => e.event === "content_block_start");
+  expect(starts).toHaveLength(2);
+  expect(starts[0].data.content_block).toMatchObject({ type: "tool_use", id: "one", name: "first" });
+  expect(starts[1].data.content_block).toMatchObject({ type: "tool_use", id: "two", name: "second" });
+  expect(starts.map((e) => e.data.index)).toEqual([0, 1]);
+  const deltas = es.filter((e) => e.event === "content_block_delta").map((e) => [e.data.index, e.data.delta.partial_json]);
+  expect(deltas).toEqual([[0, "A"], [0, "1"], [1, "B"], [1, "2"]]);
+});

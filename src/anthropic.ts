@@ -69,13 +69,21 @@ export function openAIStreamToAnthropic(response: Response, model = "unknown"): 
       let input = 0; let output = 0; let cacheRead: number | undefined; let cacheCreation: number | undefined; let reason = "end_turn"; let started = false; let terminal = false; let ended = false;
       const emit = (event: string, data: Json) => { if (!ended) controller.enqueue(encoder.encode(sse(event, data))); };
       const close = (index: number) => { if (!closed.has(index)) { closed.add(index); emit("content_block_stop", { type: "content_block_stop", index }); if (active === index) { active = undefined; activeType = undefined; } } };
-      const ensure = (type: string, extra: Json = {}, preferred?: number): number => {
-        if (active !== undefined && activeType === type && !closed.has(active)) return active;
-        if (preferred !== undefined && blocks[preferred] && !closed.has(preferred) && activeType === type) { active = preferred; return preferred; }
+      const ensure = (type: string, extra: Json = {}, forceFresh = false): number => {
+        if (!forceFresh && active !== undefined && activeType === type && !closed.has(active)) return active;
         if (active !== undefined && !closed.has(active)) close(active);
         const index = blocks.length; active = index; activeType = type; blocks[index] = { type, ...extra };
         const contentBlock: Json = { type, ...extra, ...(type === "text" ? { text: "" } : {}), ...(type === "thinking" ? { thinking: "" } : {}), ...(type === "tool_use" ? { input: {} } : {}) };
         emit("content_block_start", { type: "content_block_start", index, content_block: contentBlock }); return index;
+      };
+      const ensureTool = (eventIndex: number, extra: Json): number => {
+        const mapped = toolBlocks.get(eventIndex);
+        if (mapped !== undefined) {
+          if (closed.has(mapped)) throw new Error(`tool index ${eventIndex} is already closed`);
+          if (active !== mapped) { if (active !== undefined && !closed.has(active)) close(active); active = mapped; activeType = "tool_use"; }
+          return mapped;
+        }
+        return ensure("tool_use", extra);
       };
       const finish = () => { if (ended) return; ended = true; if (!started) { started = true; controller.enqueue(encoder.encode(sse("message_start", { type: "message_start", message: { id: messageId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }))); } blocks.forEach((_b, i) => { if (!closed.has(i)) { closed.add(i); controller.enqueue(encoder.encode(sse("content_block_stop", { type: "content_block_stop", index: i }))); } }); const usage: Json = { input_tokens: input, output_tokens: output }; if (cacheRead !== undefined) usage.cache_read_input_tokens = cacheRead; if (cacheCreation !== undefined) usage.cache_creation_input_tokens = cacheCreation; controller.enqueue(encoder.encode(sse("message_delta", { type: "message_delta", delta: { stop_reason: reason, stop_sequence: null }, usage }))); controller.enqueue(encoder.encode(sse("message_stop", { type: "message_stop" }))); controller.close(); };
       const fail = (error: unknown) => { if (ended) return; ended = true; if (!started) { started = true; controller.enqueue(encoder.encode(sse("message_start", { type: "message_start", message: { id: messageId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }))); } const message = error instanceof Error ? error.message : "upstream stream failed"; controller.enqueue(encoder.encode(sse("error", { type: "error", error: { type: "api_error", message } }))); try { controller.close(); } catch {} };
@@ -85,8 +93,8 @@ export function openAIStreamToAnthropic(response: Response, model = "unknown"): 
         else if (event.type === "thinking_delta") { const index = ensure("thinking"); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: event.thinking } }); }
         else if (event.type === "thinking_signature") { const index = (activeType === "thinking" && active !== undefined && !closed.has(active)) ? active : [...blocks].map((b, i) => [b, i] as const).reverse().find(([b, i]) => b.type === "thinking" && !closed.has(i))?.[1]; if (index !== undefined) { blocks[index].signature = event.signature; emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "signature_delta", signature: event.signature } }); } }
         else if (event.type === "text_delta") { const index = ensure("text"); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: event.text } }); }
-        else if (event.type === "tool_start") { const prior = toolBlocks.get(event.index); const index = ensure("tool_use", { id: event.id, name: event.name }, prior); toolBlocks.set(event.index, index); }
-        else if (event.type === "tool_input_delta") { const prior = toolBlocks.get(event.index); const index = ensure("tool_use", {}, prior); toolBlocks.set(event.index, index); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: event.delta } }); }
+        else if (event.type === "tool_start") { const mapped = toolBlocks.get(event.index); const index = mapped === undefined ? ensure("tool_use", { id: event.id, name: event.name }, true) : ensureTool(event.index, { id: event.id, name: event.name }); toolBlocks.set(event.index, index); }
+        else if (event.type === "tool_input_delta") { const mapped = toolBlocks.get(event.index); if (mapped === undefined || closed.has(mapped)) throw new Error(`unknown or closed tool index ${event.index}`); const index = ensureTool(event.index, {}); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: event.delta } }); }
         else if (event.type === "usage") { input = event.inputTokens; output = event.outputTokens; cacheRead = event.cacheReadInputTokens; cacheCreation = event.cacheCreationInputTokens; }
         else if (event.type === "stop") { reason = event.reason; terminal = true; }
       } if (terminal) finish(); else throw new Error("Kiro stream ended before terminal event"); } catch (error) { fail(error); } finally { clearInterval(timer); }
