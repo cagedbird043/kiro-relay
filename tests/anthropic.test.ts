@@ -126,6 +126,9 @@ describe("Anthropic request validation", () => {
       [{ messages: [{ role: "user", content: [{ type: "document", source: {} }] }] }, "document"],
       [{ messages: [{ role: "user", content: [{ type: "image", source: { type: "url", url: "https://example.com/a.png" } }] }] }, "remote image"],
       [{ messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: [{ type: "image", source: { type: "base64", data: "AA==" } }] }] }] }, "structured tool_result"],
+      [{ messages: [{ role: "user", content: [{ type: "tool_result", content: ["raw"] }] }] }, "structured tool_result"],
+      [{ messages: [{ role: "user", content: [{ type: "tool_result", content: [{ type: "text" }] }] }] }, "structured tool_result"],
+      [{ messages: [{ role: "user", content: [{ type: "tool_result", content: [{ type: "text", text: 42 }] }] }] }, "structured tool_result"],
     ] as const;
     for (const [input, message] of cases) {
       expect(() => anthropicToOpenAI(input as unknown as Record<string, unknown>)).toThrow(message);
@@ -138,6 +141,7 @@ describe("Anthropic request validation", () => {
         { role: "assistant", content: [{ type: "thinking", thinking: "prior", signature: "sig" }] },
         { role: "user", content: [
           { type: "text", text: "hello" },
+          { type: "tool_result", tool_use_id: "id", content: [{ type: "text", text: "done" }] },
           { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } },
         ] },
       ],
