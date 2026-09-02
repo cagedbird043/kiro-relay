@@ -8,3 +8,13 @@ Copyright (c) 2026 diegosouzapw
 
 The copied Kiro protocol implementation has been trimmed to remove OmniRoute's
 router, database, dashboard, compression, and multi-provider control plane.
+
+Protocol test fixtures are adapted from OpenAI Codex.
+
+Source: https://github.com/openai/codex
+Baseline commit: bdfd769640927a627dd48ab3fcc1ae8bc08bdd0a
+License: Apache-2.0
+Copyright 2025 OpenAI
+
+Only minimal Responses API request and SSE transcript fixtures are retained;
+the Codex source tree is not a build or runtime dependency.

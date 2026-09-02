@@ -20,8 +20,9 @@ export type KiroResponsesPayload = {
   conversationState: { chatTriggerType: "MANUAL"; conversationId: string; currentMessage: { userInputMessage: { content: string; modelId: string; origin: "AI_EDITOR"; images?: Array<{ format: string; source: { bytes: string } }>; userInputMessageContext?: { tools?: unknown[]; toolResults?: unknown[]; toolChoice?: unknown } } }; history: unknown[] };
   profileArn?: string;
   inferenceConfig?: { maxTokens?: number };
-  additionalModelRequestFields?: { reasoning: { effort: string } };
+  additionalModelRequestFields?: { reasoning: { effort: string; summary?: string } };
   _toolNameMap?: Record<string, string>;
+  _responseToolMetadata?: Record<string, { name: string; namespace?: string; custom: boolean }>;
 };
 
 const UUID_NAMESPACE = "34f7193f-561d-4050-bc84-9547d953d6bf";
@@ -148,6 +149,63 @@ function outputText(value: unknown): string {
   throw new Error("function_call_output output must be text or content parts");
 }
 
+
+function flattenToolDefinitions(
+  definitions: unknown[],
+  output: Obj[],
+  metadata: Record<string, { name: string; namespace?: string; custom: boolean }>,
+  seenNames: Record<string, true>,
+  namespace?: string
+): void {
+  for (const value of definitions) {
+    if (!isObj(value) || typeof value.type !== "string") {
+      throw new Error("Invalid tool definition");
+    }
+    if (value.type === "namespace") {
+      if (typeof value.name !== "string" || !value.name || !Array.isArray(value.tools)) {
+        throw new Error("namespace tool requires name and tools");
+      }
+      flattenToolDefinitions(value.tools, output, metadata, seenNames, value.name);
+      continue;
+    }
+    if (value.type !== "function" && value.type !== "custom") {
+      throw new Error(`Unsupported tool type: ${value.type}`);
+    }
+    if (typeof value.name !== "string" || !value.name) {
+      throw new Error(`${value.type} tool requires a name`);
+    }
+    const originalName = value.name;
+    const flattenedName = namespace ? `${namespace}__${originalName}` : originalName;
+    if (seenNames[flattenedName]) throw new Error(`Duplicate tool: ${flattenedName}`);
+    seenNames[flattenedName] = true;
+    if (namespace || value.type === "custom") {
+      metadata[flattenedName] = {
+        name: originalName,
+        ...(namespace ? { namespace } : {}),
+        custom: value.type === "custom",
+      };
+    }
+    if (value.type === "function") {
+      output.push({ ...value, name: flattenedName });
+      continue;
+    }
+    const formatDescription = isObj(value.format)
+      ? `\n\nCustom tool input format: ${JSON.stringify(value.format)}`
+      : "";
+    output.push({
+      type: "function",
+      name: flattenedName,
+      description:
+        (typeof value.description === "string" ? value.description : "") + formatDescription,
+      parameters: {
+        type: "object",
+        properties: { input: { type: "string" } },
+        required: ["input"],
+        additionalProperties: false,
+      },
+    });
+  }
+}
 /** Build the exact conversationState wire payload consumed by the Kiro executor. */
 export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequest, stream: boolean, credentials: ProviderCredentials): KiroResponsesPayload {
   void stream;
@@ -168,6 +226,7 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
     throw new Error("prompt_cache_key must be a string");
   }
   let reasoningEffort = "";
+  let reasoningSummary = "";
   if (body.reasoning !== undefined && body.reasoning !== null) {
     if (
       !isObj(body.reasoning) ||
@@ -179,6 +238,20 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
       );
     }
     reasoningEffort = EFFORTS[body.reasoning.effort];
+    if (body.reasoning.summary !== undefined && body.reasoning.summary !== null) {
+      const validSummaries: Readonly<Record<string, true>> = {
+        auto: true,
+        concise: true,
+        detailed: true,
+      };
+      if (
+        typeof body.reasoning.summary !== "string" ||
+        !Object.hasOwn(validSummaries, body.reasoning.summary)
+      ) {
+        throw new Error("reasoning.summary must be auto, concise, or detailed");
+      }
+      reasoningSummary = body.reasoning.summary;
+    }
   }
   if (body.max_output_tokens !== undefined && body.max_output_tokens !== null && (typeof body.max_output_tokens !== "number" || !Number.isInteger(body.max_output_tokens) || body.max_output_tokens < 1)) throw new Error("max_output_tokens must be a positive integer");
   const rawInput = body.input ?? "";
@@ -191,6 +264,7 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   let lastUser:
     | { inputIndex: number; historyIndex: number; parts: InputParts }
     | undefined;
+  const additionalToolDefinitions: unknown[] = [];
   let lastToolOutputIndex = -1;
   let lastAssistantInputIndex = -1;
   for (let i = 0; i < items.length; i++) {
@@ -200,14 +274,21 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
       : typeof item.role === "string"
         ? "message"
         : undefined;
+    if (type === "additional_tools") {
+      if (item.role !== "developer" || !Array.isArray(item.tools)) {
+        throw new Error("additional_tools requires developer role and tools");
+      }
+      additionalToolDefinitions.push(...item.tools);
+      continue;
+    }
     if (type === "reasoning") {
       validateReasoningHistoryItem(item);
       lastAssistantInputIndex = i;
       continue;
     }
-    if (type === "function_call_output") {
+    if (type === "function_call_output" || type === "custom_tool_call_output") {
       if (typeof item.call_id !== "string" || !item.call_id) {
-        throw new Error("function_call_output requires call_id");
+        throw new Error(`${type} requires call_id`);
       }
       toolResults.push({
         toolUseId: item.call_id,
@@ -217,20 +298,32 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
       lastToolOutputIndex = i;
       continue;
     }
-    if (type === "function_call") {
+    if (type === "function_call" || type === "custom_tool_call") {
       if (
         typeof item.call_id !== "string" ||
         !item.call_id ||
         typeof item.name !== "string" ||
         !item.name
       ) {
-        throw new Error("function_call requires call_id and name");
+        throw new Error(`${type} requires call_id and name`);
       }
+      const input =
+        type === "custom_tool_call"
+          ? typeof item.input === "string"
+            ? { input: item.input }
+            : (() => {
+                throw new Error("custom_tool_call input must be a string");
+              })()
+          : functionInput(item.arguments);
+      const historyName =
+        typeof item.namespace === "string" && item.namespace
+          ? `${item.namespace}__${item.name}`
+          : item.name;
       lastAssistantInputIndex = i;
       appendAssistantHistory(history, "", {
         toolUseId: item.call_id,
-        name: item.name,
-        input: functionInput(item.arguments),
+        name: historyName,
+        input,
       });
       continue;
     }
@@ -257,14 +350,41 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
     current = lastUser.parts;
     history.splice(lastUser.historyIndex, 1);
   }
-  const instruction = typeof body.instructions === "string" && body.instructions ? `<system-reminder>\n${body.instructions}\n</system-reminder>\n\n` : "";
+  const instruction =
+    typeof body.instructions === "string" && body.instructions
+      ? `<system-reminder>\n${body.instructions}\n</system-reminder>\n\n`
+      : "";
   const context: { tools?: unknown[]; toolResults?: unknown[]; toolChoice?: unknown } = {};
   if (toolResults.length) context.toolResults = toolResults;
   if (body.tool_choice !== undefined) { const c = body.tool_choice; if (c === "auto") context.toolChoice = { auto: {} }; else if (c === "required") context.toolChoice = { any: {} }; else if (c === "none") context.toolChoice = { none: {} }; else if (isObj(c) && c.type === "function" && typeof c.name === "string" && c.name) context.toolChoice = { tool: { name: c.name } }; else throw new Error("Invalid tool_choice"); }
+  const declaredTools: unknown[] = [];
+  if (body.tools !== undefined && body.tools !== null) {
+    if (!Array.isArray(body.tools)) throw new Error("tools must be an array");
+    declaredTools.push(...body.tools);
+  }
+  declaredTools.push(...additionalToolDefinitions);
   let nameMap: Record<string, string> | undefined;
-  if (body.tools !== undefined) { if (!Array.isArray(body.tools)) throw new Error("tools must be an array"); for (const tool of body.tools) { if (!isObj(tool) || tool.type !== "function") throw new Error("Only function tools are supported"); }
-    const tools = body.tools.map((tool) => { const raw: unknown = tool; const fn = isObj(raw) && isObj(raw.function) ? raw.function : raw; if (!isObj(fn) || typeof fn.name !== "string" || !fn.name) throw new Error("function tool requires a name"); return { toolSpecification: { name: fn.name, description: typeof fn.description === "string" ? fn.description : undefined, inputSchema: { json: isObj(fn.parameters) ? fn.parameters : { type: "object", properties: {} } } } }; });
-    const sanitized = sanitizeKiroTools(tools); context.tools = sanitized.tools; if (sanitized.nameMap.size) nameMap = Object.fromEntries(sanitized.nameMap);
+  let responseToolMetadata: Record<string, { name: string; namespace?: string; custom: boolean }> | undefined;
+  if (declaredTools.length) {
+    const flattened: Obj[] = [];
+    const metadata: Record<string, { name: string; namespace?: string; custom: boolean }> = {};
+    flattenToolDefinitions(declaredTools, flattened, metadata, {});
+    const tools = flattened.map((tool) => {
+      const fn = isObj(tool.function) ? tool.function : tool;
+      if (typeof fn.name !== "string" || !fn.name) throw new Error("function tool requires a name");
+      return { toolSpecification: { name: fn.name, description: typeof fn.description === "string" ? fn.description : undefined, inputSchema: { json: isObj(fn.parameters) ? fn.parameters : { type: "object", properties: {} } } } };
+    });
+    const sanitized = sanitizeKiroTools(tools);
+    context.tools = sanitized.tools;
+    if (sanitized.nameMap.size) nameMap = Object.fromEntries(sanitized.nameMap);
+    const restoredMetadata: Record<string, { name: string; namespace?: string; custom: boolean }> = {};
+    for (const tool of sanitized.tools) {
+      const sanitizedName = tool.toolSpecification.name;
+      const flattenedName = sanitized.nameMap.get(sanitizedName) ?? sanitizedName;
+      const toolMetadata = metadata[flattenedName];
+      if (toolMetadata) restoredMetadata[flattenedName] = toolMetadata;
+    }
+    if (Object.keys(restoredMetadata).length) responseToolMetadata = restoredMetadata;
   }
   const conversationSeed =
     typeof body.prompt_cache_key === "string" && body.prompt_cache_key
@@ -296,7 +416,14 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   const profileArn = credentials.providerSpecificData?.profileArn; if (typeof profileArn === "string" && profileArn) payload.profileArn = profileArn;
   if (typeof body.max_output_tokens === "number") payload.inferenceConfig = { maxTokens: body.max_output_tokens };
   if (reasoningEffort) {
-    payload.additionalModelRequestFields = { reasoning: { effort: reasoningEffort } };
+    payload.additionalModelRequestFields = {
+      reasoning: {
+        effort: reasoningEffort,
+        ...(reasoningSummary ? { summary: reasoningSummary } : {}),
+      },
+    };
   }
-  if (nameMap) payload._toolNameMap = nameMap; return payload;
+  if (nameMap) payload._toolNameMap = nameMap;
+  if (responseToolMetadata) payload._responseToolMetadata = responseToolMetadata;
+  return payload;
 }

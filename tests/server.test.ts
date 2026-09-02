@@ -33,6 +33,14 @@ describe("server routes", () => {
           { id: "claude-opus-5", object: "model", context_length: 1_000_000 },
           { id: "gpt-5.6-sol", object: "model", context_length: 272_000 },
         ],
+        models: [
+          {
+            slug: "gpt-5.6-sol",
+            base_instructions: "You are Codex, a coding agent based on GPT-5.",
+            use_responses_lite: true,
+            context_window: 272_000,
+          },
+        ],
       });
       expect((await handler(request("/v1/messages/count_tokens", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }))).status).toBe(200);
     } finally { await rm(f.dir, { recursive: true, force: true }); }
@@ -149,7 +157,7 @@ describe("server routes", () => {
       );
       expect(response.status).toBe(200);
       const payload = JSON.stringify(seen[0]?.body);
-      expect(payload).toContain('"reasoning":{"effort":"max"}');
+      expect(payload).toContain('"reasoning":{"effort":"max","summary":"auto"}');
       expect(payload).toContain('"content":"working","toolUses"');
       expect(payload).toContain('"toolUseId":"call_read"');
     } finally {

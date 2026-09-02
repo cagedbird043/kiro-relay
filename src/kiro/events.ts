@@ -3,6 +3,7 @@ export type KiroEvent =
   | { type: "start"; model: string; responseId?: string }
   | { type: "text_delta"; text: string }
   | { type: "thinking_delta"; thinking: string }
+  | { type: "thinking_signature"; signature: string }
   | { type: "tool_start"; index: number; id: string; name: string }
   | { type: "tool_input_delta"; index: number; delta: string }
   | { type: "usage"; inputTokens: number; outputTokens: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number }
@@ -54,6 +55,8 @@ export async function* readKiroEvents(response: Response, model: string): AsyncG
     const delta = isRecord(choice.delta) ? choice.delta : isRecord(choice.message) ? choice.message : {};
     const reasoning = str(delta.reasoning_content) ?? str(delta.thinking);
     if (reasoning) out.push({ type: "thinking_delta", thinking: reasoning });
+    const signature = str(delta.reasoning_signature);
+    if (signature) out.push({ type: "thinking_signature", signature });
     const text = typeof delta.content === "string" ? delta.content : isRecord(delta.content) ? str(delta.content.text) : undefined;
     if (text) out.push({ type: "text_delta", text });
     const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];

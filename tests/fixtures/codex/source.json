@@ -1,0 +1,11 @@
+{
+  "source": "https://github.com/openai/codex",
+  "commit": "bdfd769640927a627dd48ab3fcc1ae8bc08bdd0a",
+  "license": "Apache-2.0",
+  "references": [
+    "codex-rs/core/tests/suite/responses_lite.rs:79-168",
+    "codex-rs/core/tests/common/responses.rs:468-525,975-1002,1666-1674",
+    "codex-rs/app-server/tests/suite/v2/code_mode_host.rs:75-100,162-178,203-233,269-285",
+    "codex-rs/core/tests/suite/cli_stream.rs:217-240"
+  ]
+}

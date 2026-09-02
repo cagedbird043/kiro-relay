@@ -1,0 +1,60 @@
+{
+  "model": "gpt-5.6-luna",
+  "instructions": "",
+  "input": [
+    {
+      "type": "additional_tools",
+      "id": "at_fixture",
+      "role": "developer",
+      "tools": [
+        {
+          "type": "namespace",
+          "name": "functions",
+          "description": "",
+          "tools": [
+            {
+              "type": "custom",
+              "name": "exec",
+              "description": "Execute JavaScript tool orchestration code.",
+              "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: SOURCE\nSOURCE: /[\\s\\S]+/"
+              }
+            },
+            {
+              "type": "function",
+              "name": "wait",
+              "description": "Wait for a running cell.",
+              "strict": false,
+              "parameters": {
+                "type": "object",
+                "properties": { "cell_id": { "type": "string" } },
+                "required": ["cell_id"],
+                "additionalProperties": false
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "id": "msg_developer_fixture",
+      "role": "developer",
+      "content": [{ "type": "input_text", "text": "Fixture instructions" }]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [{ "type": "input_text", "text": "Inspect the repository" }]
+    }
+  ],
+  "tools": null,
+  "tool_choice": "auto",
+  "reasoning": { "effort": "max", "summary": "auto" },
+  "store": false,
+  "stream": true,
+  "include": ["reasoning.encrypted_content"],
+  "prompt_cache_key": "codex-fixture"
+}

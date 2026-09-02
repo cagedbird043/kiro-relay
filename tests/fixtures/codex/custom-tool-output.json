@@ -1,0 +1,5 @@
+{
+  "type": "custom_tool_call_output",
+  "call_id": "call_fixture",
+  "output": [{ "type": "input_text", "text": "fixture-ok" }]
+}

@@ -32,7 +32,7 @@ test("sanitizes function tools and rejects hosted/stateful features", () => {
   const tool = p.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools?.[0] as { toolSpecification: { inputSchema: { json: Record<string, unknown> } } };
   assert.deepEqual(tool.toolSpecification.inputSchema.json.required, []);
   assert.throws(() => buildKiroResponsesPayload(model, req({ background: true }), false, {}), /Unsupported Responses field/);
-  assert.throws(() => buildKiroResponsesPayload(model, req({ tools: [{ type: "web_search" }]}), false, {}), /Only function tools/);
+  assert.throws(() => buildKiroResponsesPayload(model, req({ tools: [{ type: "web_search" }]}), false, {}), /Unsupported tool type/);
 });
 
 
@@ -56,7 +56,9 @@ test("accepts OMP stateless defaults and cache keys", () => {
     {}
   );
   assert.equal(first.conversationState.conversationId, second.conversationState.conversationId);
-  assert.deepEqual(first.additionalModelRequestFields, { reasoning: { effort: "low" } });
+  assert.deepEqual(first.additionalModelRequestFields, {
+    reasoning: { effort: "low", summary: "auto" },
+  });
   assert.throws(
     () => buildKiroResponsesPayload(model, req({ store: true }), false, {}),
     /storage is not supported/
@@ -98,7 +100,9 @@ test("accepts OMP reasoning history and merges assistant tool calls", () => {
     {}
   );
 
-  assert.deepEqual(payload.additionalModelRequestFields, { reasoning: { effort: "max" } });
+  assert.deepEqual(payload.additionalModelRequestFields, {
+    reasoning: { effort: "max", summary: "auto" },
+  });
   assert.deepEqual(payload.conversationState.history, [
     {
       userInputMessage: {
@@ -127,6 +131,71 @@ test("accepts OMP reasoning history and merges assistant tool calls", () => {
       },
     ]
   );
+});
+
+test("flattens Codex additional namespace and custom tools", () => {
+  const payload = buildKiroResponsesPayload(
+    model,
+    req({
+      input: [
+        { role: "user", content: "inspect" },
+        {
+          type: "additional_tools",
+          role: "developer",
+          tools: [
+            {
+              type: "namespace",
+              name: "functions",
+              description: "Codex tools",
+              tools: [
+                {
+                  type: "custom",
+                  name: "exec",
+                  description: "Execute JavaScript",
+                  format: { type: "grammar", syntax: "lark", definition: "start: SOURCE" },
+                },
+              ],
+            },
+            {
+              type: "function",
+              name: "wait",
+              description: "Wait for a cell",
+              parameters: { type: "object", properties: { cell_id: { type: "string" } } },
+            },
+          ],
+        },
+      ],
+    }),
+    false,
+    {}
+  );
+  const tools =
+    payload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools;
+  expect(JSON.stringify(tools)).toContain('"name":"functions__exec"');
+  expect(JSON.stringify(tools)).toContain('"name":"wait"');
+  expect(JSON.stringify(tools)).toContain('"input":{"type":"string"}');
+  expect(payload._responseToolMetadata).toEqual({
+    functions__exec: { name: "exec", namespace: "functions", custom: true },
+  });
+});
+
+test("accepts custom tool call outputs", () => {
+  const payload = buildKiroResponsesPayload(
+    model,
+    req({
+      input: [
+        { type: "custom_tool_call", call_id: "call_exec", name: "exec", input: "text('ok')" },
+        { type: "custom_tool_call_output", call_id: "call_exec", output: "ok" },
+      ],
+    }),
+    false,
+    {}
+  );
+  expect(
+    payload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults
+  ).toEqual([
+    { toolUseId: "call_exec", status: "success", content: [{ text: "ok" }] },
+  ]);
 });
 test("rejects unsupported models and malformed boundaries", () => {
   assert.throws(() => buildKiroResponsesPayload("gpt-5.6", req(), false, {}), /native-reasoning/);

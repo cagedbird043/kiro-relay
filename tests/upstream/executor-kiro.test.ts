@@ -510,6 +510,32 @@ test("KiroExecutor.transformEventStreamToSSE surfaces native reasoning frames as
   assert.match(content, /The answer is 42\./, "normal content must still flow");
 });
 
+
+test("KiroExecutor suppresses placeholder reasoning and preserves its signature", async () => {
+  const executor = new KiroExecutor();
+  const response = buildEventStreamResponse([
+    buildEventFrame("reasoningContentEvent", { text: "...", signature: "kiro-signature" }),
+    buildEventFrame("assistantResponseEvent", { content: "Answer" }),
+  ]);
+
+  const transformed = executor.transformEventStreamToSSE(response, "gpt-5.6-luna");
+  const chunks = parseSSEJsonChunks(await transformed.text());
+  const reasoning = chunks
+    .map((chunk) => chunk.choices?.[0]?.delta?.reasoning_content)
+    .filter(Boolean)
+    .join("");
+  const content = chunks
+    .map((chunk) => chunk.choices?.[0]?.delta?.content)
+    .filter(Boolean)
+    .join("");
+  const signature = chunks
+    .map((chunk) => chunk.choices?.[0]?.delta?.reasoning_signature)
+    .find(Boolean);
+
+  assert.equal(reasoning, "");
+  assert.equal(content, "Answer");
+  assert.equal(signature, "kiro-signature");
+});
 test("KiroExecutor.transformEventStreamToSSE parses fragmented frames and waits for post-stop usage", async () => {
   const executor = new KiroExecutor();
   const bytes = concatArrays(

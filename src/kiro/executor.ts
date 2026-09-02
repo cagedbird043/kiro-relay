@@ -612,12 +612,20 @@ export class KiroExecutor extends BaseExecutor {
                 } else if (typeof rp?.text === "string") {
                   nativeReasoning = rp.text as string;
                 }
-                if (nativeReasoning) {
-                  state.hasReasoningContent = true;
-                  const reasoningDelta: JsonRecord =
-                    (state.reasoningChunkCount ?? 0) === 0 && chunkIndex === 0
-                      ? { role: "assistant", reasoning_content: nativeReasoning }
-                      : { reasoning_content: nativeReasoning };
+                const signature = typeof rp?.signature === "string" ? rp.signature : undefined;
+                const visibleNativeReasoning =
+                  nativeReasoning.trim() === "..." ? "" : nativeReasoning;
+                if (visibleNativeReasoning || signature) {
+                  if (visibleNativeReasoning) state.hasReasoningContent = true;
+                  const reasoningDelta: JsonRecord = {
+                    ...(visibleNativeReasoning
+                      ? { reasoning_content: visibleNativeReasoning }
+                      : {}),
+                    ...(signature ? { reasoning_signature: signature } : {}),
+                  };
+                  if ((state.reasoningChunkCount ?? 0) === 0 && chunkIndex === 0) {
+                    reasoningDelta.role = "assistant";
+                  }
                   const chunk: JsonRecord = {
                     id: responseId,
                     object: "chat.completion.chunk",
@@ -626,7 +634,9 @@ export class KiroExecutor extends BaseExecutor {
                     choices: [{ index: 0, delta: reasoningDelta, finish_reason: null }],
                   };
                   chunkIndex++;
-                  state.reasoningChunkCount = (state.reasoningChunkCount ?? 0) + 1;
+                  if (visibleNativeReasoning) {
+                    state.reasoningChunkCount = (state.reasoningChunkCount ?? 0) + 1;
+                  }
                   controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(chunk)}\n\n`));
                 }
                 // Consume the reasoning frame (incl. signature-only) so it never
@@ -650,55 +660,46 @@ export class KiroExecutor extends BaseExecutor {
                 // Split it into the OpenAI `reasoning_content` channel so downstream
                 // consumers see the same shape they would get from a native reasoning model.
                 const thinkingState = state.thinking;
-                splitInlineThinking(
-                  thinkingState,
-                  content,
-                  (text) => {
-                    if (!text) return;
-                    const chunk: JsonRecord = {
-                      id: responseId,
-                      object: "chat.completion.chunk",
-                      created,
-                      model,
-                      choices: [
-                        {
-                          index: 0,
-                          delta:
-                            chunkIndex === 0
-                              ? { role: "assistant", content: text }
-                              : { content: text },
-                          finish_reason: null,
-                        },
-                      ],
-                    };
-                    chunkIndex++;
-                    controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                  },
-                  (reasoning) => {
-                    if (!reasoning) return;
-                    state.hasReasoningContent = true;
-                    const reasoningDelta: JsonRecord =
-                      (state.reasoningChunkCount ?? 0) === 0 && chunkIndex === 0
-                        ? { role: "assistant", reasoning_content: reasoning }
-                        : { reasoning_content: reasoning };
-                    const chunk: JsonRecord = {
-                      id: responseId,
-                      object: "chat.completion.chunk",
-                      created,
-                      model,
-                      choices: [
-                        {
-                          index: 0,
-                          delta: reasoningDelta,
-                          finish_reason: null,
-                        },
-                      ],
-                    };
-                    chunkIndex++;
-                    state.reasoningChunkCount = (state.reasoningChunkCount ?? 0) + 1;
-                    controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                  }
-                );
+                const onContent = (text: string) => {
+                  if (!text) return;
+                  const chunk: JsonRecord = {
+                    id: responseId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model,
+                    choices: [
+                      {
+                        index: 0,
+                        delta:
+                          chunkIndex === 0
+                            ? { role: "assistant", content: text }
+                            : { content: text },
+                        finish_reason: null,
+                      },
+                    ],
+                  };
+                  chunkIndex++;
+                  controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                };
+                const onReasoning = (reasoning: string) => {
+                  if (!reasoning) return;
+                  state.hasReasoningContent = true;
+                  const reasoningDelta: JsonRecord =
+                    (state.reasoningChunkCount ?? 0) === 0 && chunkIndex === 0
+                      ? { role: "assistant", reasoning_content: reasoning }
+                      : { reasoning_content: reasoning };
+                  const chunk: JsonRecord = {
+                    id: responseId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model,
+                    choices: [{ index: 0, delta: reasoningDelta, finish_reason: null }],
+                  };
+                  chunkIndex++;
+                  state.reasoningChunkCount = (state.reasoningChunkCount ?? 0) + 1;
+                  controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                };
+                splitInlineThinking(thinkingState, content, onContent, onReasoning);
               } else {
                 const chunk: JsonRecord = {
                   id: responseId,

@@ -6,7 +6,10 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { splitInlineThinking, flushPendingThinking } from "../../src/kiro/thinking.ts";
+import {
+  splitInlineThinking,
+  flushPendingThinking,
+} from "../../src/kiro/thinking.ts";
 
 /** Build a fresh state + recorders for each test. */
 function makeHarness() {
@@ -168,4 +171,5 @@ describe("splitInlineThinking", () => {
     assert.equal(h.content, "just content");
     assert.equal(h.reasoning, "");
   });
+
 });

@@ -13,7 +13,11 @@ import {
   buildKiroResponsesPayload,
   type KiroResponsesRequest,
 } from "./responses/request.ts";
-import { collectResponses, responsesStream } from "./responses/response.ts";
+import {
+  collectResponses,
+  responsesStream,
+  type ResponseToolMetadata,
+} from "./responses/response.ts";
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
 
@@ -65,18 +69,65 @@ function safeErrorMessage(error: unknown, fallback: string): string {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
+
+function responseToolMetadata(payload: unknown): ResponseToolMetadata {
+  if (!isRecord(payload) || !isRecord(payload._responseToolMetadata)) return {};
+  const result: Record<string, { name: string; namespace?: string; custom: boolean }> = {};
+  for (const [toolName, value] of Object.entries(payload._responseToolMetadata)) {
+    if (!isRecord(value) || typeof value.name !== "string" || typeof value.custom !== "boolean") {
+      continue;
+    }
+    if (value.namespace !== undefined && typeof value.namespace !== "string") continue;
+    result[toolName] = {
+      name: value.name,
+      custom: value.custom,
+      ...(typeof value.namespace === "string" ? { namespace: value.namespace } : {}),
+    };
+  }
+  return result;
+}
 export function createHandler(config: AppConfig, executor: ExecutorLike = new KiroExecutor()) {
   return async function handler(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
     if (method === "GET" && url.pathname === "/healthz") return Response.json({ status: "ok" });
     if (method === "GET" && url.pathname === "/v1/models") {
+      const entries = Object.entries(config.models);
       return Response.json({
-        data: Object.entries(config.models).map(([id, spec]) => ({
+        object: "list",
+        data: entries.map(([id, spec]) => ({
           id,
           object: "model",
+          created: 0,
+          owned_by: "kiro",
           context_length: spec.contextLength,
         })),
+        models: entries
+          .filter(([id]) => id.startsWith("gpt-5.6-"))
+          .map(([id, spec], priority) => ({
+            slug: id,
+            display_name: id,
+            description: `Kiro ${id}`,
+            default_reasoning_level: "high",
+            supported_reasoning_levels: ["minimal", "low", "medium", "high", "xhigh", "max"].map(
+              (effort) => ({ effort, description: effort })
+            ),
+            shell_type: "shell_command",
+            visibility: "list",
+            supported_in_api: true,
+            priority,
+            upgrade: null,
+            support_verbosity: false,
+            default_verbosity: null,
+            apply_patch_tool_type: null,
+            truncation_policy: { mode: "bytes", limit: spec.contextLength * 4 },
+            supports_image_detail_original: false,
+            supports_reasoning_summary_parameter: false,
+            context_window: spec.contextLength,
+            base_instructions: "You are Codex, a coding agent based on GPT-5.",
+            experimental_supported_tools: [],
+            use_responses_lite: true,
+          })),
       });
     }
 
@@ -202,9 +253,10 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
     metadataLog("REQUEST", { model, stream, status: result.response.status });
     try {
       if (isResponses) {
+        const responseTools = responseToolMetadata(payload);
         return stream
-          ? responsesStream(result.response, model)
-          : Response.json(await collectResponses(result.response, model));
+          ? responsesStream(result.response, model, responseTools)
+          : Response.json(await collectResponses(result.response, model, responseTools));
       }
       return stream
         ? openAIStreamToAnthropic(result.response, model)

@@ -47,25 +47,19 @@ export type KiroThinkingState = {
 export function splitInlineThinking(
   state: KiroThinkingState,
   raw: string | null | undefined,
-  onContent: (s: string) => void,
-  onReasoning: (s: string) => void
+  onContent: (text: string) => void,
+  onReasoning: (text: string) => void
 ): void {
   let text = (state.pendingTag || "") + (raw || "");
   state.pendingTag = "";
 
-  // Maximum length of an unfinished tag we might still complete on the next
-  // frame: `</thinking>` is the longest at 11 chars.
-  const PARTIAL_MAX = 11;
-
   while (text.length > 0) {
     const target = state.thinkingMode ? "</thinking>" : "<thinking>";
     const idx = text.indexOf(target);
-
     if (idx === -1) {
-      // No full target tag in `text`. Look for a possible partial at the end
-      // so we can complete it on the next frame.
       let holdFrom = text.length;
-      for (let i = Math.max(0, text.length - PARTIAL_MAX); i < text.length; i++) {
+      const partialMax = "</thinking>".length - 1;
+      for (let i = Math.max(0, text.length - partialMax); i < text.length; i++) {
         const tail = text.slice(i);
         if (target.startsWith(tail) && tail.length > 0) {
           holdFrom = i;
@@ -81,8 +75,6 @@ export function splitInlineThinking(
       return;
     }
 
-    // Found a complete target tag. Flush everything before it in the current
-    // mode, flip the mode, and keep walking the remainder.
     const before = text.slice(0, idx);
     if (before) {
       if (state.thinkingMode) onReasoning(before);
