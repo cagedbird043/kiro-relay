@@ -19,7 +19,7 @@ describe("Responses formatter", () => {
       { choices: [{ delta: { content: "lo", tool_calls: [{ index: 0, id: "call_1", function: { name: "lookup", arguments: '{"q":' } }] } }] },
       { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] } }] },
       { usage: { prompt_tokens: 4, completion_tokens: 3, cache_read_input_tokens: 2 }, choices: [{ finish_reason: "tool_calls" }] },
-    ]), "gpt-5.6-sol");
+    ]), "gpt-5.6-sol", {}, { includeEncryptedContent: true });
     expect(result.id).toBe("up_1");
     expect(result.output_text).toBe("hello");
     expect(result.output.map((item) => item.type)).toEqual(["reasoning", "message", "function_call"]);
@@ -38,7 +38,7 @@ describe("Responses formatter", () => {
       { id: "up_2", choices: [{ delta: { reasoning_content: "why", reasoning_signature: "sig_2" } }] },
       { choices: [{ delta: { content: "ok", tool_calls: [{ index: 1, id: "call_2", function: { name: "f", arguments: "{}" } }] } }] },
       { usage: { prompt_tokens: 1, completion_tokens: 2 }, choices: [{ finish_reason: "stop" }] },
-    ]), "gpt-5.6-sol"));
+    ]), "gpt-5.6-sol", {}, { includeEncryptedContent: true }));
     expect(output.filter((e) => e.type === "response.completed")).toHaveLength(1);
     const added = output.filter((e) => e.type === "response.output_item.added");
     const done = output.filter((e) => e.type === "response.output_item.done");
@@ -60,7 +60,7 @@ describe("Responses formatter", () => {
       { choices: [{ delta: { content: "answer" } }] },
       { choices: [{ delta: {}, finish_reason: "stop" }] },
     ]);
-    const result = await collectResponses(response, "gpt-5.6-luna");
+    const result = await collectResponses(response, "gpt-5.6-luna", {}, { includeEncryptedContent: true });
     expect(result.output[0]).toMatchObject({
       type: "reasoning",
       encrypted_content: "opaque-signature",
@@ -74,7 +74,9 @@ describe("Responses formatter", () => {
         { choices: [{ delta: { content: "answer" } }] },
         { choices: [{ delta: {}, finish_reason: "stop" }] },
       ]),
-      "gpt-5.6-luna"
+      "gpt-5.6-luna",
+      {},
+      { includeEncryptedContent: true }
     );
     const events = (await streamed.text())
       .split("\n")
@@ -138,5 +140,38 @@ describe("Responses formatter", () => {
           event.item.type === "custom_tool_call"
       )
     ).toMatchObject({ item: { namespace: "functions", input: 'text("ok")' } });
+  });
+  test("closes signature-less reasoning before text", async () => {
+    const output = await events(responsesStream(upstream([
+      { id: "up_no_sig", choices: [{ delta: { reasoning_content: "thinking" } }] },
+      { choices: [{ delta: { content: "answer" } }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ]), "gpt-5.6-luna"));
+    const done = output.find((event) => event.type === "response.output_item.done" && event.item?.type === "reasoning");
+    const textDelta = output.find((event) => event.type === "response.output_text.delta");
+    expect(done).toBeDefined();
+    expect(output.indexOf(done!)).toBeLessThan(output.indexOf(textDelta!));
+    expect(done?.item).toMatchObject({ summary: [{ type: "summary_text", text: "thinking" }] });
+  });
+
+  test("honors encrypted reasoning include option", async () => {
+    const chunks = [
+      { id: "up_include", choices: [{ delta: { reasoning_signature: "secret" } }] },
+      { choices: [{ delta: { content: "ok" } }] },
+      { choices: [{ delta: {}, finish_reason: "stop" }] },
+    ];
+    const included = await collectResponses(upstream(chunks), "gpt-5.6-luna", {}, { includeEncryptedContent: true });
+    expect(included.output[0]).toHaveProperty("encrypted_content", "secret");
+    const omitted = await collectResponses(upstream(chunks), "gpt-5.6-luna", {}, { includeEncryptedContent: false });
+    expect(omitted.output[0]).not.toHaveProperty("encrypted_content");
+  });
+
+  test("emits failed response event on unexpected EOF", async () => {
+    const output = await events(responsesStream(upstream([
+      { id: "up_failed", choices: [{ delta: { content: "partial" } }] },
+    ]), "gpt-5.6-luna"));
+    expect(output.at(-1)?.type).toBe("response.failed");
+    expect(output.at(-1)?.response).toMatchObject({ id: "up_failed", status: "failed", output_text: "partial" });
+    expect(output.at(-1)).toHaveProperty("sequence_number");
   });
 });

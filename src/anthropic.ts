@@ -23,37 +23,53 @@ export function anthropicToOpenAI(body: Json): Json {
 }
 function makeId(prefix: string): string { try { return `${prefix}_${crypto.randomUUID()}`; } catch { return `${prefix}_${Date.now()}`; } }
 function sse(event: string, data: Json): string { return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`; }
-type Block = { type: string; id?: string; name?: string; text?: string; thinking?: string; json?: string; input?: unknown };
+type Block = { type: string; id?: string; name?: string; text?: string; thinking?: string; signature?: string; input?: unknown };
 
 export function openAIStreamToAnthropic(response: Response, model = "unknown"): Response {
   const encoder = new TextEncoder(); const messageId = makeId("msg");
   const stream = new ReadableStream<Uint8Array>({ start(controller) {
     void (async () => {
-      const blocks: Block[] = []; const toolBlocks = new Map<number, number>(); const closed = new Set<number>(); let active: number | undefined; let thinkingIndex: number | undefined; let textIndex: number | undefined;
-      let input = 0; let output = 0; let cacheRead: number | undefined; let cacheCreation: number | undefined; let reason = "end_turn"; let started = false;
-      const emit = (event: string, data: Json) => controller.enqueue(encoder.encode(sse(event, data)));
-      const close = (index: number) => { if (!closed.has(index)) { closed.add(index); emit("content_block_stop", { type: "content_block_stop", index }); } };
-      const ensure = (index: number, type: string, extra: Json = {}) => { if (blocks[index]) return; if (active !== undefined) close(active); active = index; blocks[index] = { type, ...extra }; emit("content_block_start", { type: "content_block_start", index, content_block: { type, ...extra, ...(type === "text" ? { text: "" } : {}), ...(type === "thinking" ? { thinking: "" } : {}), ...(type === "tool_use" ? { input: {} } : {}) } }); };
-      const finish = () => { if (!started) { started = true; emit("message_start", { type: "message_start", message: { id: messageId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }); } blocks.forEach((_b, i) => close(i)); const usage: Json = { input_tokens: input, output_tokens: output }; if (cacheRead !== undefined) usage.cache_read_input_tokens = cacheRead; if (cacheCreation !== undefined) usage.cache_creation_input_tokens = cacheCreation; emit("message_delta", { type: "message_delta", delta: { stop_reason: reason, stop_sequence: null }, usage }); emit("message_stop", { type: "message_stop" }); controller.close(); };
+      const blocks: Block[] = []; const toolBlocks = new Map<number, number>(); const closed = new Set<number>();
+      let active: number | undefined; let activeType: string | undefined;
+      let input = 0; let output = 0; let cacheRead: number | undefined; let cacheCreation: number | undefined; let reason = "end_turn"; let started = false; let terminal = false; let ended = false;
+      const emit = (event: string, data: Json) => { if (!ended) controller.enqueue(encoder.encode(sse(event, data))); };
+      const close = (index: number) => { if (!closed.has(index)) { closed.add(index); emit("content_block_stop", { type: "content_block_stop", index }); if (active === index) { active = undefined; activeType = undefined; } } };
+      const ensure = (type: string, extra: Json = {}, preferred?: number): number => {
+        if (active !== undefined && activeType === type && !closed.has(active)) return active;
+        if (preferred !== undefined && blocks[preferred] && !closed.has(preferred) && activeType === type) { active = preferred; return preferred; }
+        if (active !== undefined && !closed.has(active)) close(active);
+        const index = blocks.length; active = index; activeType = type; blocks[index] = { type, ...extra };
+        const contentBlock: Json = { type, ...extra, ...(type === "text" ? { text: "" } : {}), ...(type === "thinking" ? { thinking: "" } : {}), ...(type === "tool_use" ? { input: {} } : {}) };
+        emit("content_block_start", { type: "content_block_start", index, content_block: contentBlock }); return index;
+      };
+      const finish = () => { if (ended) return; ended = true; if (!started) { started = true; controller.enqueue(encoder.encode(sse("message_start", { type: "message_start", message: { id: messageId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }))); } blocks.forEach((_b, i) => { if (!closed.has(i)) { closed.add(i); controller.enqueue(encoder.encode(sse("content_block_stop", { type: "content_block_stop", index: i }))); } }); const usage: Json = { input_tokens: input, output_tokens: output }; if (cacheRead !== undefined) usage.cache_read_input_tokens = cacheRead; if (cacheCreation !== undefined) usage.cache_creation_input_tokens = cacheCreation; controller.enqueue(encoder.encode(sse("message_delta", { type: "message_delta", delta: { stop_reason: reason, stop_sequence: null }, usage }))); controller.enqueue(encoder.encode(sse("message_stop", { type: "message_stop" }))); controller.close(); };
+      const fail = (error: unknown) => { if (ended) return; ended = true; if (!started) { started = true; controller.enqueue(encoder.encode(sse("message_start", { type: "message_start", message: { id: messageId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }))); } const message = error instanceof Error ? error.message : "upstream stream failed"; controller.enqueue(encoder.encode(sse("error", { type: "error", error: { type: "api_error", message } }))); try { controller.close(); } catch {} };
+      const timer = setInterval(() => { if (!ended) emit("ping", { type: "ping" }); }, 15000);
       try { for await (const event of readKiroEvents(response, model)) {
         if (event.type === "start") { if (!started) { started = true; emit("message_start", { type: "message_start", message: { id: event.responseId || messageId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }); } }
-        else if (event.type === "thinking_delta") { const index = thinkingIndex ?? (thinkingIndex = blocks.length); ensure(index, "thinking"); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: event.thinking } }); }
-        else if (event.type === "text_delta") { const index = textIndex ?? (textIndex = blocks.length); ensure(index, "text"); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: event.text } }); }
-        else if (event.type === "tool_start") { const index = toolBlocks.get(event.index) ?? blocks.length; toolBlocks.set(event.index, index); ensure(index, "tool_use", { id: event.id, name: event.name }); }
-        else if (event.type === "tool_input_delta") { const index = toolBlocks.get(event.index) ?? blocks.length; toolBlocks.set(event.index, index); ensure(index, "tool_use"); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: event.delta } }); }
+        else if (event.type === "thinking_delta") { const index = ensure("thinking"); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: event.thinking } }); }
+        else if (event.type === "thinking_signature") { const index = (activeType === "thinking" && active !== undefined && !closed.has(active)) ? active : [...blocks].map((b, i) => [b, i] as const).reverse().find(([b, i]) => b.type === "thinking" && !closed.has(i))?.[1]; if (index !== undefined) { blocks[index].signature = event.signature; emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "signature_delta", signature: event.signature } }); } }
+        else if (event.type === "text_delta") { const index = ensure("text"); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: event.text } }); }
+        else if (event.type === "tool_start") { const prior = toolBlocks.get(event.index); const index = ensure("tool_use", { id: event.id, name: event.name }, prior); toolBlocks.set(event.index, index); }
+        else if (event.type === "tool_input_delta") { const prior = toolBlocks.get(event.index); const index = ensure("tool_use", {}, prior); toolBlocks.set(event.index, index); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: event.delta } }); }
         else if (event.type === "usage") { input = event.inputTokens; output = event.outputTokens; cacheRead = event.cacheReadInputTokens; cacheCreation = event.cacheCreationInputTokens; }
-        else if (event.type === "stop") reason = event.reason;
-      } finish(); } catch { finish(); }
+        else if (event.type === "stop") { reason = event.reason; terminal = true; }
+      } if (terminal) finish(); else throw new Error("Kiro stream ended before terminal event"); } catch (error) { fail(error); } finally { clearInterval(timer); }
     })();
   }, cancel() {} });
   return new Response(stream, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" } });
 }
+
 export async function collectAnthropicResponse(response: Response, model = "unknown"): Promise<Response> {
   const events: KiroEvent[] = []; for await (const event of readKiroEvents(response, model)) events.push(event);
-  const start = events.find((e): e is Extract<KiroEvent, {type:"start"}> => e.type === "start"); const content: Block[] = []; const args = new Map<number, string>(); const toolBlocks = new Map<number, number>();
-  for (const event of events) { if (event.type === "text_delta") { let b = content.find((x) => x.type === "text"); if (!b) { b = { type: "text", text: "" }; content.push(b); } b.text = (b.text || "") + event.text; } else if (event.type === "thinking_delta") { let b = content.find((x) => x.type === "thinking"); if (!b) { b = { type: "thinking", thinking: "" }; content.push(b); } b.thinking = (b.thinking || "") + event.thinking; } else if (event.type === "tool_start") { const blockIndex = toolBlocks.get(event.index) ?? content.length; toolBlocks.set(event.index, blockIndex); content[blockIndex] = { type: "tool_use", id: event.id, name: event.name, input: {} }; } else if (event.type === "tool_input_delta") args.set(event.index, (args.get(event.index) || "") + event.delta); }
+  const start = events.find((e): e is Extract<KiroEvent, {type:"start"}> => e.type === "start"); const content: Block[] = []; const args = new Map<number, string>(); const toolBlocks = new Map<number, number>(); let current: number | undefined;
+  for (const event of events) { if (event.type === "text_delta") { if (current === undefined || content[current]?.type !== "text") { current = content.length; content.push({ type: "text", text: "" }); } content[current].text = (content[current].text || "") + event.text; } else if (event.type === "thinking_delta") { if (current === undefined || content[current]?.type !== "thinking") { current = content.length; content.push({ type: "thinking", thinking: "" }); } content[current].thinking = (content[current].thinking || "") + event.thinking; } else if (event.type === "thinking_signature") { const i = [...content].map((b, i) => [b, i] as const).reverse().find(([b]) => b.type === "thinking")?.[1]; if (i !== undefined) content[i].signature = event.signature; } else if (event.type === "tool_start") { const blockIndex = toolBlocks.get(event.index) ?? content.length; toolBlocks.set(event.index, blockIndex); current = blockIndex; content[blockIndex] = { type: "tool_use", id: event.id, name: event.name, input: {} }; } else if (event.type === "tool_input_delta") args.set(event.index, (args.get(event.index) || "") + event.delta); }
   for (const [index, raw] of args) { const blockIndex = toolBlocks.get(index); const b = blockIndex === undefined ? undefined : content[blockIndex]; if (b) { try { b.input = JSON.parse(raw); } catch { b.input = raw; } } }
   const usageEvent = events.find((e): e is Extract<KiroEvent, {type:"usage"}> => e.type === "usage"); const stop = [...events].reverse().find((e): e is Extract<KiroEvent, {type:"stop"}> => e.type === "stop"); const usage: Json = { input_tokens: usageEvent?.inputTokens || 0, output_tokens: usageEvent?.outputTokens || 0 }; if (usageEvent?.cacheReadInputTokens !== undefined) usage.cache_read_input_tokens = usageEvent.cacheReadInputTokens; if (usageEvent?.cacheCreationInputTokens !== undefined) usage.cache_creation_input_tokens = usageEvent.cacheCreationInputTokens;
   return Response.json({ id: start?.responseId || makeId("msg"), type: "message", role: "assistant", model, content: content.filter(Boolean), stop_reason: stop?.reason || "end_turn", stop_sequence: null, usage });
 }
-export function countAnthropicTokens(body: Json): number { let text = JSON.stringify(body.messages || []); if (body.system) text += JSON.stringify(body.system); if (body.tools) text += JSON.stringify(body.tools); return Math.max(1, Math.ceil(text.length / 4)); }
+
+export function countAnthropicTokens(body: Json): number {
+  const encoder = new TextEncoder(); let bytes = 0; const walk = (value: unknown) => { if (typeof value === "string") { bytes += encoder.encode(value).byteLength; return; } if (Array.isArray(value)) { bytes += 2; value.forEach(walk); return; } if (value && typeof value === "object") { bytes += 2; for (const [key, item] of Object.entries(value)) { bytes += encoder.encode(key).byteLength + 2; walk(item); } } else bytes += 4; };
+  walk(body.messages || []); walk(body.system || []); walk(body.tools || []); return Math.max(1, Math.ceil(bytes / 3));
+}

@@ -1,4 +1,20 @@
 type StopReason = "end_turn" | "tool_use" | "max_tokens" | "stop_sequence";
+export type KiroStreamProtocolErrorCode = "unexpected_eof" | "missing_terminal";
+
+/** Indicates that a Kiro stream ended without protocol terminal evidence. */
+export class KiroStreamProtocolError extends Error {
+  readonly code: KiroStreamProtocolErrorCode;
+
+  constructor(
+    message = "Kiro stream ended before terminal event",
+    code: KiroStreamProtocolErrorCode = "unexpected_eof"
+  ) {
+    super(message);
+    this.name = "KiroStreamProtocolError";
+    this.code = code;
+  }
+}
+
 export type KiroEvent =
   | { type: "start"; model: string; responseId?: string }
   | { type: "text_delta"; text: string }
@@ -32,7 +48,7 @@ export async function* readKiroEvents(response: Response, model: string): AsyncG
     return;
   }
   const reader = response.body?.getReader();
-  if (!reader) { yield { type: "start", model }; yield { type: "stop", reason: "end_turn" }; return; }
+  if (!reader) throw new KiroStreamProtocolError();
   const decoder = new TextDecoder();
   let pending = "";
   let started = false;
@@ -88,6 +104,7 @@ export async function* readKiroEvents(response: Response, model: string): AsyncG
     const reason = choice.finish_reason; if (reason !== undefined && reason !== null) {
       for (const [index, tool] of tools) if (!tool.started) { tool.started = true; out.push({ type: "tool_start", index, id: tool.id, name: tool.name }); if (tool.pending) { out.push({ type: "tool_input_delta", index, delta: tool.pending }); tool.pending = ""; } }
       out.push({ type: "stop", reason: stopReason(reason) });
+      stopped = true;
     }
     return out;
   };
@@ -107,7 +124,7 @@ export async function* readKiroEvents(response: Response, model: string): AsyncG
     if (!stopped && pending.trim()) {
       const match = pending.match(/^data:\s*([\s\S]*?)(?:\r?\n|$)/); if (match) for (const event of parse(match[1].trim())) yield event;
     }
+    if (!stopped) throw new KiroStreamProtocolError();
     if (!started) { const initial = start(); if (initial) yield initial; }
-    if (!stopped) yield { type: "stop", reason: "end_turn" };
   } finally { reader.releaseLock(); }
 }

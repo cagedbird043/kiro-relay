@@ -18,7 +18,8 @@ import {
   flushPendingThinking,
   type KiroThinkingState,
 } from "./thinking.ts";
-import { ByteQueue, TEXT_ENCODER, parseEventFrame } from "./eventstream.ts";
+import { KiroStreamProtocolError } from "./events.ts";
+import { ByteQueue, parseEventFrame, TEXT_ENCODER } from "./eventstream.ts";
 import { kiroRuntimeHost, resolveKiroRuntimeRegion } from "./region.ts";
 import {
   KIRO_TOOL_CALL_WRAPPER,
@@ -975,9 +976,11 @@ export class KiroExecutor extends BaseExecutor {
         },
 
         flush(controller) {
+          if (!state.stopSeen && !state.finishEmitted) {
+            throw new KiroStreamProtocolError();
+          }
           if (!flushPendingWrapperToolCalls(controller)) return;
           if (state.invalidToolCall) return;
-          // Flush any buffered tool arguments (partial-object payloads) before finishing —
           // idempotent against toolArgsEmitted if messageStopEvent already flushed them.
           flushBufferedToolArgs(state, controller, { responseId, created, model });
 

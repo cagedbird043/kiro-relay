@@ -14,7 +14,7 @@ test("readKiroEvents handles fragmented SSE frames and DONE", async () => {
   });
   const events = [];
   for await (const event of readKiroEvents(new Response(stream), "gpt-5.6")) events.push(event);
-  expect(events.map((event) => event.type)).toEqual(["start", "text_delta", "tool_start", "tool_input_delta", "tool_input_delta", "usage", "stop", "stop"]);
+  expect(events.map((event) => event.type)).toEqual(["start", "text_delta", "tool_start", "tool_input_delta", "tool_input_delta", "usage", "stop"]);
   expect(events[0]).toMatchObject({ type: "start", responseId: "r1" });
   expect(events[1]).toEqual({ type: "text_delta", text: "hello" });
   expect(events[2]).toMatchObject({ type: "tool_start", index: 0, id: "c1", name: "lookup" });
@@ -40,4 +40,15 @@ test("readKiroEvents emits terminal stop on ordinary JSON response", async () =>
   const events = [];
   for await (const event of readKiroEvents(response, "gpt-5.6")) events.push(event);
   expect(events.at(-1)).toEqual({ type: "stop", reason: "end_turn" });
+});
+
+test("readKiroEvents rejects physical EOF before a terminal stop", async () => {
+  const response = new Response("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n", {
+    headers: { "content-type": "text/event-stream" },
+  });
+  await expect((async () => {
+    for await (const _event of readKiroEvents(response, "gpt-5.6")) {
+      // Consume until the parser observes the truncated stream.
+    }
+  })()).rejects.toThrow("Kiro stream ended before terminal event");
 });

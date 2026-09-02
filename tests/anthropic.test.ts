@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { collectAnthropicResponse, openAIStreamToAnthropic } from "../src/anthropic.ts";
+import { collectAnthropicResponse, countAnthropicTokens, openAIStreamToAnthropic } from "../src/anthropic.ts";
 
 function upstream(lines: string[]): Response {
   return new Response(lines.map((x) => `data: ${x}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
@@ -66,4 +66,53 @@ describe("Anthropic adapter", () => {
     expect(collectedTools).toHaveLength(1);
     expect(collectedTools[0]).toMatchObject({ type: "tool_use", id: "tu", name: "lookup", input: { q: "x" } });
   });
+});
+
+test("allocates fresh indexes for non-contiguous modalities", async () => {
+  const out = await openAIStreamToAnthropic(upstream([
+    JSON.stringify({ choices: [{ delta: { content: "a" } }] }),
+    JSON.stringify({ choices: [{ delta: { reasoning_content: "b" } }] }),
+    JSON.stringify({ choices: [{ delta: { content: "c" } }] }), "[DONE]",
+  ])).text();
+  expect(events(out).filter((e) => e.event === "content_block_start").map((e) => e.data.index)).toEqual([0, 1, 2]);
+});
+
+test("preserves thinking signature, including late arrival", async () => {
+  const out = await openAIStreamToAnthropic(upstream([
+    JSON.stringify({ choices: [{ delta: { reasoning_content: "secret" } }] }),
+    JSON.stringify({ choices: [{ delta: { reasoning_signature: "opaque" } }] }),
+    JSON.stringify({ choices: [{ delta: { content: "answer" } }] }), "[DONE]",
+  ])).text();
+  const es = events(out); const sig = es.find((e) => e.event === "content_block_delta" && e.data.delta.type === "signature_delta");
+  expect(sig?.data.index).toBe(0); expect(sig?.data.delta.signature).toBe("opaque");
+});
+
+test("emits an error event for a truncated stream", async () => {
+  const response = new Response("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n", { headers: { "content-type": "text/event-stream" } });
+  const es = events(await openAIStreamToAnthropic(response).text());
+  expect(es.at(-1)?.event).toBe("error"); expect(es).not.toContainEqual(expect.objectContaining({ event: "message_stop" }));
+});
+
+test("token estimator is positive, monotonic, and Unicode-aware", () => {
+  const base = countAnthropicTokens({ messages: [{ role: "user", content: "hello" }] });
+  const more = countAnthropicTokens({ messages: [{ role: "user", content: "hello 世界" }] });
+  expect(base).toBeGreaterThan(0); expect(more).toBeGreaterThanOrEqual(base);
+  expect(countAnthropicTokens({ messages: [], system: [{ type: "text", text: "policy" }], tools: [{ name: "x", input_schema: { type: "object" } }] })).toBeGreaterThan(0);
+});
+
+test("cleans up ping timer after terminal", async () => {
+  const originalSet = globalThis.setInterval;
+  const originalClear = globalThis.clearInterval;
+  let cleared = false;
+  const fakeSet = (_fn: TimerHandler, _ms?: number): number => 1;
+  const fakeClear = (_timer?: number | string): void => { cleared = true; };
+  globalThis.setInterval = fakeSet as unknown as typeof setInterval;
+  globalThis.clearInterval = fakeClear as unknown as typeof clearInterval;
+  try {
+    await openAIStreamToAnthropic(upstream(["[DONE]"])).text();
+    expect(cleared).toBe(true);
+  } finally {
+    globalThis.setInterval = originalSet;
+    globalThis.clearInterval = originalClear;
+  }
 });

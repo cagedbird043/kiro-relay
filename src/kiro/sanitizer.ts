@@ -78,6 +78,8 @@ export interface SanitizeKiroToolsResult<T = unknown> {
  * - Strips JSON-Schema keys Kiro rejects from each `inputSchema.json`.
  * - Ensures the top-level schema carries `required: []` (Kiro requires the key).
  * - Hash-truncates tool names > 64 chars and records the mapping in `nameMap`.
+ * - Deterministically disambiguates generated names that would collide with
+ *   another generated name or an existing short tool name.
  *
  * Inputs that are not arrays are returned untouched with an empty `nameMap`,
  * so this is safe to call unconditionally on the Kiro tools slot.
@@ -89,16 +91,40 @@ export function sanitizeKiroTools<T>(tools: T): SanitizeKiroToolsResult<T> {
     return { tools, nameMap };
   }
 
-  const sanitized = (tools as KiroTool[]).map((tool) => {
+  const entries = tools as KiroTool[];
+  // Short names are emitted unchanged, so reserve them before generating any
+  // truncated names. This prevents a generated name from shadowing a real one.
+  const usedNames = new Set<string>();
+  for (const tool of entries) {
+    const name = tool?.toolSpecification?.name;
+    if (typeof name === "string" && name.length <= MAX_TOOL_NAME_LENGTH) {
+      usedNames.add(name);
+    }
+  }
+
+  const generatedName = (original: string, attempt: number): string => {
+    const hashInput = attempt === 0 ? original : `${original}\u0000${attempt}`;
+    const hash = createHash("sha256").update(hashInput).digest("hex").slice(0, 7);
+    return `${original.slice(0, 56)}_${hash}`;
+  };
+
+  const sanitized = entries.map((tool) => {
     const spec = tool?.toolSpecification;
     if (!spec) return tool;
 
     const originalName = spec.name;
     let name = originalName;
     if (typeof name === "string" && name.length > MAX_TOOL_NAME_LENGTH) {
-      const hash = createHash("sha256").update(name).digest("hex").slice(0, 7);
-      name = `${name.slice(0, 56)}_${hash}`;
-      nameMap.set(name, originalName as string);
+      let attempt = 0;
+      let candidate = generatedName(name, attempt);
+      while (usedNames.has(candidate)) {
+        candidate = generatedName(name, ++attempt);
+      }
+      name = candidate;
+      usedNames.add(candidate);
+      // Every generated key is unique, so this mapping can never overwrite a
+      // different original name (including duplicate declarations).
+      nameMap.set(candidate, originalName);
     }
 
     const schema = spec.inputSchema?.json;

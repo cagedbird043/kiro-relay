@@ -1,0 +1,67 @@
+{
+  "fixtures": [
+    {
+      "file": "responses-success.request.json",
+      "source": "https://github.com/openai/codex",
+      "commit": "bdfd769640927a627dd48ab3fcc1ae8bc08bdd0a",
+      "paths": ["codex-rs/core/tests/suite/cli_stream.rs:217-224", "codex-rs/core/tests/common/responses.rs:468-501"],
+      "license": "MIT",
+      "reference_license": "Apache-2.0",
+      "normalization": "Behavioral reference only; fixture IDs are deterministic placeholders. Assertions may normalize IDs and timestamps only."
+    },
+    {
+      "file": "responses-success.sse",
+      "source": "https://github.com/openai/codex",
+      "commit": "bdfd769640927a627dd48ab3fcc1ae8bc08bdd0a",
+      "paths": ["codex-rs/core/tests/suite/cli_stream.rs:217-224", "codex-rs/core/tests/common/responses.rs:975-1002"],
+      "license": "MIT",
+      "reference_license": "Apache-2.0",
+      "normalization": "Behavioral reference only; fixture IDs are deterministic placeholders. Assertions may normalize IDs and timestamps only."
+    },
+    {
+      "file": "responses-failure.sse",
+      "source": "https://github.com/openai/codex",
+      "commit": "bdfd769640927a627dd48ab3fcc1ae8bc08bdd0a",
+      "paths": ["codex-rs/core/src/stream_events_utils.rs:289-387"],
+      "license": "MIT",
+      "reference_license": "Apache-2.0",
+      "normalization": "Behavioral reference only; fixture IDs are deterministic placeholders. Assertions may normalize IDs and timestamps only."
+    },
+    {
+      "file": "function-call.sse",
+      "source": "https://github.com/openai/codex",
+      "commit": "bdfd769640927a627dd48ab3fcc1ae8bc08bdd0a",
+      "paths": ["codex-rs/core/tests/common/responses.rs:975-1002", "codex-rs/core/tests/common/responses.rs:1666-1674"],
+      "license": "MIT",
+      "reference_license": "Apache-2.0",
+      "normalization": "Behavioral reference only; fixture IDs are deterministic placeholders. Assertions may normalize IDs and timestamps only."
+    },
+    {
+      "file": "custom-tool-call.sse",
+      "source": "https://github.com/openai/codex",
+      "commit": "bdfd769640927a627dd48ab3fcc1ae8bc08bdd0a",
+      "paths": ["codex-rs/core/tests/common/responses.rs:975-1002"],
+      "license": "MIT",
+      "reference_license": "Apache-2.0",
+      "normalization": "Behavioral reference only; fixture IDs are deterministic placeholders. Assertions may normalize IDs and timestamps only."
+    },
+    {
+      "file": "anthropic-interleaved.sse",
+      "source": "https://github.com/Wei-Shaw/sub2api",
+      "commit": "5097b31457e6dc9f49e5f5c9c72b925ce79543b3",
+      "paths": ["backend/internal/pkg/apicompat/anthropic_to_responses_stream_test.go:202-308", "backend/internal/pkg/apicompat/anthropic_responses_test.go:423-467"],
+      "license": "MIT",
+      "reference_license": "LGPL-3.0-or-later",
+      "normalization": "Behavioral reference only; no sub2api source or expressive text copied. Fixture IDs are deterministic placeholders."
+    },
+    {
+      "file": "unexpected-eof.sse",
+      "source": "https://github.com/Wei-Shaw/sub2api",
+      "commit": "5097b31457e6dc9f49e5f5c9c72b925ce79543b3",
+      "paths": ["backend/internal/pkg/apicompat/anthropic_responses_test.go:926-947", "backend/internal/pkg/apicompat/anthropic_responses_test.go:1011-1070"],
+      "license": "MIT",
+      "reference_license": "LGPL-3.0-or-later",
+      "normalization": "Behavioral reference only; no sub2api source or expressive text copied. Transcript intentionally ends without terminal event; assertions require protocol failure and forbid successful stop."
+    }
+  ]
+}

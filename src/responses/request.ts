@@ -23,6 +23,8 @@ export type KiroResponsesPayload = {
   additionalModelRequestFields?: { reasoning: { effort: string; summary?: string } };
   _toolNameMap?: Record<string, string>;
   _responseToolMetadata?: Record<string, { name: string; namespace?: string; custom: boolean }>;
+  /** Internal response wiring: expose opaque reasoning content when requested. */
+  _includeEncryptedContent?: boolean;
 };
 
 const UUID_NAMESPACE = "34f7193f-561d-4050-bc84-9547d953d6bf";
@@ -144,7 +146,16 @@ function functionInput(value: unknown): Obj {
 }
 function outputText(value: unknown): string {
   if (typeof value === "string") return value;
-  if (Array.isArray(value)) return contentParts(value).text;
+  if (Array.isArray(value)) {
+    const text: string[] = [];
+    for (const part of value) {
+      if (!isObj(part) || part.type !== "input_text" || typeof part.text !== "string") {
+        throw new Error("function_call_output output must contain text content parts");
+      }
+      text.push(part.text);
+    }
+    return text.join("");
+  }
   if (isObj(value) && typeof value.text === "string") return value.text;
   throw new Error("function_call_output output must be text or content parts");
 }
@@ -210,6 +221,7 @@ function flattenToolDefinitions(
 export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequest, stream: boolean, credentials: ProviderCredentials): KiroResponsesPayload {
   void stream;
   const capabilities = getKiroModelCapabilities(model);
+  const includeEncryptedContent = Array.isArray(body.include) && body.include.includes("reasoning.encrypted_content");
   if (!capabilities?.supportsNativeReasoning) throw new Error("Responses endpoint supports only native-reasoning GPT-5.6 models");
   for (const key of Object.keys(UNSUPPORTED_FIELDS)) if (body[key] !== undefined) throw new Error(`Unsupported Responses field: ${key}`);
   if (body.store !== undefined && body.store !== false) {
@@ -261,6 +273,8 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   const toolResults: unknown[] = [];
   let current: InputParts = { text: "", images: [] };
   let firstUser = "";
+  const instructionTexts: string[] = [];
+  if (typeof body.instructions === "string" && body.instructions) instructionTexts.push(body.instructions);
   let lastUser:
     | { inputIndex: number; historyIndex: number; parts: InputParts }
     | undefined;
@@ -269,94 +283,40 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   let lastAssistantInputIndex = -1;
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    const type = typeof item.type === "string"
-      ? item.type
-      : typeof item.role === "string"
-        ? "message"
-        : undefined;
+    const type = typeof item.type === "string" ? item.type : typeof item.role === "string" ? "message" : undefined;
     if (type === "additional_tools") {
-      if (item.role !== "developer" || !Array.isArray(item.tools)) {
-        throw new Error("additional_tools requires developer role and tools");
-      }
+      if (item.role !== "developer" || !Array.isArray(item.tools)) throw new Error("additional_tools requires developer role and tools");
       additionalToolDefinitions.push(...item.tools);
       continue;
     }
-    if (type === "reasoning") {
-      validateReasoningHistoryItem(item);
-      lastAssistantInputIndex = i;
-      continue;
-    }
+    if (type === "reasoning") { validateReasoningHistoryItem(item); lastAssistantInputIndex = i; continue; }
     if (type === "function_call_output" || type === "custom_tool_call_output") {
-      if (typeof item.call_id !== "string" || !item.call_id) {
-        throw new Error(`${type} requires call_id`);
-      }
-      toolResults.push({
-        toolUseId: item.call_id,
-        status: "success",
-        content: [{ text: outputText(item.output) }],
-      });
+      if (typeof item.call_id !== "string" || !item.call_id) throw new Error(`${type} requires call_id`);
+      toolResults.push({ toolUseId: item.call_id, status: "success", content: [{ text: outputText(item.output) }] });
       lastToolOutputIndex = i;
       continue;
     }
     if (type === "function_call" || type === "custom_tool_call") {
-      if (
-        typeof item.call_id !== "string" ||
-        !item.call_id ||
-        typeof item.name !== "string" ||
-        !item.name
-      ) {
-        throw new Error(`${type} requires call_id and name`);
-      }
-      const input =
-        type === "custom_tool_call"
-          ? typeof item.input === "string"
-            ? { input: item.input }
-            : (() => {
-                throw new Error("custom_tool_call input must be a string");
-              })()
-          : functionInput(item.arguments);
-      const historyName =
-        typeof item.namespace === "string" && item.namespace
-          ? `${item.namespace}__${item.name}`
-          : item.name;
+      if (typeof item.call_id !== "string" || !item.call_id || typeof item.name !== "string" || !item.name) throw new Error(`${type} requires call_id and name`);
+      const input = type === "custom_tool_call" ? (typeof item.input === "string" ? { input: item.input } : (() => { throw new Error("custom_tool_call input must be a string"); })()) : functionInput(item.arguments);
+      const historyName = typeof item.namespace === "string" && item.namespace ? `${item.namespace}__${item.name}` : item.name;
       lastAssistantInputIndex = i;
-      appendAssistantHistory(history, "", {
-        toolUseId: item.call_id,
-        name: historyName,
-        input,
-      });
+      appendAssistantHistory(history, "", { toolUseId: item.call_id, name: historyName, input });
       continue;
     }
     if (type !== "message") throw new Error(`Unsupported input item type: ${String(type)}`);
-    if (
-      item.role !== "user" &&
-      item.role !== "assistant" &&
-      item.role !== "system" &&
-      item.role !== "developer"
-    ) {
-      throw new Error("message role is invalid");
-    }
+    if (item.role !== "user" && item.role !== "assistant" && item.role !== "system" && item.role !== "developer") throw new Error("message role is invalid");
     const parts = contentParts(item.content);
-    if (item.role === "assistant") {
-      lastAssistantInputIndex = i;
-      appendAssistantHistory(history, parts.text);
-      continue;
-    }
+    if (item.role === "system" || item.role === "developer") { instructionTexts.push(parts.text); continue; }
+    if (item.role === "assistant") { lastAssistantInputIndex = i; appendAssistantHistory(history, parts.text); continue; }
     if (!firstUser) firstUser = parts.text;
     history.push(historyUserMessage(parts, model));
     lastUser = { inputIndex: i, historyIndex: history.length - 1, parts };
   }
-  if (lastUser && lastUser.inputIndex > Math.max(lastToolOutputIndex, lastAssistantInputIndex)) {
-    current = lastUser.parts;
-    history.splice(lastUser.historyIndex, 1);
-  }
-  const instruction =
-    typeof body.instructions === "string" && body.instructions
-      ? `<system-reminder>\n${body.instructions}\n</system-reminder>\n\n`
-      : "";
+  if (lastUser && lastUser.inputIndex > Math.max(lastToolOutputIndex, lastAssistantInputIndex)) { current = lastUser.parts; history.splice(lastUser.historyIndex, 1); }
+  const instruction = instructionTexts.length ? instructionTexts.map((text) => `<system-reminder>\n${text}\n</system-reminder>`).join("\n\n") + "\n\n" : "";
   const context: { tools?: unknown[]; toolResults?: unknown[]; toolChoice?: unknown } = {};
   if (toolResults.length) context.toolResults = toolResults;
-  if (body.tool_choice !== undefined) { const c = body.tool_choice; if (c === "auto") context.toolChoice = { auto: {} }; else if (c === "required") context.toolChoice = { any: {} }; else if (c === "none") context.toolChoice = { none: {} }; else if (isObj(c) && c.type === "function" && typeof c.name === "string" && c.name) context.toolChoice = { tool: { name: c.name } }; else throw new Error("Invalid tool_choice"); }
   const declaredTools: unknown[] = [];
   if (body.tools !== undefined && body.tools !== null) {
     if (!Array.isArray(body.tools)) throw new Error("tools must be an array");
@@ -386,6 +346,20 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
     }
     if (Object.keys(restoredMetadata).length) responseToolMetadata = restoredMetadata;
   }
+  if (body.tool_choice !== undefined) {
+    const choice = body.tool_choice;
+    if (choice === "auto") context.toolChoice = { auto: {} };
+    else if (choice === "required") context.toolChoice = { any: {} };
+    else if (choice === "none") context.toolChoice = { none: {} };
+    else if (isObj(choice) && (choice.type === "function" || choice.type === "custom") && typeof choice.name === "string" && choice.name) {
+      const flattenedName = typeof choice.namespace === "string" && choice.namespace ? `${choice.namespace}__${choice.name}` : choice.name;
+      const sanitizedName = Object.entries(nameMap ?? {}).find(([, original]) => original === flattenedName)?.[0] ?? flattenedName;
+      const declared = responseToolMetadata && Object.hasOwn(responseToolMetadata, flattenedName);
+      const ordinaryDeclared = context.tools?.some((tool) => isObj(tool) && isObj(tool.toolSpecification) && tool.toolSpecification.name === sanitizedName);
+      if (!declared && !ordinaryDeclared) throw new Error(`tool_choice references undeclared tool: ${flattenedName}`);
+      context.toolChoice = { tool: { name: sanitizedName } };
+    } else throw new Error("Invalid tool_choice");
+  }
   const conversationSeed =
     typeof body.prompt_cache_key === "string" && body.prompt_cache_key
       ? body.prompt_cache_key
@@ -413,6 +387,7 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
       history,
     },
   };
+  payload._includeEncryptedContent = includeEncryptedContent;
   const profileArn = credentials.providerSpecificData?.profileArn; if (typeof profileArn === "string" && profileArn) payload.profileArn = profileArn;
   if (typeof body.max_output_tokens === "number") payload.inferenceConfig = { maxTokens: body.max_output_tokens };
   if (reasoningEffort) {

@@ -78,6 +78,41 @@ test("sanitizeKiroTools: hash-truncates names >64 chars and records nameMap", ()
   assert.equal(nameMap.get(truncated), longName);
 });
 
+test("sanitizeKiroTools: duplicate long names are disambiguated and reversible", () => {
+  const longName = "duplicate_tool_" + "x".repeat(80);
+  const input = [
+    { toolSpecification: { name: longName } },
+    { toolSpecification: { name: longName } },
+  ];
+
+  const first = sanitizeKiroTools(input);
+  const names = first.tools.map((tool) => tool.toolSpecification.name);
+  assert.equal(new Set(names).size, 2);
+  assert.ok(names.every((name) => name.length <= 64));
+  assert.equal(first.nameMap.size, 2);
+  assert.equal(first.nameMap.get(names[0]), longName);
+  assert.equal(first.nameMap.get(names[1]), longName);
+
+  const second = sanitizeKiroTools(input);
+  assert.deepEqual(second.tools.map((tool) => tool.toolSpecification.name), names);
+  assert.deepEqual([...second.nameMap], [...first.nameMap]);
+});
+
+test("sanitizeKiroTools: generated names do not shadow existing short names", () => {
+  const longName = "collision_tool_" + "y".repeat(80);
+  const initial = sanitizeKiroTools([{ toolSpecification: { name: longName } }]);
+  const baseName = initial.tools[0].toolSpecification.name;
+  const { tools, nameMap } = sanitizeKiroTools([
+    { toolSpecification: { name: baseName } },
+    { toolSpecification: { name: longName } },
+  ]);
+
+  assert.equal(tools[0].toolSpecification.name, baseName);
+  assert.notEqual(tools[1].toolSpecification.name, baseName);
+  assert.equal(nameMap.size, 1);
+  assert.equal(nameMap.get(tools[1].toolSpecification.name), longName);
+});
+
 test("sanitizeKiroTools: short names are left untouched with an empty nameMap", () => {
   const { tools: out, nameMap } = sanitizeKiroTools([
     {

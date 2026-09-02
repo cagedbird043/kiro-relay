@@ -204,3 +204,40 @@ test("rejects unsupported models and malformed boundaries", () => {
   assert.throws(() => buildKiroResponsesPayload(model, req({ input: [{ type: "message", role: "user", content: [{ type: "input_image", image_url: "https://example.com/a.png" }]}]}), false, {}), /base64 data URL/);
   assert.throws(() => buildKiroResponsesPayload(model, req({ input: [{ type: "function_call_output", call_id: "c", output: 42 }]}), false, {}), /output must be/);
 });
+
+test("routes instructions, system, and developer messages in order", () => {
+  const payload = buildKiroResponsesPayload(model, req({
+    instructions: "top",
+    input: [
+      { type: "message", role: "system", content: "system" },
+      { type: "message", role: "developer", content: [{ type: "input_text", text: "developer" }] },
+      { type: "message", role: "user", content: "question" },
+    ],
+  }), false, {});
+  assert.equal(payload.conversationState.currentMessage.userInputMessage.content,
+    "<system-reminder>\ntop\n</system-reminder>\n\n<system-reminder>\nsystem\n</system-reminder>\n\n<system-reminder>\ndeveloper\n</system-reminder>\n\nquestion");
+  assert.equal(payload.conversationState.history.length, 0);
+});
+
+test("maps namespaced and custom forced tool choices", () => {
+  const tools = [{ type: "namespace", name: "functions", tools: [{ type: "custom", name: "exec" }] }];
+  for (const choice of [{ type: "custom", name: "exec", namespace: "functions" }, { type: "function", name: "exec", namespace: "functions" }]) {
+    const payload = buildKiroResponsesPayload(model, req({ tools, tool_choice: choice }), false, {});
+    assert.deepEqual(payload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolChoice, { tool: { name: "functions__exec" } });
+  }
+  assert.throws(() => buildKiroResponsesPayload(model, req({ tools, tool_choice: { type: "function", name: "missing" } }), false, {}), /undeclared tool/);
+});
+
+test("accepts structured text tool outputs and rejects media", () => {
+  const base = { type: "function_call_output", call_id: "call_1" };
+  for (const output of ["ok", [{ type: "input_text", text: "o" }, { type: "input_text", text: "k" }]]) {
+    const payload = buildKiroResponsesPayload(model, req({ input: [{ ...base, output }] }), false, {});
+    assert.deepEqual(payload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults?.[0], { toolUseId: "call_1", status: "success", content: [{ text: "ok" }] });
+  }
+  assert.throws(() => buildKiroResponsesPayload(model, req({ input: [{ ...base, output: [{ type: "input_image", image_url: "data:image/png;base64,AA==" }] }] }), false, {}), /text content parts/);
+});
+
+test("carries include encrypted content as internal metadata", () => {
+  assert.equal(buildKiroResponsesPayload(model, req({ include: ["reasoning.encrypted_content"] }), false, {})._includeEncryptedContent, true);
+  assert.equal(buildKiroResponsesPayload(model, req(), false, {})._includeEncryptedContent, false);
+});

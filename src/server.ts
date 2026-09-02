@@ -1,4 +1,5 @@
 import { loadConfig, type AppConfig } from "./config.ts";
+import { createHash } from "node:crypto";
 import { loadCredentials, saveCredentials } from "./credentials.ts";
 import {
   anthropicToOpenAI,
@@ -16,6 +17,7 @@ import {
 import {
   collectResponses,
   responsesStream,
+  type ResponsesOptions,
   type ResponseToolMetadata,
 } from "./responses/response.ts";
 
@@ -52,7 +54,7 @@ function metadataLog(tag: string, data: Record<string, unknown>) {
 }
 
 export type ExecutorLike = {
-  execute(input: { model: string; body: unknown; stream: boolean; credentials: ProviderCredentials; log?: unknown }): Promise<{ response: Response }>;
+  execute(input: { model: string; body: unknown; stream: boolean; credentials: ProviderCredentials; signal?: AbortSignal; log?: unknown }): Promise<{ response: Response }>;
   refreshCredentials(credentials: ProviderCredentials, log?: unknown): Promise<unknown>;
 };
 
@@ -86,6 +88,13 @@ function responseToolMetadata(payload: unknown): ResponseToolMetadata {
   }
   return result;
 }
+
+function responsesOptions(payload: unknown): ResponsesOptions {
+  return {
+    includeEncryptedContent:
+      isRecord(payload) && payload._includeEncryptedContent === true,
+  };
+}
 export function createHandler(config: AppConfig, executor: ExecutorLike = new KiroExecutor()) {
   return async function handler(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -93,7 +102,11 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
     if (method === "GET" && url.pathname === "/healthz") return Response.json({ status: "ok" });
     if (method === "GET" && url.pathname === "/v1/models") {
       const entries = Object.entries(config.models);
-      return Response.json({
+      const catalogFingerprint = entries
+        .map(([id, spec]) => ({ id, contextLength: spec.contextLength }))
+        .sort((a, b) => a.id.localeCompare(b.id));
+      const etag = `"${createHash("sha256").update(JSON.stringify(catalogFingerprint)).digest("hex")}"`;
+      const responseBody = {
         object: "list",
         data: entries.map(([id, spec]) => ({
           id,
@@ -128,7 +141,18 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
             experimental_supported_tools: [],
             use_responses_lite: true,
           })),
-      });
+      };
+      const headers = { ...jsonHeaders, etag };
+      const ifNoneMatch = request.headers.get("if-none-match");
+      if (
+        ifNoneMatch?.split(",").some((value) => {
+          const token = value.trim();
+          return token === "*" || token === etag || token.replace(/^W\//, "") === etag;
+        })
+      ) {
+        return new Response(null, { status: 304, headers: { etag } });
+      }
+      return new Response(JSON.stringify(responseBody), { headers });
     }
 
     const isResponses = url.pathname === "/v1/responses";
@@ -194,7 +218,7 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
       info: (tag: string, _message: string, _data?: unknown) => metadataLog(tag, { model }),
       error: (tag: string, _message: string, _data?: unknown) => metadataLog(tag, { model }),
     };
-    const execute = () => executor.execute({ model, body: payload, stream, credentials, log });
+    const execute = () => executor.execute({ model, body: payload, stream, credentials, signal: request.signal, log });
     let result: { response: Response };
     try {
       result = await execute();
@@ -254,9 +278,10 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
     try {
       if (isResponses) {
         const responseTools = responseToolMetadata(payload);
+        const options = responsesOptions(payload);
         return stream
-          ? responsesStream(result.response, model, responseTools)
-          : Response.json(await collectResponses(result.response, model, responseTools));
+          ? responsesStream(result.response, model, responseTools, options)
+          : Response.json(await collectResponses(result.response, model, responseTools, options));
       }
       return stream
         ? openAIStreamToAnthropic(result.response, model)

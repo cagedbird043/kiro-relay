@@ -261,6 +261,7 @@ test("KiroExecutor normalizes Bedrock cache-token fields from a metricsEvent", a
       cacheReadInputTokens: 1024,
       cacheWriteInputTokens: 256,
     }),
+    buildEventFrame("messageStopEvent", {}),
   ]);
 
   const transformed = executor.transformEventStreamToSSE(response, "glm-5");
@@ -317,6 +318,7 @@ test("KiroExecutor reads usage and cache tokens from a metadataEvent frame", asy
         cacheWriteInputTokens: 512,
       },
     }),
+    buildEventFrame("messageStopEvent", {}),
   ]);
 
   const transformed = executor.transformEventStreamToSSE(response, "glm-5");
@@ -343,6 +345,7 @@ test("KiroExecutor keeps cache tokens that arrive without input/output totals", 
     buildEventFrame("metadataEvent", {
       usage: { cacheReadInputTokens: 900 },
     }),
+    buildEventFrame("messageStopEvent", {}),
   ]);
 
   const transformed = executor.transformEventStreamToSSE(response, "glm-5");
@@ -371,6 +374,7 @@ test("KiroExecutor accepts snake_case cache token spellings", async () => {
         cache_creation_input_tokens: 32,
       },
     }),
+    buildEventFrame("messageStopEvent", {}),
   ]);
 
   const transformed = executor.transformEventStreamToSSE(response, "glm-5");
@@ -398,6 +402,7 @@ test("KiroExecutor scales the usage estimate by the model's own context window",
     const response = buildEventStreamResponse([
       buildEventFrame("assistantResponseEvent", { content: "x".repeat(400) }),
       buildEventFrame("contextUsageEvent", { contextUsagePercentage: 10 }),
+      buildEventFrame("messageStopEvent", {}),
     ]);
     const chunks = parseSSEJsonChunks(
       await executor.transformEventStreamToSSE(response, model).text()
@@ -432,6 +437,7 @@ test("KiroExecutor maps Opus 5 context percentage to the 1M context window", asy
   const response = buildEventStreamResponse([
     buildEventFrame("assistantResponseEvent", { content: "x".repeat(400) }),
     buildEventFrame("contextUsageEvent", { contextUsagePercentage: 26.943 }),
+    buildEventFrame("messageStopEvent", {}),
   ]);
   const chunks = parseSSEJsonChunks(
     await executor.transformEventStreamToSSE(response, "claude-opus-5").text()
@@ -446,6 +452,7 @@ test("KiroExecutor reports context and completion estimates independently", asyn
   const response = buildEventStreamResponse([
     buildEventFrame("assistantResponseEvent", { content: "y".repeat(800) }),
     buildEventFrame("contextUsageEvent", { contextUsagePercentage: 5 }),
+    buildEventFrame("messageStopEvent", {}),
   ]);
 
   const chunks = parseSSEJsonChunks(
@@ -465,6 +472,7 @@ test("KiroExecutor still reports a completion estimate without a context percent
   const executor = new KiroExecutor();
   const response = buildEventStreamResponse([
     buildEventFrame("assistantResponseEvent", { content: "z".repeat(400) }),
+    buildEventFrame("messageStopEvent", {}),
   ]);
 
   const chunks = parseSSEJsonChunks(
@@ -489,6 +497,7 @@ test("KiroExecutor.transformEventStreamToSSE surfaces native reasoning frames as
     buildEventFrame("assistantResponseEvent", { reasoningText: { text: "variant." } }),
     buildEventFrame("assistantResponseEvent", { content: "The answer is 42." }),
     buildEventFrame("metricsEvent", { inputTokens: 3, outputTokens: 5 }),
+    buildEventFrame("messageStopEvent", {}),
   ]);
 
   const transformed = executor.transformEventStreamToSSE(response, "glm-5");
@@ -516,6 +525,7 @@ test("KiroExecutor suppresses placeholder reasoning and preserves its signature"
   const response = buildEventStreamResponse([
     buildEventFrame("reasoningContentEvent", { text: "...", signature: "kiro-signature" }),
     buildEventFrame("assistantResponseEvent", { content: "Answer" }),
+    buildEventFrame("messageStopEvent", {}),
   ]);
 
   const transformed = executor.transformEventStreamToSSE(response, "gpt-5.6-luna");
@@ -725,4 +735,15 @@ test("KiroExecutor cancels upstream after the terminal metering frame", async ()
     .text();
   assert.match(text, /"finish_reason":"stop"/);
   assert.match(text, /\[DONE\]/);
+});
+
+test("KiroExecutor propagates physical EOF before messageStopEvent", async () => {
+  const executor = new KiroExecutor();
+  const response = buildEventStreamResponse([
+    buildEventFrame("assistantResponseEvent", { content: "truncated" }),
+  ]);
+  await assert.rejects(
+    () => executor.transformEventStreamToSSE(response, "claude-opus-5").text(),
+    /Kiro stream ended before terminal event/
+  );
 });
