@@ -66,6 +66,68 @@ test("accepts OMP stateless defaults and cache keys", () => {
     /include value/
   );
 });
+
+test("accepts OMP reasoning history and merges assistant tool calls", () => {
+  const payload = buildKiroResponsesPayload(
+    "gpt-5.6-luna",
+    {
+      model: "gpt-5.6-luna",
+      reasoning: { effort: "max", summary: "auto" },
+      input: [
+        { role: "user", content: [{ type: "input_text", text: "inspect this repository" }] },
+        { type: "reasoning", summary: [{ type: "summary_text", text: "..." }] },
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "I will inspect it.", annotations: [] }],
+        },
+        {
+          type: "function_call",
+          call_id: "call_read",
+          name: "read",
+          arguments: '{"path":"."}',
+        },
+        {
+          type: "function_call_output",
+          call_id: "call_read",
+          output: "package.json\nsrc/",
+        },
+      ],
+    },
+    true,
+    {}
+  );
+
+  assert.deepEqual(payload.additionalModelRequestFields, { reasoning: { effort: "max" } });
+  assert.deepEqual(payload.conversationState.history, [
+    {
+      userInputMessage: {
+        content: "inspect this repository",
+        modelId: "gpt-5.6-luna",
+        origin: "AI_EDITOR",
+      },
+    },
+    {
+      assistantResponseMessage: {
+        content: "I will inspect it.",
+        toolUses: [
+          { toolUseId: "call_read", name: "read", input: { path: "." } },
+        ],
+      },
+    },
+  ]);
+  assert.equal(payload.conversationState.currentMessage.userInputMessage.content, "");
+  assert.deepEqual(
+    payload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults,
+    [
+      {
+        toolUseId: "call_read",
+        status: "success",
+        content: [{ text: "package.json\nsrc/" }],
+      },
+    ]
+  );
+});
 test("rejects unsupported models and malformed boundaries", () => {
   assert.throws(() => buildKiroResponsesPayload("gpt-5.6", req(), false, {}), /native-reasoning/);
   assert.throws(() => buildKiroResponsesPayload(model, req({ reasoning: { effort: "x" }}), false, {}), /reasoning.effort/);

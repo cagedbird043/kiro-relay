@@ -45,6 +45,75 @@ type Obj = Record<string, unknown>;
 const isObj = (value: unknown): value is Obj =>
   !!value && typeof value === "object" && !Array.isArray(value);
 
+type InputParts = {
+  text: string;
+  images: Array<{ format: string; bytes: string }>;
+};
+type KiroToolUse = { toolUseId: string; name: string; input: Obj };
+type KiroHistoryItem = {
+  userInputMessage?: {
+    content: string;
+    modelId: string;
+    origin: "AI_EDITOR";
+    images?: Array<{ format: string; source: { bytes: string } }>;
+  };
+  assistantResponseMessage?: {
+    content: string;
+    toolUses?: KiroToolUse[];
+  };
+};
+
+function historyUserMessage(parts: InputParts, model: string): KiroHistoryItem {
+  return {
+    userInputMessage: {
+      content: parts.text,
+      modelId: model,
+      origin: "AI_EDITOR",
+      ...(parts.images.length
+        ? {
+            images: parts.images.map((image) => ({
+              format: image.format,
+              source: { bytes: image.bytes },
+            })),
+          }
+        : {}),
+    },
+  };
+}
+
+function appendAssistantHistory(
+  history: KiroHistoryItem[],
+  content: string,
+  toolUse?: KiroToolUse
+): void {
+  const previous = history.at(-1)?.assistantResponseMessage;
+  if (previous) {
+    if (content) previous.content = [previous.content, content].filter(Boolean).join("\n\n");
+    if (toolUse) (previous.toolUses ??= []).push(toolUse);
+    return;
+  }
+  history.push({
+    assistantResponseMessage: {
+      content,
+      ...(toolUse ? { toolUses: [toolUse] } : {}),
+    },
+  });
+}
+
+function validateReasoningHistoryItem(item: Obj): void {
+  if (item.summary !== undefined) {
+    if (!Array.isArray(item.summary)) throw new Error("reasoning summary must be an array");
+    for (const part of item.summary) {
+      if (!isObj(part) || part.type !== "summary_text" || typeof part.text !== "string") {
+        throw new Error("reasoning summary items must contain summary_text");
+      }
+    }
+  }
+  if (item.encrypted_content !== undefined && typeof item.encrypted_content !== "string") {
+    throw new Error("reasoning encrypted_content must be a string");
+  }
+}
+
 function imageOf(value: unknown): { format: string; bytes: string } {
   if (!isObj(value) || value.type !== "input_image" || typeof value.image_url !== "string") throw new Error("input_image requires image_url");
   const m = /^data:image\/(png|jpe?g|gif|webp);base64,([A-Za-z0-9+/]+={0,2})$/i.exec(value.image_url);
@@ -115,7 +184,15 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   const rawInput = body.input ?? "";
   if (typeof rawInput !== "string" && !Array.isArray(rawInput)) throw new Error("input must be a string or array");
   const items: Obj[] = typeof rawInput === "string" ? [{ type: "message", role: "user", content: [{ type: "input_text", text: rawInput }] }] : rawInput.map((v) => { if (!isObj(v)) throw new Error("input items must be objects"); return v; });
-  const history: unknown[] = []; const toolResults: unknown[] = []; let current: { text: string; images: Array<{ format: string; bytes: string }> } = { text: "", images: [] }; let firstUser = "";
+  const history: KiroHistoryItem[] = [];
+  const toolResults: unknown[] = [];
+  let current: InputParts = { text: "", images: [] };
+  let firstUser = "";
+  let lastUser:
+    | { inputIndex: number; historyIndex: number; parts: InputParts }
+    | undefined;
+  let lastToolOutputIndex = -1;
+  let lastAssistantInputIndex = -1;
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     const type = typeof item.type === "string"
@@ -123,13 +200,62 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
       : typeof item.role === "string"
         ? "message"
         : undefined;
-    if (type === "function_call_output") { if (typeof item.call_id !== "string" || !item.call_id) throw new Error("function_call_output requires call_id"); toolResults.push({ toolUseId: item.call_id, status: "success", content: [{ text: outputText(item.output) }] }); continue; }
-    if (type === "function_call") { if (typeof item.call_id !== "string" || !item.call_id || typeof item.name !== "string" || !item.name) throw new Error("function_call requires call_id and name"); history.push({ assistantResponseMessage: { content: "", toolUses: [{ toolUseId: item.call_id, name: item.name, input: functionInput(item.arguments) }] } }); continue; }
+    if (type === "reasoning") {
+      validateReasoningHistoryItem(item);
+      lastAssistantInputIndex = i;
+      continue;
+    }
+    if (type === "function_call_output") {
+      if (typeof item.call_id !== "string" || !item.call_id) {
+        throw new Error("function_call_output requires call_id");
+      }
+      toolResults.push({
+        toolUseId: item.call_id,
+        status: "success",
+        content: [{ text: outputText(item.output) }],
+      });
+      lastToolOutputIndex = i;
+      continue;
+    }
+    if (type === "function_call") {
+      if (
+        typeof item.call_id !== "string" ||
+        !item.call_id ||
+        typeof item.name !== "string" ||
+        !item.name
+      ) {
+        throw new Error("function_call requires call_id and name");
+      }
+      lastAssistantInputIndex = i;
+      appendAssistantHistory(history, "", {
+        toolUseId: item.call_id,
+        name: item.name,
+        input: functionInput(item.arguments),
+      });
+      continue;
+    }
     if (type !== "message") throw new Error(`Unsupported input item type: ${String(type)}`);
-    if (item.role !== "user" && item.role !== "assistant" && item.role !== "system" && item.role !== "developer") throw new Error("message role is invalid");
-    const parts = contentParts(item.content); const role = item.role === "assistant" ? "assistant" : "user";
-    if (role === "user" && !firstUser) firstUser = parts.text;
-    if (i === items.length - 1) current = parts; else if (role === "assistant") history.push({ assistantResponseMessage: { content: parts.text } }); else history.push({ userInputMessage: { content: parts.text, modelId: model, origin: "AI_EDITOR", ...(parts.images.length ? { images: parts.images.map((x) => ({ format: x.format, source: { bytes: x.bytes } })) } : {}) } });
+    if (
+      item.role !== "user" &&
+      item.role !== "assistant" &&
+      item.role !== "system" &&
+      item.role !== "developer"
+    ) {
+      throw new Error("message role is invalid");
+    }
+    const parts = contentParts(item.content);
+    if (item.role === "assistant") {
+      lastAssistantInputIndex = i;
+      appendAssistantHistory(history, parts.text);
+      continue;
+    }
+    if (!firstUser) firstUser = parts.text;
+    history.push(historyUserMessage(parts, model));
+    lastUser = { inputIndex: i, historyIndex: history.length - 1, parts };
+  }
+  if (lastUser && lastUser.inputIndex > Math.max(lastToolOutputIndex, lastAssistantInputIndex)) {
+    current = lastUser.parts;
+    history.splice(lastUser.historyIndex, 1);
   }
   const instruction = typeof body.instructions === "string" && body.instructions ? `<system-reminder>\n${body.instructions}\n</system-reminder>\n\n` : "";
   const context: { tools?: unknown[]; toolResults?: unknown[]; toolChoice?: unknown } = {};

@@ -121,6 +121,41 @@ describe("server routes", () => {
       await rm(f.dir, { recursive: true, force: true });
     }
   });
+
+  test("accepts OMP reasoning items on a tool continuation", async () => {
+    const f = await fixture();
+    try {
+      const seen: Parameters<ExecutorLike["execute"]>[0][] = [];
+      const executor: ExecutorLike = {
+        execute: async (input) => {
+          seen.push(input);
+          return { response: upstream(true, "continued") };
+        },
+        refreshCredentials: async () => null,
+      };
+      const handler = createHandler(f.config, executor);
+      const response = await handler(
+        request("/v1/responses", {
+          model: "gpt-5.6-sol",
+          reasoning: { effort: "max", summary: "auto" },
+          input: [
+            { role: "user", content: "inspect" },
+            { type: "reasoning", summary: [{ type: "summary_text", text: "..." }] },
+            { type: "message", role: "assistant", content: [{ type: "output_text", text: "working" }] },
+            { type: "function_call", call_id: "call_read", name: "read", arguments: '{"path":"."}' },
+            { type: "function_call_output", call_id: "call_read", output: "result" },
+          ],
+        })
+      );
+      expect(response.status).toBe(200);
+      const payload = JSON.stringify(seen[0]?.body);
+      expect(payload).toContain('"reasoning":{"effort":"max"}');
+      expect(payload).toContain('"content":"working","toolUses"');
+      expect(payload).toContain('"toolUseId":"call_read"');
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
   test("returns OpenAI error envelopes for Responses failures", async () => {
     const f = await fixture();
     try {
