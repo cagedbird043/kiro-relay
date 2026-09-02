@@ -1,0 +1,10 @@
+Kiro Relay includes code adapted from OmniRoute.
+
+Source: https://github.com/diegosouzapw/OmniRoute
+Upstream branch: release/v3.8.51
+Baseline commit: 97041954171ee3aa3f51a7fb01748797c23716f8
+License: MIT
+Copyright (c) 2026 diegosouzapw
+
+The copied Kiro protocol implementation has been trimmed to remove OmniRoute's
+router, database, dashboard, compression, and multi-provider control plane.

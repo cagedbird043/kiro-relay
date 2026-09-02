@@ -1,0 +1,14 @@
+listen: 127.0.0.1:4000
+models:
+  claude-opus-5:
+    contextLength: 1000000
+  claude-sonnet-5:
+    contextLength: 1000000
+  gpt-5.6-sol:
+    contextLength: 272000
+  gpt-5.6-terra:
+    contextLength: 272000
+  gpt-5.6-luna:
+    contextLength: 272000
+accounts:
+  - credentialFile: ~/.config/kiro-relay/account.json
