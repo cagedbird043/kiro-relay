@@ -14,6 +14,7 @@ import {
   supportsKiroAdaptiveThinking,
   supportsKiroNativeReasoning,
 } from "./adaptiveThinking.ts";
+import { supportsKiroImages } from "../modelCapabilities.ts";
 import { sanitizeKiroTools } from "../sanitizer.ts";
 
 /**
@@ -183,11 +184,9 @@ function convertMessages(messages, tools, model) {
   let toolsAttached = false;
   let toolDocs = "";
 
-  // Only Claude models support images in Kiro. Kiro also routes non-Claude
-  // models (deepseek, minimax, glm, qwen3-coder-next) that do not accept image
-  // attachments — gate image extraction behind a Claude check so we never
-  // attach images those models would reject.
-  const supportsImages = typeof model === "string" && model.toLowerCase().includes("claude");
+  // Attachments are accepted only for explicitly listed Kiro models. Unknown
+  // and known text-only models remain image-disabled by default.
+  const supportsImages = typeof model === "string" && supportsKiroImages(model);
 
   const flushPending = () => {
     if (currentRole === "user") {

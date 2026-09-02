@@ -6,7 +6,10 @@ import { createHandler, type ExecutorLike } from "../src/server.ts";
 
 const config = (credentialFile: string) => ({
   listen: "127.0.0.1:0",
-  models: { "claude-opus-5": { contextLength: 1_000_000 } },
+  models: {
+    "claude-opus-5": { contextLength: 1_000_000 },
+    "gpt-5.6-sol": { contextLength: 272_000 },
+  },
   accounts: [{ credentialFile }],
 });
 const request = (path: string, body?: unknown) => new Request(`http://relay${path}`, body === undefined ? undefined : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -25,7 +28,12 @@ describe("server routes", () => {
     try {
       const handler = createHandler(f.config, { execute: async () => ({ response: upstream() }), refreshCredentials: async () => null });
       expect((await handler(new Request("http://relay/healthz"))).status).toBe(200);
-      expect((await handler(new Request("http://relay/v1/models"))).json()).resolves.toMatchObject({ data: [{ id: "claude-opus-5", context_length: 1_000_000 }] });
+      expect((await handler(new Request("http://relay/v1/models"))).json()).resolves.toMatchObject({
+        data: [
+          { id: "claude-opus-5", object: "model", context_length: 1_000_000 },
+          { id: "gpt-5.6-sol", object: "model", context_length: 272_000 },
+        ],
+      });
       expect((await handler(request("/v1/messages/count_tokens", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }))).status).toBe(200);
     } finally { await rm(f.dir, { recursive: true, force: true }); }
   });
@@ -81,7 +89,71 @@ describe("server routes", () => {
     }
   });
 
+
+  test("routes native Responses requests in stream and nonstream modes", async () => {
+    const f = await fixture();
+    try {
+      const seen: Parameters<ExecutorLike["execute"]>[0][] = [];
+      const executor: ExecutorLike = {
+        execute: async (input) => {
+          seen.push(input);
+          return { response: upstream(true, "responses-ok") };
+        },
+        refreshCredentials: async () => null,
+      };
+      const handler = createHandler(f.config, executor);
+      const nonstream = await handler(
+        request("/v1/responses", { model: "gpt-5.6-sol", input: "hello" })
+      );
+      const nonstreamBody: unknown = await nonstream.json();
+      expect(nonstream.status).toBe(200);
+      expect(nonstreamBody).toMatchObject({ object: "response", output_text: "responses-ok" });
+
+      const stream = await handler(
+        request("/v1/responses", { model: "gpt-5.6-sol", input: "hello", stream: true })
+      );
+      const streamText = await stream.text();
+      expect(stream.status).toBe(200);
+      expect(streamText).toContain("event: response.created");
+      expect(streamText).toContain("event: response.completed");
+      expect(seen).toHaveLength(2);
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+  test("returns OpenAI error envelopes for Responses failures", async () => {
+    const f = await fixture();
+    try {
+      const executor: ExecutorLike = {
+        execute: async () => ({ response: upstream(true) }),
+        refreshCredentials: async () => null,
+      };
+      const handler = createHandler(f.config, executor);
+      const unknown = await handler(
+        request("/v1/responses", { model: "missing", input: "hello" })
+      );
+      const unknownBody: unknown = await unknown.json();
+      expect(unknown.status).toBe(400);
+      expect(unknownBody).toMatchObject({
+        error: { type: "invalid_request_error", param: null, code: null },
+      });
+
+      const stateful = await handler(
+        request("/v1/responses", {
+          model: "gpt-5.6-sol",
+          input: "hello",
+          previous_response_id: "resp_previous",
+        })
+      );
+      const statefulBody: unknown = await stateful.json();
+      expect(stateful.status).toBe(400);
+      expect(statefulBody).toMatchObject({ error: { type: "invalid_request_error" } });
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
   test("executor and translator errors become Anthropic JSON errors", async () => {
+
     const f = await fixture();
     try {
       const handler = createHandler(f.config, { execute: async () => { throw new Error("secret upstream payload"); }, refreshCredentials: async () => null });

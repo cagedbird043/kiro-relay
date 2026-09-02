@@ -9,6 +9,11 @@ import {
 import { buildKiroPayload } from "./kiro/request/openai-to-kiro.ts";
 import { KiroExecutor } from "./kiro/executor.ts";
 import type { ProviderCredentials } from "./kiro/base.ts";
+import {
+  buildKiroResponsesPayload,
+  type KiroResponsesRequest,
+} from "./responses/request.ts";
+import { collectResponses, responsesStream } from "./responses/response.ts";
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
 
@@ -17,6 +22,13 @@ function anthropicError(message: string, status = 400, type = "invalid_request_e
     status,
     headers: jsonHeaders,
   });
+}
+
+function openAIError(message: string, status = 400, type = "invalid_request_error"): Response {
+  return new Response(
+    JSON.stringify({ error: { message, type, param: null, code: null } }),
+    { status, headers: jsonHeaders }
+  );
 }
 
 function listenAddress(value: string): { hostname: string; port: number } {
@@ -49,80 +61,161 @@ function isRefreshResult(value: unknown): value is RefreshResult {
 function safeErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? error.message : fallback;
 }
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
 export function createHandler(config: AppConfig, executor: ExecutorLike = new KiroExecutor()) {
   return async function handler(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
     if (method === "GET" && url.pathname === "/healthz") return Response.json({ status: "ok" });
     if (method === "GET" && url.pathname === "/v1/models") {
-      return Response.json({ data: Object.entries(config.models).map(([id, spec]) => ({ id, object: "model", context_length: spec.contextLength })) });
+      return Response.json({
+        data: Object.entries(config.models).map(([id, spec]) => ({
+          id,
+          object: "model",
+          context_length: spec.contextLength,
+        })),
+      });
     }
-    if (method !== "POST" || !["/v1/messages", "/v1/messages/count_tokens"].includes(url.pathname)) {
+
+    const isResponses = url.pathname === "/v1/responses";
+    const isMessages = url.pathname === "/v1/messages";
+    const isCountTokens = url.pathname === "/v1/messages/count_tokens";
+    if (method !== "POST" || (!isResponses && !isMessages && !isCountTokens)) {
       return anthropicError("Not found", 404, "not_found_error");
     }
-    let body: Record<string, any>;
+    const requestError = (message: string, status = 400, type = "invalid_request_error") =>
+      isResponses ? openAIError(message, status, type) : anthropicError(message, status, type);
+
+    let body: Record<string, unknown>;
     try {
-      const parsed = await request.json();
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("body must be an object");
+      const parsed: unknown = await request.json();
+      if (!isRecord(parsed)) throw new Error("body must be an object");
       body = parsed;
-    } catch { return anthropicError("Request body must be valid JSON"); }
-    const model = typeof body.model === "string" ? body.model : "";
-    if (!model || !config.models[model]) return anthropicError(`Unknown model: ${model || "(missing)"}`);
-    if (url.pathname === "/v1/messages/count_tokens") {
-      try { return Response.json({ input_tokens: countAnthropicTokens(body) }); }
-      catch (error) { return anthropicError(error instanceof Error ? error.message : "Unable to count tokens"); }
+    } catch {
+      return requestError("Request body must be valid JSON");
     }
-    if (!Array.isArray(body.messages)) return anthropicError("messages must be an array");
+
+    const model = typeof body.model === "string" ? body.model : "";
+    if (!model || !config.models[model]) {
+      return requestError(`Unknown model: ${model || "(missing)"}`);
+    }
+    if (isCountTokens) {
+      try {
+        return Response.json({ input_tokens: countAnthropicTokens(body) });
+      } catch (error) {
+        return requestError(safeErrorMessage(error, "Unable to count tokens"));
+      }
+    }
+    if (isMessages && !Array.isArray(body.messages)) {
+      return requestError("messages must be an array");
+    }
+
     const account = config.accounts[0];
     let credentials: ProviderCredentials;
-    try { credentials = await loadCredentials(account.credentialFile); }
-    catch { return anthropicError("Unable to load configured credentials", 500, "api_error"); }
+    try {
+      credentials = await loadCredentials(account.credentialFile);
+    } catch {
+      return requestError("Unable to load configured credentials", 500, "api_error");
+    }
+
     const stream = body.stream === true;
-    let openaiBody: Record<string, any>;
+    let buildPayload: (currentCredentials: ProviderCredentials) => unknown;
     let payload: unknown;
     try {
-      openaiBody = anthropicToOpenAI(body);
-      payload = buildKiroPayload(model, openaiBody, stream, credentials);
+      if (isResponses) {
+        const responsesBody = { ...body, model } satisfies KiroResponsesRequest;
+        buildPayload = (currentCredentials) =>
+          buildKiroResponsesPayload(model, responsesBody, stream, currentCredentials);
+      } else {
+        const openaiBody = anthropicToOpenAI(body);
+        buildPayload = (currentCredentials) =>
+          buildKiroPayload(model, openaiBody, stream, currentCredentials);
+      }
+      payload = buildPayload(credentials);
     } catch (error) {
-      return anthropicError(safeErrorMessage(error, "Unable to translate request"));
+      return requestError(safeErrorMessage(error, "Unable to translate request"));
     }
+
     const log = {
       info: (tag: string, _message: string, _data?: unknown) => metadataLog(tag, { model }),
       error: (tag: string, _message: string, _data?: unknown) => metadataLog(tag, { model }),
     };
     const execute = () => executor.execute({ model, body: payload, stream, credentials, log });
     let result: { response: Response };
-    try { result = await execute(); }
-    catch { return anthropicError("Kiro upstream request failed", 502, "api_error"); }
+    try {
+      result = await execute();
+    } catch {
+      return requestError("Kiro upstream request failed", 502, "api_error");
+    }
+
     const credentialExpiry =
       typeof credentials.expiresAt === "string" ? Date.parse(credentials.expiresAt) : Number.NaN;
     const credentialsExpired =
       Number.isFinite(credentialExpiry) && credentialExpiry <= Date.now() + 60_000;
     if (result.response.status === 401 || (result.response.status === 403 && credentialsExpired)) {
       let refreshed: unknown;
-      try { refreshed = await executor.refreshCredentials(credentials, log); }
-      catch { return anthropicError("Kiro credentials expired", 401, "authentication_error"); }
-      if (!isRefreshResult(refreshed) || refreshed.error || typeof refreshed.accessToken !== "string" || !refreshed.accessToken) return anthropicError("Kiro credentials expired", 401, "authentication_error");
+      try {
+        refreshed = await executor.refreshCredentials(credentials, log);
+      } catch {
+        return requestError("Kiro credentials expired", 401, "authentication_error");
+      }
+      if (
+        !isRefreshResult(refreshed) ||
+        refreshed.error ||
+        typeof refreshed.accessToken !== "string" ||
+        !refreshed.accessToken
+      ) {
+        return requestError("Kiro credentials expired", 401, "authentication_error");
+      }
       credentials = {
         ...credentials,
         accessToken: refreshed.accessToken,
         ...(typeof refreshed.refreshToken === "string" ? { refreshToken: refreshed.refreshToken } : {}),
-        providerSpecificData: refreshed.providerSpecificData && typeof refreshed.providerSpecificData === "object" && !Array.isArray(refreshed.providerSpecificData) ? refreshed.providerSpecificData as ProviderCredentials["providerSpecificData"] : credentials.providerSpecificData,
+        providerSpecificData: isRecord(refreshed.providerSpecificData)
+          ? refreshed.providerSpecificData
+          : credentials.providerSpecificData,
       };
-      try { await saveCredentials(account.credentialFile, credentials); }
-      catch { return anthropicError("Unable to persist refreshed credentials", 500, "api_error"); }
       try {
-        payload = buildKiroPayload(model, openaiBody, stream, credentials);
+        await saveCredentials(account.credentialFile, credentials);
+      } catch {
+        return requestError("Unable to persist refreshed credentials", 500, "api_error");
+      }
+      try {
+        payload = buildPayload(credentials);
         result = await execute();
-      } catch { return anthropicError("Kiro upstream request failed", 502, "api_error"); }
+      } catch {
+        return requestError("Kiro upstream request failed", 502, "api_error");
+      }
     }
+
     if (!result.response.ok) {
       const status = result.response.status >= 500 ? 502 : result.response.status;
-      return anthropicError(`Kiro upstream request failed (${result.response.status})`, status, status === 401 ? "authentication_error" : "api_error");
+      return requestError(
+        `Kiro upstream request failed (${result.response.status})`,
+        status,
+        status === 401 ? "authentication_error" : "api_error"
+      );
     }
     metadataLog("REQUEST", { model, stream, status: result.response.status });
-    try { return stream ? openAIStreamToAnthropic(result.response, model) : await collectAnthropicResponse(result.response, model); }
-    catch (error) { return anthropicError(safeErrorMessage(error, "Unable to translate upstream response"), 502, "api_error"); }
+    try {
+      if (isResponses) {
+        return stream
+          ? responsesStream(result.response, model)
+          : Response.json(await collectResponses(result.response, model));
+      }
+      return stream
+        ? openAIStreamToAnthropic(result.response, model)
+        : await collectAnthropicResponse(result.response, model);
+    } catch (error) {
+      return requestError(
+        safeErrorMessage(error, "Unable to translate upstream response"),
+        502,
+        "api_error"
+      );
+    }
   };
 }
 
