@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { collectAnthropicResponse, countAnthropicTokens, openAIStreamToAnthropic } from "../src/anthropic.ts";
+import { anthropicToOpenAI, collectAnthropicResponse, countAnthropicTokens, openAIStreamToAnthropic } from "../src/anthropic.ts";
 
 function upstream(lines: string[]): Response {
   return new Response(lines.map((x) => `data: ${x}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
@@ -115,4 +115,32 @@ test("cleans up ping timer after terminal", async () => {
     globalThis.setInterval = originalSet;
     globalThis.clearInterval = originalClear;
   }
+});
+
+describe("Anthropic request validation", () => {
+  test("rejects unsupported request semantics and content blocks", () => {
+    const cases = [
+      [{ output_config: { format: "json" } }, "output_config.format"],
+      [{ output_config: { task_budget: 10 } }, "output_config.task_budget"],
+      [{ speed: "fast" }, "speed"],
+      [{ messages: [{ role: "user", content: [{ type: "document", source: {} }] }] }, "document"],
+      [{ messages: [{ role: "user", content: [{ type: "image", source: { type: "url", url: "https://example.com/a.png" } }] }] }, "remote image"],
+      [{ messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: [{ type: "image", source: { type: "base64", data: "AA==" } }] }] }] }, "structured tool_result"],
+    ] as const;
+    for (const [input, message] of cases) {
+      expect(() => anthropicToOpenAI(input as unknown as Record<string, unknown>)).toThrow(message);
+    }
+  });
+  test("continues accepting effort, text, base64 images, and thinking replay", () => {
+    expect(anthropicToOpenAI({
+      context_management: { compact_2025_01_28: { trigger: "auto" } },
+      messages: [
+        { role: "assistant", content: [{ type: "thinking", thinking: "prior", signature: "sig" }] },
+        { role: "user", content: [
+          { type: "text", text: "hello" },
+          { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } },
+        ] },
+      ],
+    }).messages).toBeDefined();
+  });
 });

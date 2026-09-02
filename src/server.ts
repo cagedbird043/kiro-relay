@@ -37,6 +37,38 @@ function openAIError(message: string, status = 400, type = "invalid_request_erro
   );
 }
 
+const UPSTREAM_ERROR_HEADERS = ["retry-after"] as const;
+
+function upstreamError(
+  response: Response,
+  isResponses: boolean,
+): Response {
+  const upstreamStatus = response.status;
+  const isRateLimited = upstreamStatus === 429;
+  const isOverloaded = upstreamStatus === 529;
+  const status = isRateLimited || isOverloaded
+    ? upstreamStatus
+    : upstreamStatus >= 500
+      ? 502
+      : upstreamStatus;
+  const type = isRateLimited
+    ? "rate_limit_error"
+    : isOverloaded
+      ? "overloaded_error"
+      : status === 401
+        ? "authentication_error"
+        : "api_error";
+  const headers = new Headers(jsonHeaders);
+  for (const name of UPSTREAM_ERROR_HEADERS) {
+    const value = response.headers.get(name);
+    if (value !== null) headers.set(name, value);
+  }
+  const message = `Kiro upstream request failed (${upstreamStatus})`;
+  return isResponses
+    ? new Response(JSON.stringify({ error: { message, type, param: null, code: null } }), { status, headers })
+    : new Response(JSON.stringify({ type: "error", error: { type, message } }), { status, headers });
+}
+
 function listenAddress(value: string): { hostname: string; port: number } {
   const last = value.lastIndexOf(":");
   if (last <= 0 || last === value.length - 1) throw new Error("listen must be host:port");
@@ -267,12 +299,7 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
     }
 
     if (!result.response.ok) {
-      const status = result.response.status >= 500 ? 502 : result.response.status;
-      return requestError(
-        `Kiro upstream request failed (${result.response.status})`,
-        status,
-        status === 401 ? "authentication_error" : "api_error"
-      );
+      return upstreamError(result.response, isResponses);
     }
     metadataLog("REQUEST", { model, stream, status: result.response.status });
     try {

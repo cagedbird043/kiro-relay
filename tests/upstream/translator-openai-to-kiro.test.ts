@@ -1273,3 +1273,35 @@ test("buildKiroPayload drops both temperature and top_p when thinking is enabled
   assert.equal(result.inferenceConfig?.temperature, undefined, "temperature must be dropped");
   assert.equal(result.inferenceConfig?.topP, undefined, "top_p must be dropped");
 });
+
+function choicePayload(toolChoice: unknown, toolName = "lookup") {
+  return buildKiroPayload("claude-sonnet-4", {
+    messages: [{ role: "user", content: "hello" }],
+    tools: [{ type: "function", function: { name: toolName, description: "Lookup", parameters: { type: "object" } } }],
+    tool_choice: toolChoice,
+  }, false, {});
+}
+
+test("lowers Anthropic tool_choice variants to exact Kiro context shapes", () => {
+  for (const [choice, expected] of [["auto", { auto: {} }], [{ type: "auto" }, { auto: {} }], ["any", { any: {} }], [{ type: "any" }, { any: {} }], ["none", { none: {} }], [{ type: "none" }, { none: {} }], [{ type: "tool", name: "lookup" }, { tool: { name: "lookup" } }]] as const) {
+    const context = choicePayload(choice).conversationState.currentMessage.userInputMessage.userInputMessageContext;
+    assert.deepEqual(context?.toolChoice, expected);
+  }
+});
+
+test("sanitizes long forced tool names consistently and rejects invalid choices", () => {
+  const longName = "tool_" + "x".repeat(100);
+  const payload = choicePayload({ type: "tool", name: longName }, longName);
+  const context = payload.conversationState.currentMessage.userInputMessage.userInputMessageContext;
+  const firstTool = context?.tools?.[0];
+  const spec = firstTool && typeof firstTool === "object" && "toolSpecification" in firstTool ? firstTool.toolSpecification : undefined;
+  const sanitized = spec && typeof spec === "object" && "name" in spec ? spec.name : undefined;
+  assert.equal(typeof sanitized, "string");
+  assert.notEqual(sanitized, longName);
+  const lowered = context?.toolChoice;
+  const loweredName = lowered && typeof lowered === "object" && "tool" in lowered && lowered.tool && typeof lowered.tool === "object" && "name" in lowered.tool ? lowered.tool.name : undefined;
+  assert.equal(loweredName, sanitized);
+  assert.throws(() => choicePayload({ type: "tool", name: "missing" }), /undeclared/);
+  assert.throws(() => choicePayload("required"), /tool_choice/);
+  assert.throws(() => choicePayload({ type: "any", disable_parallel_tool_use: true }), /disable_parallel_tool_use/);
+});

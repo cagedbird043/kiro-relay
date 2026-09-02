@@ -1056,6 +1056,44 @@ export function buildKiroPayload(model, body, stream, credentials) {
       (payload as typeof payload & { _toolNameMap: Record<string, string> })._toolNameMap =
         Object.fromEntries(nameMap);
     }
+
+    // Lower Anthropic tool_choice only after sanitization, so forced long names
+    // use the exact name declared in Kiro's tool schema.
+    if (body.tool_choice !== undefined) {
+      const choice = body.tool_choice;
+      const choiceObject = choice && typeof choice === "object" && !Array.isArray(choice)
+        ? choice as Record<string, unknown> : undefined;
+      if (choiceObject?.disable_parallel_tool_use === true) {
+        throw new Error("Unsupported tool_choice.disable_parallel_tool_use");
+      }
+      const choiceType = typeof choice === "string" ? choice : choiceObject?.type;
+      if (choiceType === "auto") context.toolChoice = { auto: {} };
+      else if (choiceType === "any") context.toolChoice = { any: {} };
+      else if (choiceType === "none") context.toolChoice = { none: {} };
+      else if (choiceType === "tool" && typeof choiceObject?.name === "string" && choiceObject.name) {
+        const originalName = choiceObject.name;
+        const sanitizedName = [...nameMap.entries()].find(([, original]) => original === originalName)?.[0] ?? originalName;
+        const declared = (sanitizedTools as Array<Record<string, unknown>>).some((tool) =>
+          (tool.toolSpecification as Record<string, unknown> | undefined)?.name === sanitizedName
+        );
+        if (!declared) throw new Error(`tool_choice references undeclared tool: ${originalName}`);
+        context.toolChoice = { tool: { name: sanitizedName } };
+      } else {
+        throw new Error("Invalid tool_choice");
+      }
+    }
+  } else if (body.tool_choice !== undefined) {
+    const choice = body.tool_choice;
+    const choiceObject = choice && typeof choice === "object" && !Array.isArray(choice)
+      ? choice as Record<string, unknown> : undefined;
+    if (choiceObject?.disable_parallel_tool_use === true) {
+      throw new Error("Unsupported tool_choice.disable_parallel_tool_use");
+    }
+    const choiceType = typeof choice === "string" ? choice : choiceObject?.type;
+    const target = payload.conversationState.currentMessage.userInputMessage;
+    if (choiceType === "auto") (target.userInputMessageContext ??= {}).toolChoice = { auto: {} };
+    else if (choiceType === "none") (target.userInputMessageContext ??= {}).toolChoice = { none: {} };
+    else throw new Error("tool_choice requires declared tools");
   }
 
   return payload;

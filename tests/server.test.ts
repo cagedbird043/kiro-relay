@@ -195,6 +195,53 @@ describe("server routes", () => {
       await rm(f.dir, { recursive: true, force: true });
     }
   });
+  test("preserves upstream overload statuses and Retry-After on both protocols", async () => {
+    const cases = [
+      { path: "/v1/messages", body: { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }, type429: "rate_limit_error", type529: "overloaded_error" },
+      { path: "/v1/responses", body: { model: "gpt-5.6-sol", input: "hi" }, type429: "rate_limit_error", type529: "overloaded_error" },
+    ] as const;
+    for (const protocol of cases) {
+      for (const [status, type] of [[429, protocol.type429], [529, protocol.type529]] as const) {
+        const f = await fixture();
+        try {
+          const handler = createHandler(f.config, {
+            execute: async () => ({ response: new Response("upstream secret", { status, headers: { "retry-after": "17", "x-upstream-secret": "no" } }) }),
+            refreshCredentials: async () => null,
+          });
+          const response = await handler(request(protocol.path, protocol.body));
+          const body = await response.json() as { error: { type: string; message: string } };
+          expect(response.status).toBe(status);
+          expect(body.error.type).toBe(type);
+          expect(body.error.message).toBe(`Kiro upstream request failed (${status})`);
+          expect(response.headers.get("retry-after")).toBe("17");
+          expect(response.headers.get("x-upstream-secret")).toBeNull();
+          expect(JSON.stringify(body)).not.toContain("upstream secret");
+        } finally { await rm(f.dir, { recursive: true, force: true }); }
+      }
+    }
+  });
+
+  test("maps ordinary upstream 5xx to 502 on both protocols", async () => {
+    const cases = [
+      ["/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }],
+      ["/v1/responses", { model: "gpt-5.6-sol", input: "hi" }],
+    ] as const;
+    for (const [path, body] of cases) {
+      const f = await fixture();
+      try {
+        const handler = createHandler(f.config, {
+          execute: async () => ({ response: new Response("upstream secret", { status: 503, headers: { "retry-after": "17" } }) }),
+          refreshCredentials: async () => null,
+        });
+        const response = await handler(request(path, body));
+        const payload = await response.json() as { error: { type: string } };
+        expect(response.status).toBe(502);
+        expect(payload.error.type).toBe("api_error");
+        expect(response.headers.get("retry-after")).toBe("17");
+      } finally { await rm(f.dir, { recursive: true, force: true }); }
+    }
+  });
+
   test("executor and translator errors become Anthropic JSON errors", async () => {
 
     const f = await fixture();

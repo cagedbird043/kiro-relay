@@ -3,6 +3,41 @@ import { readKiroEvents, type KiroEvent } from "./kiro/events.ts";
 type Json = Record<string, unknown>;
 
 export function anthropicToOpenAI(body: Json): Json {
+  const reject = (message: string): never => { throw new Error(message); };
+  const outputConfig = body.output_config;
+  if (outputConfig && typeof outputConfig === "object" && !Array.isArray(outputConfig)) {
+    const unsupported = ["format", "task_budget"].find((key) => key in (outputConfig as Json));
+    if (unsupported) reject(`Unsupported output_config.${unsupported}`);
+  }
+  if ("speed" in body) reject("Unsupported speed");
+  const validateBlock = (block: unknown, location: string) => {
+    if (!block || typeof block !== "object") return;
+    const b = block as Json;
+    if (b.type === "document") reject(`Unsupported ${location} document content`);
+    const source = b.source && typeof b.source === "object" ? b.source as Json : undefined;
+    const imageUrl = b.image_url && typeof b.image_url === "object" ? b.image_url as Json : undefined;
+    const remoteImage =
+      (b.type === "image" && source?.type === "url") ||
+      (b.type === "image_url" && typeof imageUrl?.url === "string" && !imageUrl.url.startsWith("data:"));
+    if (remoteImage) reject(`Unsupported ${location} remote image URL`);
+    if (b.type === "tool_result" && Array.isArray(b.content)) {
+      for (const item of b.content) {
+        if (item && typeof item === "object" && (item as Json).type !== "text") {
+          reject(`Unsupported ${location} structured tool_result content`);
+        }
+      }
+    }
+  };
+  if (Array.isArray(body.messages)) {
+    for (const message of body.messages) {
+      if (!message || typeof message !== "object") continue;
+      const content = (message as Json).content;
+      if (Array.isArray(content)) content.forEach((block) => validateBlock(block, "message"));
+    }
+  }
+  if (Array.isArray(body.system)) {
+    for (const block of body.system) validateBlock(block, "system");
+  }
   const out: Json = { ...body };
   if (Array.isArray(body.messages)) out.messages = body.messages.map((message) => {
     if (!message || typeof message !== "object") return message;
