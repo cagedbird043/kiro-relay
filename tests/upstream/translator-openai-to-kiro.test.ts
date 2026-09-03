@@ -708,6 +708,10 @@ test("OpenAI -> Kiro serializes image tool_result content to non-empty text", ()
   assert.ok(imgResult, "tool result should exist");
   const text = imgResult!.content[0].text;
   assert.ok(text && text.length > 0, `text must not be empty for image content, got: '${text}'`);
+  const images = result.conversationState.currentMessage.userInputMessage.images as
+    | Array<{ format: string; source: { bytes: string } }>
+    | undefined;
+  assert.deepEqual(images, [{ format: "png", source: { bytes: "abc123" } }]);
 });
 
 test("OpenAI -> Kiro serializes JSON-object tool_result content to non-empty text", () => {

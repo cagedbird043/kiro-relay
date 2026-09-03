@@ -22,9 +22,19 @@ export function anthropicToOpenAI(body: Json): Json {
     if (remoteImage) reject(`Unsupported ${location} remote image URL`);
     if (b.type === "tool_result" && Array.isArray(b.content)) {
       for (const item of b.content) {
-        const validText = item && typeof item === "object" && !Array.isArray(item) &&
-          (item as Json).type === "text" && typeof (item as Json).text === "string";
-        if (!validText) reject(`Unsupported ${location} structured tool_result content`);
+        if (!item || typeof item !== "object" || Array.isArray(item)) {
+          reject(`Unsupported ${location} structured tool_result content`);
+        }
+        const structured = item as Json;
+        const validText = structured.type === "text" && typeof structured.text === "string";
+        const imageSource = structured.source && typeof structured.source === "object" &&
+          !Array.isArray(structured.source) ? structured.source as Json : undefined;
+        const validBase64Image = structured.type === "image" && imageSource?.type === "base64" &&
+          typeof imageSource.media_type === "string" && imageSource.media_type.startsWith("image/") &&
+          typeof imageSource.data === "string" && imageSource.data.length > 0;
+        if (!validText && !validBase64Image) {
+          reject(`Unsupported ${location} structured tool_result content`);
+        }
       }
     }
   };

@@ -134,14 +134,17 @@ describe("Anthropic request validation", () => {
       expect(() => anthropicToOpenAI(input as unknown as Record<string, unknown>)).toThrow(message);
     }
   });
-  test("continues accepting effort, text, base64 images, and thinking replay", () => {
+  test("continues accepting effort, text, base64 images, thinking replay, and image tool results", () => {
     expect(anthropicToOpenAI({
       context_management: { compact_2025_01_28: { trigger: "auto" } },
       messages: [
         { role: "assistant", content: [{ type: "thinking", thinking: "prior", signature: "sig" }] },
         { role: "user", content: [
           { type: "text", text: "hello" },
-          { type: "tool_result", tool_use_id: "id", content: [{ type: "text", text: "done" }] },
+          { type: "tool_result", tool_use_id: "id", content: [
+            { type: "text", text: "Image dimensions: 32x32." },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } },
+          ] },
           { type: "image", source: { type: "base64", media_type: "image/png", data: "AA==" } },
         ] },
       ],

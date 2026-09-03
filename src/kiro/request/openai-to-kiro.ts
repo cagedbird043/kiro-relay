@@ -381,7 +381,9 @@ function convertMessages(messages, tools, model) {
           }
         }
 
-        // Check for tool_result blocks
+        // Check for tool_result blocks. Kiro keeps tool observations in
+        // userInputMessageContext, while image bytes belong on the surrounding
+        // userInputMessage. Preserve both parts of an Anthropic Read result.
         const toolResultBlocks = msg.content.filter((c) => c.type === "tool_result");
         if (toolResultBlocks.length > 0) {
           toolResultBlocks.forEach((block) => {
@@ -391,6 +393,15 @@ function convertMessages(messages, tools, model) {
               status: block.is_error ? "error" : "success",
               content: [{ text: text }],
             });
+            if (supportsImages && Array.isArray(block.content)) {
+              for (const item of block.content) {
+                if (item?.type !== "image" || item.source?.type !== "base64") continue;
+                const format = (item.source.media_type || "image/jpeg").split("/")[1] || "jpeg";
+                if (item.source.data) {
+                  pendingImages.push({ format, source: { bytes: item.source.data } });
+                }
+              }
+            }
           });
         }
       }
