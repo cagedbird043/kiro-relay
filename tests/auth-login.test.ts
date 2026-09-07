@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loginWithBuilderId, type DeviceLoginDependencies } from "../src/auth-login.ts";
+import { loginWithKiroOidc, type DeviceLoginDependencies } from "../src/auth-login.ts";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -48,7 +48,7 @@ describe("Builder ID device login", () => {
       output: (message) => messages.push(message),
     };
 
-    const credentials = await loginWithBuilderId(outputPath, dependencies);
+    const credentials = await loginWithKiroOidc({ outputPath }, dependencies);
     expect(calls.map((call) => new URL(call.url).pathname)).toEqual([
       "/client/register",
       "/device_authorization",
@@ -98,7 +98,7 @@ describe("Builder ID device login", () => {
       output: () => undefined,
     };
 
-    await expect(loginWithBuilderId(outputPath, dependencies)).rejects.toThrow("AccessDeniedException");
+    await expect(loginWithKiroOidc({ outputPath }, dependencies)).rejects.toThrow("AccessDeniedException");
     expect(await Bun.file(outputPath).exists()).toBe(false);
   });
 
@@ -124,7 +124,43 @@ describe("Builder ID device login", () => {
       output: () => undefined,
     };
 
-    await expect(loginWithBuilderId(outputPath, dependencies)).rejects.toThrow("expired before approval");
+    await expect(loginWithKiroOidc({ outputPath }, dependencies)).rejects.toThrow("expired before approval");
     expect(tokenPolls).toBe(1);
+  });
+
+  test("uses an enterprise start URL without the Builder ID issuer", async () => {
+    const outputPath = await destination();
+    const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const responses = [
+      json({ clientId: "idc-client", clientSecret: "idc-secret" }),
+      json({ deviceCode: "device", userCode: "CODE", verificationUri: "https://signin", expiresIn: 600, interval: 1 }),
+      json({ accessToken: "access", refreshToken: "refresh", expiresIn: 3600 }),
+    ];
+    const dependencies: DeviceLoginDependencies = {
+      fetch: (async (input, init) => {
+        calls.push({ url: String(input), body: JSON.parse(String(init?.body)) as Record<string, unknown> });
+        const response = responses.shift();
+        if (!response) throw new Error("unexpected fetch");
+        return response;
+      }) as typeof fetch,
+      sleep: async () => undefined,
+      now: () => 1_000_000,
+      output: () => undefined,
+    };
+
+    const credentials = await loginWithKiroOidc({
+      outputPath,
+      startUrl: "https://us-east-1.signin.aws",
+      region: "us-east-1",
+    }, dependencies);
+    expect(calls[0].body.issuerUrl).toBeUndefined();
+    expect(calls[1].body.startUrl).toBe("https://us-east-1.signin.aws");
+    expect(credentials.providerSpecificData).toEqual({
+      authMethod: "idc",
+      provider: "Enterprise",
+      clientId: "idc-client",
+      clientSecret: "idc-secret",
+      region: "us-east-1",
+    });
   });
 });

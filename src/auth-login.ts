@@ -4,8 +4,8 @@ import { homedir } from "node:os";
 import { saveCredentials } from "./credentials.ts";
 import type { ProviderCredentials } from "./kiro/base.ts";
 
-const REGION = "us-east-1";
-const OIDC_BASE_URL = `https://oidc.${REGION}.amazonaws.com`;
+const DEFAULT_REGION = "us-east-1";
+const BUILDER_ID_START_URL = "https://view.awsapps.com/start";
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 const SCOPES = [
   "codewhisperer:completions",
@@ -38,6 +38,12 @@ interface OAuthError {
   code: string;
 }
 
+
+export interface KiroOidcLoginOptions {
+  outputPath: string;
+  startUrl?: string;
+  region?: string;
+}
 export interface DeviceLoginDependencies {
   fetch: typeof fetch;
   sleep(milliseconds: number): Promise<void>;
@@ -105,11 +111,12 @@ async function jsonResponse(response: Response, operation: string): Promise<Reco
 
 async function postJson(
   dependencies: DeviceLoginDependencies,
+  region: string,
   path: string,
   body: Record<string, unknown>,
   operation: string,
 ): Promise<Record<string, unknown>> {
-  const response = await dependencies.fetch(`${OIDC_BASE_URL}${path}`, {
+  const response = await dependencies.fetch(`https://oidc.${region}.amazonaws.com${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify(body),
@@ -117,13 +124,17 @@ async function postJson(
   return jsonResponse(response, operation);
 }
 
-async function registerClient(dependencies: DeviceLoginDependencies): Promise<OidcClientRegistration> {
-  const body = await postJson(dependencies, "/client/register", {
+async function registerClient(
+  dependencies: DeviceLoginDependencies,
+  region: string,
+  enterprise: boolean,
+): Promise<OidcClientRegistration> {
+  const body = await postJson(dependencies, region, "/client/register", {
     clientName: "kiro-oauth-client",
     clientType: "public",
     scopes: SCOPES,
     grantTypes: [DEVICE_GRANT, "refresh_token"],
-    issuerUrl: "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6",
+    ...(!enterprise ? { issuerUrl: "https://identitycenter.amazonaws.com/ssoins-722374e8c3c8e6c6" } : {}),
   }, "OIDC client registration");
   const expires = body.clientSecretExpiresAt;
   if (expires !== undefined && (typeof expires !== "number" || !Number.isFinite(expires))) {
@@ -138,12 +149,14 @@ async function registerClient(dependencies: DeviceLoginDependencies): Promise<Oi
 
 async function startDeviceAuthorization(
   dependencies: DeviceLoginDependencies,
+  region: string,
+  startUrl: string,
   client: OidcClientRegistration,
 ): Promise<DeviceAuthorization> {
-  const body = await postJson(dependencies, "/device_authorization", {
+  const body = await postJson(dependencies, region, "/device_authorization", {
     clientId: client.clientId,
     clientSecret: client.clientSecret,
-    startUrl: "https://view.awsapps.com/start",
+    startUrl,
   }, "OIDC device authorization");
   return {
     deviceCode: requiredString(body, "deviceCode"),
@@ -166,6 +179,7 @@ function oauthError(body: Record<string, unknown>): OAuthError {
 
 async function pollForTokens(
   dependencies: DeviceLoginDependencies,
+  region: string,
   client: OidcClientRegistration,
   device: DeviceAuthorization,
 ): Promise<DeviceTokens> {
@@ -173,7 +187,7 @@ async function pollForTokens(
   let intervalMs = device.interval * 1000;
   while (dependencies.now() < deadline) {
     await dependencies.sleep(intervalMs);
-    const response = await dependencies.fetch(`${OIDC_BASE_URL}/token`, {
+    const response = await dependencies.fetch(`https://oidc.${region}.amazonaws.com/token`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({
@@ -208,48 +222,71 @@ async function pollForTokens(
   throw new Error("OIDC device authorization expired before approval");
 }
 
-export async function loginWithBuilderId(
-  outputPath: string,
+export async function loginWithKiroOidc(
+  options: KiroOidcLoginOptions,
   dependencies: DeviceLoginDependencies = DEFAULT_DEPENDENCIES,
 ): Promise<ProviderCredentials> {
-  const client = await registerClient(dependencies);
-  const device = await startDeviceAuthorization(dependencies, client);
+  const region = options.region ?? DEFAULT_REGION;
+  if (!/^[a-z]{2}(?:-gov)?-[a-z]+-\d$/.test(region)) {
+    throw new Error("AWS region must have a canonical region name such as us-east-1");
+  }
+  const startUrl = options.startUrl ?? BUILDER_ID_START_URL;
+  let parsedStartUrl: URL;
+  try {
+    parsedStartUrl = new URL(startUrl);
+  } catch {
+    throw new Error("IDC start URL must be a valid HTTPS URL");
+  }
+  if (parsedStartUrl.protocol !== "https:") {
+    throw new Error("IDC start URL must be a valid HTTPS URL");
+  }
+  const enterprise = startUrl !== BUILDER_ID_START_URL;
+  const client = await registerClient(dependencies, region, enterprise);
+  const device = await startDeviceAuthorization(dependencies, region, startUrl, client);
   dependencies.output("Authorize this VPS in your browser:");
   dependencies.output(device.verificationUriComplete ?? device.verificationUri);
   dependencies.output(`Device code: ${device.userCode}`);
-  const tokens = await pollForTokens(dependencies, client, device);
+  const tokens = await pollForTokens(dependencies, region, client, device);
   const credentials: ProviderCredentials = {
     accessToken: tokens.accessToken,
     refreshToken: tokens.refreshToken,
     expiresAt: new Date(dependencies.now() + tokens.expiresIn * 1000).toISOString(),
     providerSpecificData: {
-      authMethod: "builder-id",
-      provider: "AWS Builder ID",
+      authMethod: enterprise ? "idc" : "builder-id",
+      provider: enterprise ? "Enterprise" : "AWS Builder ID",
       clientId: client.clientId,
       clientSecret: client.clientSecret,
       ...(client.clientSecretExpiresAt !== undefined
         ? { clientSecretExpiresAt: client.clientSecretExpiresAt }
         : {}),
-      region: REGION,
+      region,
     },
   };
-  await mkdir(dirname(outputPath), { recursive: true, mode: 0o700 });
-  await saveCredentials(outputPath, credentials);
-  dependencies.output(`Credentials saved to ${outputPath}`);
+  await mkdir(dirname(options.outputPath), { recursive: true, mode: 0o700 });
+  await saveCredentials(options.outputPath, credentials);
+  dependencies.output(`Credentials saved to ${options.outputPath}`);
   return credentials;
 }
 
-function outputArgument(arguments_: string[]): string {
-  if (arguments_.length === 0) return resolve(homedir(), ".config/kiro-relay/account.json");
-  if (arguments_.length === 2 && arguments_[0] === "--output" && arguments_[1]) {
-    return resolve(arguments_[1]);
+function commandOptions(arguments_: string[]): KiroOidcLoginOptions {
+  let outputPath = resolve(homedir(), ".config/kiro-relay/account.json");
+  let startUrl: string | undefined;
+  let region: string | undefined;
+  for (let index = 0; index < arguments_.length; index += 2) {
+    const flag = arguments_[index];
+    const value = arguments_[index + 1];
+    if (!value) throw new Error("Every login option requires a value");
+    if (flag === "--output") outputPath = resolve(value);
+    else if (flag === "--start-url") startUrl = value;
+    else if (flag === "--region") region = value;
+    else throw new Error(`Unknown login option: ${flag}`);
   }
-  throw new Error("Usage: bun run auth:login [--output /path/to/account.json]");
+  return { outputPath, ...(startUrl ? { startUrl } : {}), ...(region ? { region } : {}) };
 }
 
 if (import.meta.main) {
   try {
-    await loginWithBuilderId(outputArgument(process.argv.slice(2)));
+    await loginWithKiroOidc(commandOptions(process.argv.slice(2)));
   } catch (error) {
     console.error(error instanceof Error ? error.message : "Kiro login failed");
     process.exitCode = 1;
