@@ -78,7 +78,16 @@ function listenAddress(value: string): { hostname: string; port: number } {
   return { hostname, port };
 }
 
-const SAFE_LOG_KEYS: Record<string, true> = { model: true, stream: true, status: true, url: true, attempt: true, phase: true };
+const SAFE_LOG_KEYS: Record<string, true> = {
+  model: true,
+  stream: true,
+  status: true,
+  url: true,
+  attempt: true,
+  phase: true,
+  category: true,
+  code: true,
+};
 
 function metadataLog(tag: string, data: Record<string, unknown>) {
   const safe = Object.fromEntries(Object.entries(data).filter(([key, value]) => SAFE_LOG_KEYS[key] && (typeof value === "string" || typeof value === "number" || typeof value === "boolean")));
@@ -90,7 +99,15 @@ export type ExecutorLike = {
   refreshCredentials(credentials: ProviderCredentials, log?: unknown): Promise<unknown>;
 };
 
-type RefreshResult = { accessToken?: unknown; refreshToken?: unknown; providerSpecificData?: unknown; error?: unknown };
+type RefreshResult = {
+  accessToken?: unknown;
+  refreshToken?: unknown;
+  expiresIn?: unknown;
+  expiresAt?: unknown;
+  providerSpecificData?: unknown;
+  error?: unknown;
+  code?: unknown;
+};
 
 function isRefreshResult(value: unknown): value is RefreshResult {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -102,6 +119,86 @@ function safeErrorMessage(error: unknown, fallback: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+const REFRESH_LEAD_MS = 5 * 60_000;
+
+type CredentialRefreshOutcome =
+  | { credentials: ProviderCredentials }
+  | { error: "refresh_failed" | "persist_failed"; code?: string };
+
+function credentialExpiry(credentials: ProviderCredentials): number | undefined {
+  if (typeof credentials.expiresAt !== "string") return undefined;
+  const value = Date.parse(credentials.expiresAt);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function expiresWithin(credentials: ProviderCredentials, leadMs: number): boolean {
+  const expiry = credentialExpiry(credentials);
+  return expiry !== undefined && expiry <= Date.now() + leadMs;
+}
+
+function refreshCode(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  for (const key of ["code", "oauthErr", "awsErrorType"]) {
+    if (typeof value[key] === "string" && value[key].length <= 80) return value[key];
+  }
+  return undefined;
+}
+
+function normalizeRefreshedCredentials(
+  current: ProviderCredentials,
+  refreshed: RefreshResult,
+): ProviderCredentials | undefined {
+  if (refreshed.error || typeof refreshed.accessToken !== "string" || !refreshed.accessToken) {
+    return undefined;
+  }
+  let expiresAt: string | undefined;
+  if (typeof refreshed.expiresAt === "string" && Number.isFinite(Date.parse(refreshed.expiresAt))) {
+    expiresAt = new Date(refreshed.expiresAt).toISOString();
+  } else if (typeof refreshed.expiresIn === "number" && Number.isFinite(refreshed.expiresIn) && refreshed.expiresIn > 0) {
+    const expiry = Date.now() + refreshed.expiresIn * 1000;
+    if (Number.isFinite(expiry)) expiresAt = new Date(expiry).toISOString();
+  }
+  const { expiresAt: _staleExpiry, ...base } = current;
+  return {
+    ...base,
+    accessToken: refreshed.accessToken,
+    ...(typeof refreshed.refreshToken === "string" && refreshed.refreshToken
+      ? { refreshToken: refreshed.refreshToken }
+      : {}),
+    ...(expiresAt ? { expiresAt } : {}),
+    providerSpecificData: isRecord(refreshed.providerSpecificData)
+      ? refreshed.providerSpecificData
+      : current.providerSpecificData,
+  };
+}
+
+type CredentialRefreshLog = {
+  debug(tag: string, message: string, data?: unknown): void;
+  info(tag: string, message: string, data?: unknown): void;
+  warn(tag: string, message: string, data?: unknown): void;
+  error(tag: string, message: string, data?: unknown): void;
+};
+
+function executorLog(model: string): CredentialRefreshLog {
+  const write = (phase: string, tag: string, data?: unknown) => {
+    const record = isRecord(data) ? data : {};
+    const code = refreshCode(record);
+    metadataLog(tag, {
+      model,
+      phase,
+      category: "credential_refresh",
+      ...(typeof record.status === "number" ? { status: record.status } : {}),
+      ...(code ? { code } : {}),
+    });
+  };
+  return {
+    debug: (tag: string, _message: string, data?: unknown) => write("debug", tag, data),
+    info: (tag: string, _message: string, data?: unknown) => write("info", tag, data),
+    warn: (tag: string, _message: string, data?: unknown) => write("warning", tag, data),
+    error: (tag: string, _message: string, data?: unknown) => write("failed", tag, data),
+  };
 }
 
 function responseToolMetadata(payload: unknown): ResponseToolMetadata {
@@ -128,6 +225,71 @@ function responsesOptions(payload: unknown): ResponsesOptions {
   };
 }
 export function createHandler(config: AppConfig, executor: ExecutorLike = new KiroExecutor()) {
+  const account = config.accounts[0];
+  const refreshFlights = new Map<string, Promise<CredentialRefreshOutcome>>();
+
+  const refreshAccount = async (
+    model: string,
+    log: CredentialRefreshLog,
+    rejectedAccessToken?: string,
+  ): Promise<CredentialRefreshOutcome> => {
+    const path = account.credentialFile;
+    const active = refreshFlights.get(path);
+    if (active) return active;
+
+    const flight = (async (): Promise<CredentialRefreshOutcome> => {
+      let latest: ProviderCredentials;
+      try {
+        latest = await loadCredentials(path);
+      } catch {
+        metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_reload", code: "credential_reload_failed" });
+        return { error: "refresh_failed", code: "credential_reload_failed" };
+      }
+
+      const anotherRequestRefreshed = rejectedAccessToken !== undefined &&
+        latest.accessToken !== rejectedAccessToken && !expiresWithin(latest, 0);
+      const proactiveRefreshNoLongerNeeded = rejectedAccessToken === undefined &&
+        !expiresWithin(latest, REFRESH_LEAD_MS);
+      if (anotherRequestRefreshed || proactiveRefreshNoLongerNeeded) {
+        return { credentials: latest };
+      }
+
+      metadataLog("TOKEN_REFRESH", { model, phase: "started", category: "credential_refresh" });
+      let value: unknown;
+      try {
+        value = await executor.refreshCredentials(latest, log);
+      } catch {
+        metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_refresh", code: "refresh_exception" });
+        return { error: "refresh_failed", code: "refresh_exception" };
+      }
+      if (!isRefreshResult(value)) {
+        metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_refresh", code: "refresh_failed" });
+        return { error: "refresh_failed", code: "refresh_failed" };
+      }
+      const refreshed = normalizeRefreshedCredentials(latest, value);
+      if (!refreshed) {
+        const code = refreshCode(value) ?? "refresh_rejected";
+        metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_refresh", code });
+        return { error: "refresh_failed", code };
+      }
+      try {
+        await saveCredentials(path, refreshed);
+      } catch {
+        metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_persistence", code: "persist_failed" });
+        return { error: "persist_failed", code: "persist_failed" };
+      }
+      metadataLog("TOKEN_REFRESH", { model, phase: "succeeded", category: "credential_refresh" });
+      return { credentials: refreshed };
+    })();
+
+    refreshFlights.set(path, flight);
+    try {
+      return await flight;
+    } finally {
+      if (refreshFlights.get(path) === flight) refreshFlights.delete(path);
+    }
+  };
+
   return async function handler(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
@@ -220,7 +382,6 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
       return requestError("messages must be an array");
     }
 
-    const account = config.accounts[0];
     let credentials: ProviderCredentials;
     try {
       credentials = await loadCredentials(account.credentialFile);
@@ -229,6 +390,18 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
     }
 
     const stream = body.stream === true;
+    const log = executorLog(model);
+    if (expiresWithin(credentials, REFRESH_LEAD_MS)) {
+      const proactive = await refreshAccount(model, log);
+      if ("credentials" in proactive) {
+        credentials = proactive.credentials;
+      } else if (proactive.error === "persist_failed") {
+        return requestError("Unable to persist refreshed credentials", 500, "api_error");
+      } else if (expiresWithin(credentials, 0)) {
+        return requestError("Kiro credentials expired", 401, "authentication_error");
+      }
+    }
+
     let buildPayload: (currentCredentials: ProviderCredentials) => unknown;
     let payload: unknown;
     try {
@@ -245,11 +418,6 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
     } catch (error) {
       return requestError(safeErrorMessage(error, "Unable to translate request"));
     }
-
-    const log = {
-      info: (tag: string, _message: string, _data?: unknown) => metadataLog(tag, { model }),
-      error: (tag: string, _message: string, _data?: unknown) => metadataLog(tag, { model }),
-    };
     const execute = () => executor.execute({ model, body: payload, stream, credentials, signal: request.signal, log });
     let result: { response: Response };
     try {
@@ -258,38 +426,16 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
       return requestError("Kiro upstream request failed", 502, "api_error");
     }
 
-    const credentialExpiry =
-      typeof credentials.expiresAt === "string" ? Date.parse(credentials.expiresAt) : Number.NaN;
-    const credentialsExpired =
-      Number.isFinite(credentialExpiry) && credentialExpiry <= Date.now() + 60_000;
+    const credentialsExpired = expiresWithin(credentials, 60_000);
     if (result.response.status === 401 || (result.response.status === 403 && credentialsExpired)) {
-      let refreshed: unknown;
-      try {
-        refreshed = await executor.refreshCredentials(credentials, log);
-      } catch {
-        return requestError("Kiro credentials expired", 401, "authentication_error");
+      const rejectedAccessToken = credentials.accessToken;
+      const reactive = await refreshAccount(model, log, rejectedAccessToken);
+      if (!("credentials" in reactive)) {
+        return reactive.error === "persist_failed"
+          ? requestError("Unable to persist refreshed credentials", 500, "api_error")
+          : requestError("Kiro credentials expired", 401, "authentication_error");
       }
-      if (
-        !isRefreshResult(refreshed) ||
-        refreshed.error ||
-        typeof refreshed.accessToken !== "string" ||
-        !refreshed.accessToken
-      ) {
-        return requestError("Kiro credentials expired", 401, "authentication_error");
-      }
-      credentials = {
-        ...credentials,
-        accessToken: refreshed.accessToken,
-        ...(typeof refreshed.refreshToken === "string" ? { refreshToken: refreshed.refreshToken } : {}),
-        providerSpecificData: isRecord(refreshed.providerSpecificData)
-          ? refreshed.providerSpecificData
-          : credentials.providerSpecificData,
-      };
-      try {
-        await saveCredentials(account.credentialFile, credentials);
-      } catch {
-        return requestError("Unable to persist refreshed credentials", 500, "api_error");
-      }
+      credentials = reactive.credentials;
       try {
         payload = buildPayload(credentials);
         result = await execute();

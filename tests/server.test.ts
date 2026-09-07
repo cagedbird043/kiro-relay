@@ -58,17 +58,19 @@ describe("server routes", () => {
     } finally { await rm(f.dir, { recursive: true, force: true }); }
   });
 
-  test("401 refresh retries with refreshed credentials and payload", async () => {
+  test("401 refresh retries once and persists the refreshed expiry", async () => {
     const f = await fixture();
     try {
       const seen: Parameters<ExecutorLike["execute"]>[0][] = [];
-      const executor: ExecutorLike = { execute: async (input) => { seen.push(input); return { response: seen.length === 1 ? new Response("expired", { status: 401 }) : upstream() }; }, refreshCredentials: async () => ({ accessToken: "new", refreshToken: "refresh2" }) };
+      const executor: ExecutorLike = { execute: async (input) => { seen.push(input); return { response: seen.length === 1 ? new Response("expired", { status: 401 }) : upstream() }; }, refreshCredentials: async () => ({ accessToken: "new", refreshToken: "refresh2", expiresIn: 3600 }) };
+      const before = Date.now();
       const response = await createHandler(f.config, executor).call(null, request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }));
-      expect(response.status).toBe(200); expect(seen).toHaveLength(2); expect(seen[1].credentials.accessToken).toBe("new"); expect(JSON.parse(await Bun.file(f.credentials).text()).accessToken).toBe("new");
+      const saved = JSON.parse(await Bun.file(f.credentials).text()) as { accessToken: string; expiresAt: string };
+      expect(response.status).toBe(200); expect(seen).toHaveLength(2); expect(seen[1].credentials.accessToken).toBe("new"); expect(saved.accessToken).toBe("new"); expect(Date.parse(saved.expiresAt)).toBeGreaterThanOrEqual(before + 3_599_000); expect(Date.parse(saved.expiresAt)).toBeLessThanOrEqual(Date.now() + 3_601_000);
     } finally { await rm(f.dir, { recursive: true, force: true }); }
   });
 
-  test("expired credentials refresh and retry after Kiro returns 403", async () => {
+  test("expired credentials refresh before the upstream request", async () => {
     const f = await fixture();
     try {
       await writeFile(
@@ -76,12 +78,16 @@ describe("server routes", () => {
         JSON.stringify({ accessToken: "old", refreshToken: "refresh", expiresAt: "2020-01-01T00:00:00Z" })
       );
       const seen: Parameters<ExecutorLike["execute"]>[0][] = [];
+      let refreshes = 0;
       const executor: ExecutorLike = {
         execute: async (input) => {
           seen.push(input);
-          return { response: seen.length === 1 ? new Response("expired", { status: 403 }) : upstream() };
+          return { response: upstream() };
         },
-        refreshCredentials: async () => ({ accessToken: "new", refreshToken: "refresh2" }),
+        refreshCredentials: async () => {
+          refreshes += 1;
+          return { accessToken: "new", refreshToken: "refresh2", expiresIn: 3600 };
+        },
       };
       const response = await createHandler(f.config, executor)(
         request("/v1/messages", {
@@ -90,8 +96,135 @@ describe("server routes", () => {
         })
       );
       expect(response.status).toBe(200);
+      expect(refreshes).toBe(1);
+      expect(seen).toHaveLength(1);
+      expect(seen[0].credentials.accessToken).toBe("new");
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("concurrent expired requests share one refresh and use the persisted token", async () => {
+    const f = await fixture();
+    try {
+      await writeFile(f.credentials, JSON.stringify({ accessToken: "old", refreshToken: "refresh", expiresAt: "2020-01-01T00:00:00Z" }));
+      let releaseRefresh: (value: unknown) => void = () => undefined;
+      const refreshGate = new Promise<unknown>((resolve) => {
+        releaseRefresh = resolve;
+      });
+      let announceRefresh: () => void = () => undefined;
+      const refreshStarted = new Promise<void>((resolve) => {
+        announceRefresh = resolve;
+      });
+      let refreshes = 0;
+      const seen: Parameters<ExecutorLike["execute"]>[0][] = [];
+      const executor: ExecutorLike = {
+        execute: async (input) => {
+          seen.push(input);
+          return { response: upstream() };
+        },
+        refreshCredentials: async () => {
+          refreshes += 1;
+          announceRefresh();
+          return refreshGate;
+        },
+      };
+      const handler = createHandler(f.config, executor);
+      const first = handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "one" }] }));
+      await refreshStarted;
+      const second = handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "two" }] }));
+      releaseRefresh({ accessToken: "shared", refreshToken: "rotated", expiresIn: 3600 });
+      const responses = await Promise.all([first, second]);
+      expect(responses.map((response) => response.status)).toEqual([200, 200]);
+      expect(refreshes).toBe(1);
       expect(seen).toHaveLength(2);
-      expect(seen[1].credentials.accessToken).toBe("new");
+      expect(seen.every((input) => input.credentials.accessToken === "shared")).toBe(true);
+      expect(JSON.parse(await Bun.file(f.credentials).text()).refreshToken).toBe("rotated");
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("concurrent 401 responses share one refresh-token rotation", async () => {
+    const f = await fixture();
+    try {
+      let releaseRefresh: (value: unknown) => void = () => undefined;
+      const refreshGate = new Promise<unknown>((resolve) => {
+        releaseRefresh = resolve;
+      });
+      let announceRefresh: () => void = () => undefined;
+      const refreshStarted = new Promise<void>((resolve) => {
+        announceRefresh = resolve;
+      });
+      let refreshes = 0;
+      const seen: Parameters<ExecutorLike["execute"]>[0][] = [];
+      const executor: ExecutorLike = {
+        execute: async (input) => {
+          seen.push(input);
+          return {
+            response: input.credentials.accessToken === "old"
+              ? new Response("expired", { status: 401 })
+              : upstream(),
+          };
+        },
+        refreshCredentials: async () => {
+          refreshes += 1;
+          announceRefresh();
+          return refreshGate;
+        },
+      };
+      const handler = createHandler(f.config, executor);
+      const first = handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "one" }] }));
+      const second = handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "two" }] }));
+      await refreshStarted;
+      releaseRefresh({ accessToken: "shared", refreshToken: "rotated", expiresIn: 3600 });
+      const responses = await Promise.all([first, second]);
+      expect(responses.map((response) => response.status)).toEqual([200, 200]);
+      expect(refreshes).toBe(1);
+      expect(seen.filter((input) => input.credentials.accessToken === "old")).toHaveLength(2);
+      expect(seen.filter((input) => input.credentials.accessToken === "shared")).toHaveLength(2);
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed early refresh uses the still-valid access token", async () => {
+    const f = await fixture();
+    try {
+      await writeFile(f.credentials, JSON.stringify({ accessToken: "still-valid", refreshToken: "refresh", expiresAt: new Date(Date.now() + 60_000).toISOString() }));
+      const seen: Parameters<ExecutorLike["execute"]>[0][] = [];
+      const executor: ExecutorLike = {
+        execute: async (input) => {
+          seen.push(input);
+          return { response: upstream() };
+        },
+        refreshCredentials: async () => null,
+      };
+      const response = await createHandler(f.config, executor)(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }));
+      expect(response.status).toBe(200);
+      expect(seen).toHaveLength(1);
+      expect(seen[0].credentials.accessToken).toBe("still-valid");
+    } finally {
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed refresh never sends an already expired access token", async () => {
+    const f = await fixture();
+    try {
+      await writeFile(f.credentials, JSON.stringify({ accessToken: "expired", refreshToken: "refresh", expiresAt: "2020-01-01T00:00:00Z" }));
+      let executions = 0;
+      const executor: ExecutorLike = {
+        execute: async () => {
+          executions += 1;
+          return { response: upstream() };
+        },
+        refreshCredentials: async () => ({ error: "unrecoverable_refresh_error", code: "invalid_grant" }),
+      };
+      const response = await createHandler(f.config, executor)(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }));
+      expect(response.status).toBe(401);
+      expect(executions).toBe(0);
+      expect(JSON.parse(await Bun.file(f.credentials).text()).accessToken).toBe("expired");
     } finally {
       await rm(f.dir, { recursive: true, force: true });
     }
