@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "bun --watch src/server.ts",
     "start": "bun src/server.ts",
+    "auth:login": "bun src/auth-login.ts",
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit",
     "build": "bun build src/server.ts --outdir dist --target bun"
