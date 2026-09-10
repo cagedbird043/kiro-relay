@@ -1,8 +1,9 @@
-import { v5 as uuidv5 } from "uuid";
+import { v4 as uuidv4 } from "uuid";
 import type { ResponseCreateParamsBase } from "openai/resources/responses/responses";
 import { sanitizeKiroTools } from "../kiro/sanitizer.ts";
 import type { ProviderCredentials } from "../kiro/base.ts";
 import { getKiroModelCapabilities } from "../kiro/modelCapabilities.ts";
+import { decodeReasoning, type KiroReasoningContent } from "../kiro/reasoning.ts";
 
 /** Responses request accepted by the native Kiro adapter. */
 export type KiroResponsesRequest = Partial<ResponseCreateParamsBase> & Record<string, unknown> & {
@@ -17,7 +18,7 @@ export type KiroResponsesRequest = Partial<ResponseCreateParamsBase> & Record<st
 };
 
 export type KiroResponsesPayload = {
-  conversationState: { chatTriggerType: "MANUAL"; conversationId: string; currentMessage: { userInputMessage: { content: string; modelId: string; origin: "AI_EDITOR"; images?: Array<{ format: string; source: { bytes: string } }>; userInputMessageContext?: { tools?: unknown[]; toolResults?: unknown[]; toolChoice?: unknown } } }; history: unknown[] };
+  conversationState: { chatTriggerType: "MANUAL"; conversationId: string; currentMessage: { userInputMessage: { content: string; modelId: string; origin: "AI_EDITOR"; images?: Array<{ format: string; source: { bytes: string } }>; userInputMessageContext?: { tools?: unknown[]; toolResults?: unknown[]; toolChoice?: unknown } } }; history: KiroHistoryItem[] };
   profileArn?: string;
   inferenceConfig?: { maxTokens?: number };
   additionalModelRequestFields?: { reasoning: { effort: string; summary?: string } };
@@ -27,7 +28,6 @@ export type KiroResponsesPayload = {
   _includeEncryptedContent?: boolean;
 };
 
-const UUID_NAMESPACE = "34f7193f-561d-4050-bc84-9547d953d6bf";
 const UNSUPPORTED_FIELDS: Record<string, true> = {
   previous_response_id: true,
   conversation: true,
@@ -53,16 +53,19 @@ type InputParts = {
   images: Array<{ format: string; bytes: string }>;
 };
 type KiroToolUse = { toolUseId: string; name: string; input: Obj };
+type KiroToolResult = { toolUseId: string; status: "success"; content: Array<{ text: string }> };
 type KiroHistoryItem = {
   userInputMessage?: {
     content: string;
     modelId: string;
     origin: "AI_EDITOR";
     images?: Array<{ format: string; source: { bytes: string } }>;
+    userInputMessageContext?: { toolResults: KiroToolResult[] };
   };
   assistantResponseMessage?: {
     content: string;
     toolUses?: KiroToolUse[];
+    reasoningContent?: KiroReasoningContent;
   };
 };
 
@@ -102,19 +105,23 @@ function appendAssistantHistory(
     },
   });
 }
-
-function validateReasoningHistoryItem(item: Obj): void {
+function reasoningHistoryItem(item: Obj, model: string): KiroReasoningContent | undefined {
+  const summary: string[] = [];
   if (item.summary !== undefined) {
     if (!Array.isArray(item.summary)) throw new Error("reasoning summary must be an array");
     for (const part of item.summary) {
       if (!isObj(part) || part.type !== "summary_text" || typeof part.text !== "string") {
         throw new Error("reasoning summary items must contain summary_text");
       }
+      summary.push(part.text);
     }
   }
-  if (item.encrypted_content !== undefined && typeof item.encrypted_content !== "string") {
+  if (item.encrypted_content !== undefined && item.encrypted_content !== null && typeof item.encrypted_content !== "string") {
     throw new Error("reasoning encrypted_content must be a string");
   }
+  if (typeof item.encrypted_content === "string" && item.encrypted_content) return decodeReasoning(item.encrypted_content, model);
+  const text = summary.join("");
+  return text ? { reasoningText: { text } } : undefined;
 }
 
 function imageOf(value: unknown): { format: string; bytes: string } {
@@ -270,17 +277,9 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   if (typeof rawInput !== "string" && !Array.isArray(rawInput)) throw new Error("input must be a string or array");
   const items: Obj[] = typeof rawInput === "string" ? [{ type: "message", role: "user", content: [{ type: "input_text", text: rawInput }] }] : rawInput.map((v) => { if (!isObj(v)) throw new Error("input items must be objects"); return v; });
   const history: KiroHistoryItem[] = [];
-  const toolResults: unknown[] = [];
-  let current: InputParts = { text: "", images: [] };
-  let firstUser = "";
   const instructionTexts: string[] = [];
   if (typeof body.instructions === "string" && body.instructions) instructionTexts.push(body.instructions);
-  let lastUser:
-    | { inputIndex: number; historyIndex: number; parts: InputParts }
-    | undefined;
   const additionalToolDefinitions: unknown[] = [];
-  let lastToolOutputIndex = -1;
-  let lastAssistantInputIndex = -1;
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     const type = typeof item.type === "string" ? item.type : typeof item.role === "string" ? "message" : undefined;
@@ -289,18 +288,29 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
       additionalToolDefinitions.push(...item.tools);
       continue;
     }
-    if (type === "reasoning") { validateReasoningHistoryItem(item); lastAssistantInputIndex = i; continue; }
+    if (type === "reasoning") {
+      const reasoningContent = reasoningHistoryItem(item, model);
+      if (reasoningContent) {
+        appendAssistantHistory(history, "");
+        history.at(-1)!.assistantResponseMessage!.reasoningContent = reasoningContent;
+      }
+      continue;
+    }
     if (type === "function_call_output" || type === "custom_tool_call_output") {
       if (typeof item.call_id !== "string" || !item.call_id) throw new Error(`${type} requires call_id`);
-      toolResults.push({ toolUseId: item.call_id, status: "success", content: [{ text: outputText(item.output) }] });
-      lastToolOutputIndex = i;
+      let user = history.at(-1)?.userInputMessage;
+      if (!user) {
+        const turn = historyUserMessage({ text: "", images: [] }, model);
+        history.push(turn);
+        user = turn.userInputMessage!;
+      }
+      (user.userInputMessageContext ??= { toolResults: [] }).toolResults.push({ toolUseId: item.call_id, status: "success", content: [{ text: outputText(item.output) }] });
       continue;
     }
     if (type === "function_call" || type === "custom_tool_call") {
       if (typeof item.call_id !== "string" || !item.call_id || typeof item.name !== "string" || !item.name) throw new Error(`${type} requires call_id and name`);
       const input = type === "custom_tool_call" ? (typeof item.input === "string" ? { input: item.input } : (() => { throw new Error("custom_tool_call input must be a string"); })()) : functionInput(item.arguments);
       const historyName = typeof item.namespace === "string" && item.namespace ? `${item.namespace}__${item.name}` : item.name;
-      lastAssistantInputIndex = i;
       appendAssistantHistory(history, "", { toolUseId: item.call_id, name: historyName, input });
       continue;
     }
@@ -308,15 +318,19 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
     if (item.role !== "user" && item.role !== "assistant" && item.role !== "system" && item.role !== "developer") throw new Error("message role is invalid");
     const parts = contentParts(item.content);
     if (item.role === "system" || item.role === "developer") { instructionTexts.push(parts.text); continue; }
-    if (item.role === "assistant") { lastAssistantInputIndex = i; appendAssistantHistory(history, parts.text); continue; }
-    if (!firstUser) firstUser = parts.text;
-    history.push(historyUserMessage(parts, model));
-    lastUser = { inputIndex: i, historyIndex: history.length - 1, parts };
+    if (item.role === "assistant") { appendAssistantHistory(history, parts.text); continue; }
+    const previous = history.at(-1)?.userInputMessage;
+    if (previous) {
+      previous.content = [previous.content, parts.text].filter(Boolean).join("\n\n");
+      if (parts.images.length) (previous.images ??= []).push(...parts.images.map(image => ({ format: image.format, source: { bytes: image.bytes } })));
+    } else history.push(historyUserMessage(parts, model));
   }
-  if (lastUser && lastUser.inputIndex > Math.max(lastToolOutputIndex, lastAssistantInputIndex)) { current = lastUser.parts; history.splice(lastUser.historyIndex, 1); }
+  const lastUser = history.at(-1)?.userInputMessage;
+  if (lastUser) history.pop();
+  const current: InputParts = { text: lastUser?.content ?? "", images: lastUser?.images?.map(image => ({ format: image.format, bytes: image.source.bytes })) ?? [] };
   const instruction = instructionTexts.length ? instructionTexts.map((text) => `<system-reminder>\n${text}\n</system-reminder>`).join("\n\n") + "\n\n" : "";
   const context: { tools?: unknown[]; toolResults?: unknown[]; toolChoice?: unknown } = {};
-  if (toolResults.length) context.toolResults = toolResults;
+  if (lastUser?.userInputMessageContext) context.toolResults = lastUser.userInputMessageContext.toolResults;
   const declaredTools: unknown[] = [];
   if (body.tools !== undefined && body.tools !== null) {
     if (!Array.isArray(body.tools)) throw new Error("tools must be an array");
@@ -360,14 +374,10 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
       context.toolChoice = { tool: { name: sanitizedName } };
     } else throw new Error("Invalid tool_choice");
   }
-  const conversationSeed =
-    typeof body.prompt_cache_key === "string" && body.prompt_cache_key
-      ? body.prompt_cache_key
-      : (firstUser || current.text).slice(0, 4000);
   const payload: KiroResponsesPayload = {
     conversationState: {
       chatTriggerType: "MANUAL",
-      conversationId: uuidv5(conversationSeed, UUID_NAMESPACE),
+      conversationId: uuidv4(),
       currentMessage: {
         userInputMessage: {
           content: instruction + current.text,

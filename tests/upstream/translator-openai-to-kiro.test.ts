@@ -230,20 +230,6 @@ test("OpenAI -> Kiro uses a neutral filler currentMessage when the request ends 
   ]);
 });
 
-test("OpenAI -> Kiro derives a stable conversationId for the same first history turn", () => {
-  const first = buildSamplePayload();
-  const second = buildSamplePayload();
-
-  assert.equal(
-    (first.conversationState as any).history[0].userInputMessage.content,
-    "<system-reminder>\nRules\n</system-reminder>\n\nHello"
-  );
-  assert.equal(
-    (second as any).conversationState.history[0].userInputMessage.content,
-    "<system-reminder>\nRules\n</system-reminder>\n\nHello"
-  );
-  assert.equal(first.conversationState.conversationId, second.conversationState.conversationId);
-});
 
 test("OpenAI -> Kiro still returns a valid payload for minimal requests", () => {
   const result = buildKiroPayload(

@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import { KiroExecutor } from "../../src/kiro/executor.ts";
 import { anthropicToOpenAI, collectAnthropicResponse } from "../../src/anthropic.ts";
 import { buildKiroPayload } from "../../src/kiro/request/openai-to-kiro.ts";
+import { collectResponses, responsesStream } from "../../src/responses/response.ts";
+import { buildKiroResponsesPayload } from "../../src/responses/request.ts";
 
 function hasStreamReadinessSignal(text: string): boolean {
   const match = text.match(/data:\s*(\{.*\})/);
@@ -61,8 +63,8 @@ function encodeHeader(name, value) {
   return header;
 }
 
-function buildEventFrame(eventType, payload) {
-  const headers = encodeHeader(":event-type", eventType);
+function buildEventFrame(eventType: string, payload: unknown, extraHeaders: Record<string, string> = {}) {
+  const headers = concatArrays(encodeHeader(":event-type", eventType), ...Object.entries(extraHeaders).map(([name, value]) => encodeHeader(name, value)));
   const payloadBytes =
     payload === null
       ? new Uint8Array()
@@ -111,6 +113,70 @@ function parseSSEJsonChunks(text) {
     .map((payload) => JSON.parse(payload));
 }
 
+test("计量帧后分片到达的官方元数据保留真实用量和停止原因", async () => {
+  const frames = [
+    buildEventFrame("assistantResponseEvent", { content: "done" }),
+    buildEventFrame("meteringEvent", { usage: 1 }),
+    buildEventFrame("metadataEvent", { tokenUsage: { uncachedInputTokens: 100, outputTokens: 25, cacheReadInputTokens: 200, cacheWriteInputTokens: 30 }, stopReason: "END_TURN" }),
+  ];
+  const source = () => new KiroExecutor().transformEventStreamToSSE(buildEventStreamResponseFromChunks(frames), "gpt-5.6-sol");
+  const anthropic = await (await collectAnthropicResponse(source())).json();
+  assert.equal(anthropic.stop_reason, "end_turn");
+  assert.deepEqual(anthropic.usage, { input_tokens: 100, output_tokens: 25, cache_read_input_tokens: 200, cache_creation_input_tokens: 30 });
+  const responses = await collectResponses(source(), "gpt-5.6-sol");
+  assert.deepEqual(responses.usage, { input_tokens: 330, output_tokens: 25, total_tokens: 355, input_tokens_details: { cached_tokens: 200, cache_write_tokens: 30 }, output_tokens_details: {} });
+  const streamed = parseSSEJsonChunks(await responsesStream(source(), "gpt-5.6-sol").text());
+  assert.deepEqual(streamed.at(-1).response.usage, responses.usage);
+});
+
+test("官方零用量和分帧缓存不会被正文估算覆盖", async () => {
+  const raw = buildEventStreamResponse([
+    buildEventFrame("assistantResponseEvent", { content: "有正文也不能覆盖上游的零值" }),
+    buildEventFrame("metadataEvent", { tokenUsage: { cacheReadInputTokens: 200 } }),
+    buildEventFrame("metadataEvent", { tokenUsage: { uncachedInputTokens: 0, outputTokens: 0, cacheWriteInputTokens: 0 }, stopReason: "END_TURN" }),
+  ]);
+  const result = await (await collectAnthropicResponse(new KiroExecutor().transformEventStreamToSSE(raw, "claude-opus-5"))).json();
+  assert.deepEqual(result.usage, { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 200, cache_creation_input_tokens: 0 });
+});
+
+test("输出受限与未知终止原因不会被报告为完整成功", async () => {
+  const source = (reason: string) => new KiroExecutor().transformEventStreamToSSE(buildEventStreamResponse([
+    buildEventFrame("assistantResponseEvent", { content: "partial" }), buildEventFrame("metadataEvent", { stopReason: reason }),
+  ]), "gpt-5.6-sol");
+  const anthropic = await (await collectAnthropicResponse(source("max_tokens"))).json();
+  assert.equal(anthropic.stop_reason, "max_tokens");
+  const streamed = parseSSEJsonChunks(await responsesStream(source("max_tokens"), "gpt-5.6-sol").text());
+  assert.equal(streamed.at(-1).type, "response.incomplete");
+  assert.equal(streamed.at(-1).response.incomplete_details.reason, "max_output_tokens");
+  await assert.rejects(() => collectResponses(source("UNKNOWN_STOP"), "gpt-5.6-sol"), /Unsupported Kiro stop reason/);
+  const truncated = buildEventStreamResponseFromChunks([buildEventFrame("metadataEvent", { stopReason: "END_TURN" }), new Uint8Array([0, 0, 0])]);
+  await assert.rejects(() => new KiroExecutor().transformEventStreamToSSE(truncated, "claude-opus-5").text(), /terminal event/);
+});
+
+test("隐藏推理经过两种响应格式后仍能作为原生历史回放", async () => {
+  const raw = () => new KiroExecutor().transformEventStreamToSSE(buildEventStreamResponse([
+    buildEventFrame("reasoningContentEvent", { redactedContent: "UkVEQUNURUQ=" }),
+    buildEventFrame("assistantResponseEvent", { content: "继续任务" }),
+    buildEventFrame("metadataEvent", { stopReason: "END_TURN" }),
+  ]), "gpt-5.6-sol");
+  const anthropic = await (await collectAnthropicResponse(raw())).json();
+  assert.deepEqual(anthropic.content[0], { type: "redacted_thinking", data: "UkVEQUNURUQ=" });
+  const a = buildKiroPayload("claude-opus-5", anthropicToOpenAI({ messages: [{ role: "user", content: "任务" }, { role: "assistant", content: anthropic.content }, { role: "user", content: "继续" }] }), false, {});
+  assert.deepEqual(a.conversationState.history[1].assistantResponseMessage.reasoningContent, { redactedContent: "UkVEQUNURUQ=" });
+  const response = await collectResponses(raw(), "gpt-5.6-sol", {}, { includeEncryptedContent: true });
+  const r = buildKiroResponsesPayload("gpt-5.6-sol", { model: "gpt-5.6-sol", input: [{ role: "user", content: "任务" }, ...response.output, { role: "user", content: "继续" }] }, false, {});
+  assert.deepEqual(r.conversationState.history[1].assistantResponseMessage?.reasoningContent, { redactedContent: "UkVEQUNURUQ=" });
+});
+
+test("原生异常保留错误类型且不暴露上游错误正文", async () => {
+  const raw = buildEventStreamResponse([buildEventFrame("ValidationException", { message: "敏感上游正文" }, { ":message-type": "exception", ":exception-type": "ValidationException" })]);
+  const response = responsesStream(new KiroExecutor().transformEventStreamToSSE(raw, "gpt-5.6-sol"), "gpt-5.6-sol");
+  const text = await response.text();
+  const events = parseSSEJsonChunks(text);
+  assert.equal(events.at(-1).type, "response.failed");
+  assert.match(events.at(-1).response.error.message, /ValidationException/);
+  assert.doesNotMatch(text, /敏感上游正文/);
+});
 test("KiroExecutor.transformEventStreamToSSE emits an early role-only start chunk that satisfies stream readiness", async () => {
   const executor = new KiroExecutor();
   // A corrupted prelude frame must NOT trigger the start chunk; only the first
@@ -355,6 +421,7 @@ test("KiroExecutor keeps cache tokens that arrive without input/output totals", 
   const finish = chunks.find((chunk) => chunk.choices?.[0]?.finish_reason);
 
   assert.deepEqual(finish.usage, {
+    estimated: true,
     prompt_tokens: 20000,
     completion_tokens: 1,
     total_tokens: 20001,
@@ -414,6 +481,7 @@ test("KiroExecutor scales the usage estimate by the model's own context window",
 
   // 10% of 200000, with completion estimated independently from output length.
   assert.deepEqual(await estimateFor("claude-sonnet-4.5"), {
+    estimated: true,
     prompt_tokens: 20000,
     completion_tokens: 100,
     total_tokens: 20100,
@@ -421,6 +489,7 @@ test("KiroExecutor scales the usage estimate by the model's own context window",
 
   // 10% of 1000000 — a fixed 200000 budget would have reported 20000 here.
   assert.deepEqual(await estimateFor("claude-sonnet-5"), {
+    estimated: true,
     prompt_tokens: 100000,
     completion_tokens: 100,
     total_tokens: 100100,
@@ -545,32 +614,6 @@ test("原生嵌套推理签名经过响应适配后随工具结果回传", async
 });
 
 
-test("KiroExecutor suppresses placeholder reasoning and preserves its signature", async () => {
-  const executor = new KiroExecutor();
-  const response = buildEventStreamResponse([
-    buildEventFrame("reasoningContentEvent", { text: "...", signature: "kiro-signature" }),
-    buildEventFrame("assistantResponseEvent", { content: "Answer" }),
-    buildEventFrame("messageStopEvent", {}),
-  ]);
-
-  const transformed = executor.transformEventStreamToSSE(response, "gpt-5.6-luna");
-  const chunks = parseSSEJsonChunks(await transformed.text());
-  const reasoning = chunks
-    .map((chunk) => chunk.choices?.[0]?.delta?.reasoning_content)
-    .filter(Boolean)
-    .join("");
-  const content = chunks
-    .map((chunk) => chunk.choices?.[0]?.delta?.content)
-    .filter(Boolean)
-    .join("");
-  const signature = chunks
-    .map((chunk) => chunk.choices?.[0]?.delta?.reasoning_signature)
-    .find(Boolean);
-
-  assert.equal(reasoning, "");
-  assert.equal(content, "Answer");
-  assert.equal(signature, "kiro-signature");
-});
 test("KiroExecutor.transformEventStreamToSSE parses fragmented frames and waits for post-stop usage", async () => {
   const executor = new KiroExecutor();
   const bytes = concatArrays(
@@ -735,32 +778,6 @@ test("KiroExecutor.refreshCredentials returns null when the token refresh fails"
   }
 });
 
-test("KiroExecutor cancels upstream after the terminal metering frame", async () => {
-  const executor = new KiroExecutor();
-  const bytes = concatArrays(
-    buildEventFrame("assistantResponseEvent", { content: "done" }),
-    buildEventFrame("messageStopEvent", {}),
-    buildEventFrame("contextUsageEvent", { contextUsagePercentage: 1 }),
-    buildEventFrame("meteringEvent", {})
-  );
-  let upstreamController: ReadableStreamDefaultController<Uint8Array>;
-  const response = new Response(
-    new ReadableStream<Uint8Array>({
-      start(controller) {
-        upstreamController = controller;
-        controller.enqueue(bytes);
-      },
-    })
-  );
-
-  const text = await executor
-    .transformEventStreamToSSE(response, "claude-opus-5", {
-      onTerminal: () => upstreamController.close(),
-    })
-    .text();
-  assert.match(text, /"finish_reason":"stop"/);
-  assert.match(text, /\[DONE\]/);
-});
 
 test("KiroExecutor propagates physical EOF before messageStopEvent", async () => {
   const executor = new KiroExecutor();

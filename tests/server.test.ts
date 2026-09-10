@@ -22,6 +22,43 @@ async function fixture() {
   return { dir, credentials, config: config(credentials) };
 }
 
+test("失败响应保留协议原因与关联编号且不泄漏原始正文", async () => {
+  const f = await fixture();
+  const original = console.info;
+  const logs: unknown[][] = [];
+  console.info = (...args: unknown[]) => { logs.push(args); };
+  try {
+    for (const path of ["/v1/messages", "/v1/responses"]) {
+      for (const reason of ["INVALID_MODEL_ID", "THINKING_SIGNATURE_INVALID"]) {
+        const handler = createHandler(f.config, { execute: async () => ({ response: Response.json({ reason, message: "敏感原始正文" }, { status: 400 }) }), refreshCredentials: async () => null });
+        const response = await handler(request(path, path.endsWith("responses") ? { model: "gpt-5.6-sol", input: "hi" } : { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }));
+        expect(response.status).toBe(400);
+        const text = await response.text();
+        expect(text).toContain(reason);
+        expect(text).not.toContain("敏感原始正文");
+        expect(logs.at(-1)).toEqual(["[REQUEST]", expect.objectContaining({ requestId: response.headers.get("request-id"), phase: "failed", code: reason })]);
+      }
+    }
+    expect(JSON.stringify(logs)).not.toContain("敏感原始正文");
+  } finally { console.info = original; await rm(f.dir, { recursive: true, force: true }); }
+});
+
+test("不支持的停止序列在发送上游前明确拒绝", async () => {
+  const f = await fixture();
+  let calls = 0;
+  try {
+    const handler = createHandler(f.config, { execute: async () => { calls++; return { response: upstream() }; }, refreshCredentials: async () => null });
+    const body = { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] };
+    const rejected = await handler(request("/v1/messages", { ...body, stop_sequences: ["END"] }));
+    expect(rejected.status).toBe(400);
+    expect((await rejected.json()).error.type).toBe("invalid_request_error");
+    expect(calls).toBe(0);
+    const accepted = await handler(request("/v1/messages", { ...body, stop_sequences: [] }));
+    expect(accepted.status).toBe(200);
+    expect(calls).toBe(1);
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
 describe("server routes", () => {
   test("health, models, and token count routes", async () => {
     const f = await fixture();
@@ -263,40 +300,6 @@ describe("server routes", () => {
     }
   });
 
-  test("accepts OMP reasoning items on a tool continuation", async () => {
-    const f = await fixture();
-    try {
-      const seen: Parameters<ExecutorLike["execute"]>[0][] = [];
-      const executor: ExecutorLike = {
-        execute: async (input) => {
-          seen.push(input);
-          return { response: upstream(true, "continued") };
-        },
-        refreshCredentials: async () => null,
-      };
-      const handler = createHandler(f.config, executor);
-      const response = await handler(
-        request("/v1/responses", {
-          model: "gpt-5.6-sol",
-          reasoning: { effort: "max", summary: "auto" },
-          input: [
-            { role: "user", content: "inspect" },
-            { type: "reasoning", summary: [{ type: "summary_text", text: "..." }] },
-            { type: "message", role: "assistant", content: [{ type: "output_text", text: "working" }] },
-            { type: "function_call", call_id: "call_read", name: "read", arguments: '{"path":"."}' },
-            { type: "function_call_output", call_id: "call_read", output: "result" },
-          ],
-        })
-      );
-      expect(response.status).toBe(200);
-      const payload = JSON.stringify(seen[0]?.body);
-      expect(payload).toContain('"reasoning":{"effort":"max","summary":"auto"}');
-      expect(payload).toContain('"content":"working","toolUses"');
-      expect(payload).toContain('"toolUseId":"call_read"');
-    } finally {
-      await rm(f.dir, { recursive: true, force: true });
-    }
-  });
   test("returns OpenAI error envelopes for Responses failures", async () => {
     const f = await fixture();
     try {

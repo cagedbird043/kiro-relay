@@ -2,6 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { anthropicToOpenAI, collectAnthropicResponse, countAnthropicTokens, openAIStreamToAnthropic } from "../src/anthropic.ts";
 import { buildKiroPayload } from "../src/kiro/request/openai-to-kiro.ts";
 
+test("相同长系统提示和开场文本不会复用会话身份", () => {
+  const body = anthropicToOpenAI({ system: "共同系统规则".repeat(1000), messages: [
+    { role: "user", content: "你好" }, { role: "assistant", content: "请继续" }, { role: "user", content: "处理当前任务" },
+  ] });
+  const first = buildKiroPayload("claude-opus-5", body, false, {});
+  const second = buildKiroPayload("claude-opus-5", body, false, {});
+  expect(first.conversationState.conversationId).not.toBe(second.conversationState.conversationId);
+  expect(first.conversationState.history).toEqual(second.conversationState.history);
+});
+
 function upstream(lines: string[]): Response {
   return new Response(lines.map((x) => `data: ${x}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
 }

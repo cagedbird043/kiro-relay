@@ -15,6 +15,7 @@ import {
 } from "./adaptiveThinking.ts";
 import { supportsKiroImages } from "../modelCapabilities.ts";
 import { sanitizeKiroTools } from "../sanitizer.ts";
+import type { KiroReasoningContent } from "../reasoning.ts";
 
 /**
  * Anthropic's direct-provider `[1m]` context-1m beta suffix. Kiro is AWS
@@ -162,7 +163,6 @@ function hasFollowingToolResult(messages, index: number): boolean {
   return false;
 }
 
-type KiroReasoningContent = { reasoningText: { text: string; signature: string } };
 
 /**
  * Convert OpenAI messages to Kiro format
@@ -435,11 +435,13 @@ function convertMessages(messages, tools, model) {
       let toolUses = [];
 
       if (Array.isArray(msg.content)) {
-        // 与官方客户端一致：仅回传带签名的推理，使用本轮最后一个有效块。
+        // 与官方客户端一致，回放最后一个带签名或隐藏内容的推理块。
         for (const block of msg.content) {
           if (block?.type === "thinking" && typeof block.thinking === "string" &&
               typeof block.signature === "string" && block.signature.length > 0) {
             pendingReasoning = { reasoningText: { text: block.thinking, signature: block.signature } };
+          } else if (block?.type === "redacted_thinking" && typeof block.data === "string" && block.data.length > 0) {
+            pendingReasoning = { redactedContent: block.data };
           }
         }
         const textBlocks = msg.content.filter((c) => c.type === "text");
@@ -648,15 +650,6 @@ function convertMessages(messages, tools, model) {
         origin: "AI_EDITOR",
       },
     };
-    // Mark as synthetic (non-enumerable so it doesn't leak to upstream JSON)
-    // so conversationId derivation can skip it — otherwise every
-    // assistant-first conversation collapses onto the same uuidv5(empty)
-    // namespace and leaks AWS Builder ID context across unrelated sessions.
-    Object.defineProperty(syntheticUserTurn, "__synthetic", {
-      value: true,
-      enumerable: false,
-      configurable: true,
-    });
     mergedHistory.unshift(syntheticUserTurn);
   }
 
@@ -736,11 +729,6 @@ function convertMessages(messages, tools, model) {
       const syntheticAssistantTurn = {
         assistantResponseMessage: { content: "(empty)" },
       };
-      Object.defineProperty(syntheticAssistantTurn, "__synthetic", {
-        value: true,
-        enumerable: false,
-        configurable: true,
-      });
       alternatingHistory.push(syntheticAssistantTurn);
     }
     alternatingHistory.push(item);
@@ -919,7 +907,7 @@ export function buildKiroPayload(model, body, stream, credentials) {
   } = {
     conversationState: {
       chatTriggerType: "MANUAL",
-      conversationId: uuidv4(), // We must override this with deterministic ID
+      conversationId: uuidv4(),
       currentMessage: {
         userInputMessage: {
           content: finalContent,
@@ -937,44 +925,6 @@ export function buildKiroPayload(model, body, stream, credentials) {
     },
   };
 
-  // Deterministic session caching for Kiro.
-  // Skip synthetic placeholder turns ("(empty)" injected for assistant-first
-  // conversations or alternating-role gaps) — otherwise unrelated assistant-
-  // first chats would all hash to the same uuidv5(empty) and reuse the same
-  // upstream Kiro/AWS conversation context, leaking prior state across
-  // sessions. See conversionMessages() above for the `__synthetic` marker.
-  const NAMESPACE_KIRO = "34f7193f-561d-4050-bc84-9547d953d6bf";
-
-  // Priority 1: Extract first user message from pre-compression body (passed by chatCore before
-  // compressContext runs). This keeps conversationId stable even when compression alters content.
-  // Priority 2: Deterministic hash from first user message in translated history (fallback).
-  const preCompressionBody = credentials?._preCompressionBody as
-    Record<string, unknown> | null | undefined;
-  const preCompressionMessages = Array.isArray(preCompressionBody?.messages)
-    ? preCompressionBody.messages
-    : null;
-  const preCompressionFirstUser = preCompressionMessages?.find(
-    (m: Record<string, unknown>) => m.role === "user"
-  );
-  const seedFromPreCompression = preCompressionFirstUser
-    ? typeof preCompressionFirstUser.content === "string"
-      ? preCompressionFirstUser.content
-      : Array.isArray(preCompressionFirstUser.content)
-        ? (preCompressionFirstUser.content as Array<{ type: string; text?: string }>)
-            .filter((b) => b.type === "text")
-            .map((b) => b.text || "")
-            .join(" ")
-        : ""
-    : "";
-  const firstRealUserTurn = history.find((h) => h?.userInputMessage?.content && !h.__synthetic);
-  const firstContent =
-    seedFromPreCompression || firstRealUserTurn?.userInputMessage?.content || finalContent;
-
-  // Use uuidv5 with the hash of the system prompt / first message to maintain AWS Builder ID context cache
-  payload.conversationState.conversationId = uuidv5(
-    (firstContent || "").substring(0, 4000),
-    NAMESPACE_KIRO
-  );
 
   if (profileArn) {
     payload.profileArn = profileArn;

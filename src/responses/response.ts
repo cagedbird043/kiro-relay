@@ -1,138 +1,177 @@
 import { randomUUID } from "node:crypto";
 import type { Response as OpenAIResponse, ResponseStreamEvent, ResponseUsage } from "openai/resources/responses/responses";
 import { readKiroEvents, type KiroEvent } from "../kiro/events.ts";
+import { encodeReasoning } from "../kiro/reasoning.ts";
 
 const id = (prefix: string) => `${prefix}_${randomUUID().replaceAll("-", "")}`;
-type Usage = ResponseUsage;
-export type ResponseToolMetadata = Readonly<
-  Record<string, { name: string; namespace?: string; custom: boolean }>
->;
-type Call = { id: string; callId: string; name: string; args: string; kiroIndex: number; outputIndex: number; metadata?: { name: string; namespace?: string; custom: boolean } };
+type Usage = Omit<ResponseUsage, "output_tokens_details"> & {
+  output_tokens_details: Partial<ResponseUsage["output_tokens_details"]>;
+  estimated?: true;
+};
+export type RelayResponse = Omit<OpenAIResponse, "usage"> & { usage: Usage | null; stop_details?: Record<string, unknown> };
+export type ResponseToolMetadata = Readonly<Record<string, { name: string; namespace?: string; custom: boolean }>>;
 export type ResponsesOptions = Readonly<{ includeEncryptedContent?: boolean }>;
+type Reasoning = { kind: "reasoning"; id: string; index: number; text: string; signature?: string; redacted?: string; summaryStarted: boolean };
+type Message = { kind: "message"; id: string; index: number; text: string };
+type Call = { kind: "tool"; id: string; index: number; callId: string; name: string; args: string; metadata?: { name: string; namespace?: string; custom: boolean } };
+type Entry = Reasoning | Message | Call;
+type Emit = (name: string, data: Record<string, unknown>) => void;
 type State = {
-  responseId: string; model: string; text: string; thinking: string; output: Array<Record<string, unknown>>;
-  usage?: Usage; reason: string; status: "completed" | "incomplete" | "failed"; finalized: boolean; reasoningDone: boolean;
-  messageId?: string; messageIndex?: number; reasoningId?: string; reasoningIndex?: number; reasoningSignature?: string;
-  calls: Map<number, Call>; nextOutputIndex: number; outputOrder: Array<"reasoning" | "message" | number>; responseTools: ResponseToolMetadata;
-  includeEncryptedContent: boolean; error?: OpenAIResponse["error"];
+  responseId: string; model: string; entries: Entry[]; calls: Map<number, Call>;
+  activeReasoning?: Reasoning; lastReasoning?: Reasoning; activeMessage?: Message;
+  responseTools: ResponseToolMetadata; includeEncryptedContent: boolean;
+  usage: Usage | null; reason: string; status: "completed" | "incomplete" | "failed"; finalized: boolean;
+  error: OpenAIResponse["error"]; stopDetails?: Record<string, unknown>;
 };
 
-function initial(model: string, responseTools: ResponseToolMetadata = {}, options: ResponsesOptions = {}): State {
-  return { responseId: id("resp"), model, text: "", thinking: "", output: [], reason: "end_turn", status: "completed", finalized: false, reasoningDone: false, calls: new Map(), nextOutputIndex: 0, outputOrder: [], responseTools, includeEncryptedContent: options.includeEncryptedContent === true };
+function initial(model: string, responseTools: ResponseToolMetadata, options: ResponsesOptions): State {
+  return { responseId: id("resp"), model, entries: [], calls: new Map(), responseTools, includeEncryptedContent: options.includeEncryptedContent === true, usage: null, reason: "end_turn", status: "completed", finalized: false, error: null };
 }
-
-
 function usageOf(event: Extract<KiroEvent, { type: "usage" }>): Usage {
   const cached = event.cacheReadInputTokens ?? 0;
-  return { input_tokens: event.inputTokens, output_tokens: event.outputTokens, total_tokens: event.inputTokens + event.outputTokens, input_tokens_details: { cached_tokens: cached, cache_write_tokens: event.cacheCreationInputTokens ?? 0 }, output_tokens_details: { reasoning_tokens: 0 } };
+  const written = event.cacheCreationInputTokens ?? 0;
+  const input = event.inputTokens + cached + written;
+  return { input_tokens: input, output_tokens: event.outputTokens, total_tokens: input + event.outputTokens, input_tokens_details: { cached_tokens: cached, cache_write_tokens: written }, output_tokens_details: {}, ...(event.estimated ? { estimated: true as const } : {}) };
 }
-function baseResponse(s: State): OpenAIResponse {
-  const now = Math.floor(Date.now() / 1000);
-  return { id: s.responseId, object: "response", created_at: now, model: s.model as OpenAIResponse["model"], output_text: s.text, output: s.output as unknown as OpenAIResponse["output"], error: s.error ?? null, incomplete_details: s.status === "incomplete" ? { reason: "max_output_tokens" } : null, instructions: null, metadata: null, parallel_tool_calls: true, temperature: null, tool_choice: "auto", tools: [], top_p: null, status: s.status, usage: s.usage };
-}
-function jsonEvent(event: string, data: Record<string, unknown>): string { return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`; }
-function responseCreated(s: State): Record<string, unknown> { return { type: "response.created", response: { ...baseResponse(s), status: "in_progress", output: [], output_text: "", usage: null } }; }
-function allocate(s: State, kind: "reasoning" | "message" | number): number { const n = s.nextOutputIndex++; s.outputOrder.push(kind); return n; }
-function ensureReasoning(s: State): void {
-  if (s.reasoningId) return;
-  s.reasoningId = id("rs");
-  s.reasoningIndex = allocate(s, "reasoning");
-}
-function reasoningSummary(s: State): Array<{ type: "summary_text"; text: string }> {
-  return s.thinking ? [{ type: "summary_text", text: s.thinking }] : [];
-}
-function reasoningFields(s: State): Record<string, unknown> {
-  return s.includeEncryptedContent ? { encrypted_content: s.reasoningSignature ?? null } : {};
-}
-
-
-
 function customInput(argumentsText: string): string {
   try {
     const parsed: unknown = JSON.parse(argumentsText);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      const input = (parsed as Record<string, unknown>).input;
-      if (typeof input === "string") return input;
-    }
+    if (parsed && typeof parsed === "object" && "input" in parsed && typeof parsed.input === "string") return parsed.input;
   } catch {
-    // Preserve malformed or already-freeform input verbatim.
+    // 非 JSON 自定义工具输入按原文交付。
   }
   return argumentsText;
 }
-function applyEvent(s: State, e: KiroEvent): void {
-  if (e.type === "start" && e.responseId) s.responseId = e.responseId;
-  else if (e.type === "thinking_delta") { ensureReasoning(s); s.thinking += e.thinking; }
-  else if (e.type === "text_delta") { if (s.messageIndex === undefined) { s.messageId = id("msg"); s.messageIndex = allocate(s, "message"); } s.text += e.text; }
-  else if (e.type === "thinking_signature") { ensureReasoning(s); s.reasoningSignature = e.signature; }
-  else if (e.type === "stop") { if (s.finalized) return; s.finalized = true; s.reason = e.reason; s.status = e.reason === "max_tokens" ? "incomplete" : "completed"; }
-  else if (e.type === "usage") s.usage = usageOf(e);
-  else if (e.type === "tool_start" && !s.calls.has(e.index)) { const metadata = s.responseTools[e.name]; s.calls.set(e.index, { id: id(metadata?.custom ? "ctc" : "fc"), callId: e.id, name: metadata?.name ?? e.name, args: "", kiroIndex: e.index, outputIndex: allocate(s, e.index), metadata }); }
-  else if (e.type === "tool_input_delta") { const c = s.calls.get(e.index); if (c) c.args += e.delta; }
+function reasoningSummary(entry: Reasoning): Array<{ type: "summary_text"; text: string }> {
+  return entry.text ? [{ type: "summary_text", text: entry.text }] : [];
 }
-
-function outputItems(s: State): Array<Record<string, unknown>> {
-  const out: Array<Record<string, unknown>> = [];
-  for (const kind of s.outputOrder) {
-    if (kind === "reasoning" && s.reasoningId) out.push({ id: s.reasoningId, type: "reasoning", content: [], ...reasoningFields(s), summary: reasoningSummary(s), status: "completed" });
-    else if (kind === "message" && s.messageId) out.push({ id: s.messageId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: s.text, annotations: [] }] });
-    else if (typeof kind === "number") { const c = s.calls.get(kind); if (c) out.push(c.metadata?.custom ? { id: c.id, type: "custom_tool_call", call_id: c.callId, name: c.name, namespace: c.metadata.namespace, input: customInput(c.args), status: "completed" } : { id: c.id, type: "function_call", call_id: c.callId, name: c.name, ...(c.metadata?.namespace ? { namespace: c.metadata.namespace } : {}), arguments: c.args, status: "completed" }); }
+function outputItem(s: State, entry: Entry, pending = false): OpenAIResponse["output"][number] & { status?: "in_progress" | "completed" | "incomplete" } {
+  const status = pending ? "in_progress" : s.status === "completed" ? "completed" : "incomplete";
+  if (entry.kind === "reasoning") {
+    const content = entry.redacted !== undefined ? { redactedContent: entry.redacted } : { reasoningText: { text: entry.text, ...(entry.signature !== undefined ? { signature: entry.signature } : {}) } };
+    return { id: entry.id, type: "reasoning", content: [], summary: pending ? [] : reasoningSummary(entry), status,
+      ...(s.includeEncryptedContent ? { encrypted_content: pending ? null : encodeReasoning(s.model, content) } : {}) };
   }
-  return out;
+  if (entry.kind === "message") return { id: entry.id, type: "message", role: "assistant", status, content: pending ? [] : [{ type: "output_text", text: entry.text, annotations: [] }] };
+  const metadata = entry.metadata;
+  return metadata?.custom
+    ? { id: entry.id, type: "custom_tool_call", call_id: entry.callId, name: metadata.name, ...(metadata.namespace ? { namespace: metadata.namespace } : {}), input: pending ? "" : customInput(entry.args), status }
+    : { id: entry.id, type: "function_call", call_id: entry.callId, name: metadata?.name ?? entry.name, ...(metadata?.namespace ? { namespace: metadata.namespace } : {}), arguments: pending ? "" : entry.args, status };
 }
-
-export async function collectResponses(response: globalThis.Response, model: string, responseTools: ResponseToolMetadata = {}, options: ResponsesOptions = {}): Promise<OpenAIResponse> {
-  const s = initial(model, responseTools, options); for await (const e of readKiroEvents(response, model)) applyEvent(s, e); s.output = outputItems(s); return baseResponse(s);
+function baseResponse(s: State): RelayResponse {
+  return { id: s.responseId, object: "response", created_at: Math.floor(Date.now() / 1000), model: s.model as OpenAIResponse["model"],
+    output_text: s.entries.filter((entry): entry is Message => entry.kind === "message").map(entry => entry.text).join(""),
+    output: s.entries.map(entry => outputItem(s, entry)), error: s.error,
+    incomplete_details: s.status === "incomplete" ? { reason: s.reason === "refusal" ? "content_filter" : "max_output_tokens" } : null,
+    instructions: null, metadata: null, parallel_tool_calls: true, temperature: null, tool_choice: "auto", tools: [], top_p: null, status: s.status, usage: s.usage,
+    ...(s.stopDetails ? { stop_details: s.stopDetails } : {}) };
 }
-
-function finishReasoning(s: State): Array<[string, Record<string, unknown>]> {
-  if (!s.reasoningId || s.reasoningDone) return [];
-  s.reasoningDone = true;
-  const item = {
-    id: s.reasoningId,
-    type: "reasoning",
-    content: [],
-    ...reasoningFields(s),
-    summary: reasoningSummary(s),
-    status: "completed",
-  };
-  const result: Array<[string, Record<string, unknown>]> = [];
-  if (s.thinking) {
-    result.push(
-      ["response.reasoning_summary_text.done", { type: "response.reasoning_summary_text.done", item_id: s.reasoningId, output_index: s.reasoningIndex, summary_index: 0, text: s.thinking }],
-      ["response.reasoning_summary_part.done", { type: "response.reasoning_summary_part.done", item_id: s.reasoningId, output_index: s.reasoningIndex, summary_index: 0, part: { type: "summary_text", text: s.thinking } }]
-    );
+function added(s: State, entry: Entry, emit?: Emit): void {
+  s.entries.push(entry);
+  emit?.("response.output_item.added", { type: "response.output_item.added", output_index: entry.index, item: outputItem(s, entry, true) });
+}
+function newReasoning(s: State, emit?: Emit): Reasoning {
+  const entry: Reasoning = { kind: "reasoning", id: id("rs"), index: s.entries.length, text: "", summaryStarted: false };
+  s.activeMessage = undefined;
+  s.activeReasoning = s.lastReasoning = entry;
+  added(s, entry, emit);
+  return entry;
+}
+function finishEntry(s: State, entry: Entry, emit?: Emit): void {
+  if (entry.kind === "reasoning" && entry.summaryStarted) {
+    emit?.("response.reasoning_summary_text.done", { type: "response.reasoning_summary_text.done", item_id: entry.id, output_index: entry.index, summary_index: 0, text: entry.text });
+    emit?.("response.reasoning_summary_part.done", { type: "response.reasoning_summary_part.done", item_id: entry.id, output_index: entry.index, summary_index: 0, part: { type: "summary_text", text: entry.text } });
+  } else if (entry.kind === "message") {
+    emit?.("response.output_text.done", { type: "response.output_text.done", item_id: entry.id, output_index: entry.index, content_index: 0, text: entry.text });
+    emit?.("response.content_part.done", { type: "response.content_part.done", item_id: entry.id, output_index: entry.index, content_index: 0, part: { type: "output_text", text: entry.text, annotations: [] } });
+  } else if (entry.kind === "tool") {
+    const name = entry.metadata?.custom ? "response.custom_tool_call_input.done" : "response.function_call_arguments.done";
+    emit?.(name, { type: name, item_id: entry.id, output_index: entry.index, call_id: entry.callId,
+      ...(entry.metadata?.custom ? { input: customInput(entry.args) } : { arguments: entry.args }) });
   }
-  result.push(["response.output_item.done", { type: "response.output_item.done", output_index: s.reasoningIndex, item }]);
-  return result;
+  emit?.("response.output_item.done", { type: "response.output_item.done", output_index: entry.index, item: outputItem(s, entry) });
 }
-
-function streamEventObjects(s: State, e: KiroEvent): Array<[string, Record<string, unknown>]> {
-  const result: Array<[string, Record<string, unknown>]> = [];
-  if (e.type === "start") { if (e.responseId) s.responseId = e.responseId; result.push(["response.created", responseCreated(s)], ["response.in_progress", { type: "response.in_progress", response: { ...baseResponse(s), status: "in_progress", output: [], output_text: "", usage: null } }]); }
-  else if (e.type === "thinking_delta") { if (!s.reasoningId) { s.reasoningId = id("rs"); s.reasoningIndex = allocate(s, "reasoning"); result.push(["response.output_item.added", { type: "response.output_item.added", output_index: s.reasoningIndex, item: { id: s.reasoningId, type: "reasoning", content: [], ...reasoningFields(s), summary: [], status: "in_progress" } }], ["response.reasoning_summary_part.added", { type: "response.reasoning_summary_part.added", item_id: s.reasoningId, output_index: s.reasoningIndex, summary_index: 0, part: { type: "summary_text", text: "" } }]); } s.thinking += e.thinking; result.push(["response.reasoning_summary_text.delta", { type: "response.reasoning_summary_text.delta", item_id: s.reasoningId, output_index: s.reasoningIndex, summary_index: 0, delta: e.thinking }]); }
-  else if (e.type === "thinking_signature") { const added = !s.reasoningId; ensureReasoning(s); s.reasoningSignature = e.signature; if (added) result.push(["response.output_item.added", { type: "response.output_item.added", output_index: s.reasoningIndex, item: { id: s.reasoningId, type: "reasoning", content: [], ...reasoningFields(s), summary: [], status: "in_progress" } }]); if (s.messageId || s.calls.size > 0) result.push(...finishReasoning(s)); }
-  else if (e.type === "text_delta") { if (s.reasoningId) result.push(...finishReasoning(s)); if (!s.messageId) { s.messageId = id("msg"); s.messageIndex = allocate(s, "message"); result.push(["response.output_item.added", { type: "response.output_item.added", output_index: s.messageIndex, item: { id: s.messageId, type: "message", role: "assistant", status: "in_progress", content: [] } }], ["response.content_part.added", { type: "response.content_part.added", item_id: s.messageId, output_index: s.messageIndex, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }]); } s.text += e.text; result.push(["response.output_text.delta", { type: "response.output_text.delta", item_id: s.messageId, output_index: s.messageIndex, content_index: 0, delta: e.text }]); }
-  else if (e.type === "tool_start" && !s.calls.has(e.index)) { if (s.reasoningId) result.push(...finishReasoning(s)); const metadata = s.responseTools[e.name]; const c: Call = { id: id(metadata?.custom ? "ctc" : "fc"), callId: e.id, name: metadata?.name ?? e.name, args: "", kiroIndex: e.index, outputIndex: allocate(s, e.index), metadata }; s.calls.set(e.index, c); result.push(["response.output_item.added", { type: "response.output_item.added", output_index: c.outputIndex, item: metadata?.custom ? { id: c.id, type: "custom_tool_call", call_id: c.callId, name: c.name, namespace: metadata.namespace, input: "", status: "in_progress" } : { id: c.id, type: "function_call", call_id: c.callId, name: c.name, ...(metadata?.namespace ? { namespace: metadata.namespace } : {}), arguments: "", status: "in_progress" } }]); }
-  // Kiro sends a JSON envelope for custom tools; emit only the complete freeform input at done.
-  else if (e.type === "tool_input_delta") { const c = s.calls.get(e.index); if (c) { c.args += e.delta; if (!c.metadata?.custom) result.push(["response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: c.id, output_index: c.outputIndex, call_id: c.callId, delta: e.delta }]); } }
-  else if (e.type === "usage") s.usage = usageOf(e);
-  else if (e.type === "stop") {
-    if (s.finalized) return result;
-    s.finalized = true;
-    s.reason = e.reason;
-    s.status = e.reason === "max_tokens" ? "incomplete" : "completed";
-    result.push(...finishReasoning(s));
-    if (s.messageId) result.push(["response.output_text.done", { type: "response.output_text.done", item_id: s.messageId, output_index: s.messageIndex, content_index: 0, text: s.text }], ["response.content_part.done", { type: "response.content_part.done", item_id: s.messageId, output_index: s.messageIndex, content_index: 0, part: { type: "output_text", text: s.text, annotations: [] } }], ["response.output_item.done", { type: "response.output_item.done", output_index: s.messageIndex, item: { id: s.messageId, type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: s.text, annotations: [] }] } }]);
-    for (const c of s.calls.values()) { if (c.metadata?.custom) { const input = customInput(c.args); result.push(["response.custom_tool_call_input.done", { type: "response.custom_tool_call_input.done", item_id: c.id, call_id: c.callId, output_index: c.outputIndex, input }], ["response.output_item.done", { type: "response.output_item.done", output_index: c.outputIndex, item: { id: c.id, type: "custom_tool_call", call_id: c.callId, name: c.name, namespace: c.metadata.namespace, input, status: "completed" } }]); } else result.push(["response.function_call_arguments.done", { type: "response.function_call_arguments.done", item_id: c.id, output_index: c.outputIndex, call_id: c.callId, arguments: c.args }], ["response.output_item.done", { type: "response.output_item.done", output_index: c.outputIndex, item: { id: c.id, type: "function_call", call_id: c.callId, name: c.name, ...(c.metadata?.namespace ? { namespace: c.metadata.namespace } : {}), arguments: c.args, status: "completed" } }]); }
-    s.output = outputItems(s);
-    result.push(["response.completed", { type: "response.completed", response: baseResponse(s) }]);
+function applyEvent(s: State, e: KiroEvent, emit?: Emit): void {
+  if (e.type === "start") {
+    if (e.responseId) s.responseId = e.responseId;
+    const response = { ...baseResponse(s), status: "in_progress", output: [], output_text: "", usage: null };
+    emit?.("response.created", { type: "response.created", response });
+    emit?.("response.in_progress", { type: "response.in_progress", response });
+  } else if (e.type === "thinking_delta") {
+    const entry = s.activeReasoning && s.activeReasoning.redacted === undefined ? s.activeReasoning : newReasoning(s, emit);
+    if (!entry.summaryStarted) {
+      entry.summaryStarted = true;
+      emit?.("response.reasoning_summary_part.added", { type: "response.reasoning_summary_part.added", item_id: entry.id, output_index: entry.index, summary_index: 0, part: { type: "summary_text", text: "" } });
+    }
+    entry.text += e.thinking;
+    emit?.("response.reasoning_summary_text.delta", { type: "response.reasoning_summary_text.delta", item_id: entry.id, output_index: entry.index, summary_index: 0, delta: e.thinking });
+  } else if (e.type === "thinking_signature") {
+    const entry = s.lastReasoning && s.lastReasoning.redacted === undefined ? s.lastReasoning : newReasoning(s, emit);
+    entry.signature = (entry.signature ?? "") + e.signature;
+  } else if (e.type === "thinking_redacted") {
+    newReasoning(s, emit).redacted = e.data;
+  } else if (e.type === "text_delta") {
+    s.activeReasoning = undefined;
+    if (!s.activeMessage) {
+      const entry: Message = { kind: "message", id: id("msg"), index: s.entries.length, text: "" };
+      s.activeMessage = entry;
+      added(s, entry, emit);
+      emit?.("response.content_part.added", { type: "response.content_part.added", item_id: entry.id, output_index: entry.index, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+    }
+    const entry = s.activeMessage;
+    entry.text += e.text;
+    emit?.("response.output_text.delta", { type: "response.output_text.delta", item_id: entry.id, output_index: entry.index, content_index: 0, delta: e.text });
+  } else if (e.type === "tool_start" && !s.calls.has(e.index)) {
+    s.activeReasoning = undefined; s.activeMessage = undefined;
+    const metadata = s.responseTools[e.name];
+    const entry: Call = { kind: "tool", id: id(metadata?.custom ? "ctc" : "fc"), index: s.entries.length, callId: e.id, name: e.name, args: "", metadata };
+    s.calls.set(e.index, entry);
+    added(s, entry, emit);
+  } else if (e.type === "tool_input_delta") {
+    const entry = s.calls.get(e.index);
+    if (!entry) throw new Error(`Unknown tool index ${e.index}`);
+    entry.args += e.delta;
+    if (!entry.metadata?.custom) emit?.("response.function_call_arguments.delta", { type: "response.function_call_arguments.delta", item_id: entry.id, output_index: entry.index, call_id: entry.callId, delta: e.delta });
+  } else if (e.type === "usage") s.usage = usageOf(e);
+  else if (e.type === "stop" && !s.finalized) {
+    s.finalized = true; s.reason = e.reason; s.stopDetails = e.details;
+    s.status = e.reason === "max_tokens" || e.reason === "refusal" ? "incomplete" : e.reason === "pause_turn" ? "failed" : "completed";
+    if (e.reason === "pause_turn") s.error = { code: "server_error", message: "Kiro paused before completing the response" };
+    // 签名可晚于正文到达，终止时才发布不可再修改的完整推理项目。
+    if (emit) for (const entry of s.entries) finishEntry(s, entry, emit);
+    const name = `response.${s.status}`;
+    emit?.(name, { type: name, response: baseResponse(s) });
   }
-  return result;
 }
 
+export async function collectResponses(response: globalThis.Response, model: string, responseTools: ResponseToolMetadata = {}, options: ResponsesOptions = {}): Promise<RelayResponse> {
+  const s = initial(model, responseTools, options);
+  for await (const event of readKiroEvents(response, model)) applyEvent(s, event);
+  return baseResponse(s);
+}
 export function responsesStream(response: globalThis.Response, model: string, responseTools: ResponseToolMetadata = {}, options: ResponsesOptions = {}): globalThis.Response {
-  const s = initial(model, responseTools, options); const encoder = new TextEncoder(); let sequenceNumber = 0;
-  const readable = new ReadableStream<Uint8Array>({ async start(controller) { try { for await (const e of readKiroEvents(response, model)) { for (const [name, data] of streamEventObjects(s, e)) controller.enqueue(encoder.encode(jsonEvent(name, { ...data, sequence_number: sequenceNumber++ }))); } controller.enqueue(encoder.encode("data: [DONE]\n\n")); controller.close(); } catch (error) { s.output = outputItems(s); s.status = "failed"; const message = error instanceof Error ? error.message : "Response stream failed"; s.error = { code: "server_error", message }; controller.enqueue(encoder.encode(jsonEvent("response.failed", { type: "response.failed", response: baseResponse(s), sequence_number: sequenceNumber++ }))); controller.close(); } } });
+  const s = initial(model, responseTools, options);
+  const encoder = new TextEncoder();
+  const abort = new AbortController();
+  let sequenceNumber = 0;
+  const readable = new ReadableStream<Uint8Array>({ async start(controller) {
+    const emit: Emit = (name, data) => controller.enqueue(encoder.encode(`event: ${name}\ndata: ${JSON.stringify({ ...data, sequence_number: sequenceNumber++ })}\n\n`));
+    try {
+      for await (const event of readKiroEvents(response, model, abort.signal)) {
+        if (abort.signal.aborted) return;
+        applyEvent(s, event, emit);
+      }
+      if (abort.signal.aborted) return;
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    } catch (error) {
+      if (abort.signal.aborted) return;
+      s.status = "failed";
+      s.error = { code: "server_error", message: error instanceof Error ? error.message : "Response stream failed" };
+      emit("response.failed", { type: "response.failed", response: baseResponse(s) });
+      controller.close();
+    }
+  }, cancel(reason) { abort.abort(reason); } });
   return new globalThis.Response(readable, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive" } });
 }
 export type { ResponseStreamEvent };

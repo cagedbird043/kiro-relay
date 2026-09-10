@@ -39,10 +39,31 @@ function openAIError(message: string, status = 400, type = "invalid_request_erro
 
 const UPSTREAM_ERROR_HEADERS = ["retry-after"] as const;
 
-function upstreamError(
+const UPSTREAM_REASONS: Record<string, true> = {
+  INVALID_MODEL_ID: true, PROMPT_TOO_LONG: true, REQUEST_BODY_INVALID: true, REQUEST_BODY_INVALID_JSON: true,
+  THINKING_SIGNATURE_INVALID: true, TOOL_CONFIG_MISSING: true, TOOL_DUPLICATE: true, TOOL_SCHEMA_INVALID: true,
+  TOOL_USE_RESULT_MISMATCH: true, CONVERSATION_LIMIT_EXCEEDED: true, MONTHLY_REQUEST_COUNT: true,
+  OVERAGE_REQUEST_LIMIT_EXCEEDED: true, INVALID_KMS_GRANT: true,
+};
+
+async function upstreamReason(response: Response): Promise<string | undefined> {
+  try {
+    const body: unknown = await response.json();
+    if (!isRecord(body)) return;
+    const nested = isRecord(body.error) ? body.error : {};
+    for (const value of [body.reason, body.code, nested.reason, nested.code]) {
+      if (typeof value === "string" && Object.hasOwn(UPSTREAM_REASONS, value)) return value;
+    }
+  } catch {
+    // 非 JSON 错误页不包含可安全透传的协议原因。
+  }
+}
+
+async function upstreamError(
   response: Response,
   isResponses: boolean,
-): Response {
+  context: { requestId: string; model: string; stream: boolean },
+): Promise<Response> {
   const upstreamStatus = response.status;
   const isRateLimited = upstreamStatus === 429;
   const isOverloaded = upstreamStatus === 529;
@@ -63,9 +84,12 @@ function upstreamError(
     const value = response.headers.get(name);
     if (value !== null) headers.set(name, value);
   }
-  const message = `Kiro upstream request failed (${upstreamStatus})`;
+  const code = await upstreamReason(response);
+  headers.set("request-id", context.requestId);
+  metadataLog("REQUEST", { ...context, status: upstreamStatus, phase: "failed", category: type, code });
+  const message = `Kiro upstream request failed (${upstreamStatus})${code ? `: ${code}` : ""}`;
   return isResponses
-    ? new Response(JSON.stringify({ error: { message, type, param: null, code: null } }), { status, headers })
+    ? new Response(JSON.stringify({ error: { message, type, param: null, code: code ?? null } }), { status, headers })
     : new Response(JSON.stringify({ type: "error", error: { type, message } }), { status, headers });
 }
 
@@ -87,6 +111,7 @@ const SAFE_LOG_KEYS: Record<string, true> = {
   phase: true,
   category: true,
   code: true,
+  requestId: true,
 };
 
 function metadataLog(tag: string, data: Record<string, unknown>) {
@@ -355,8 +380,14 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
     if (method !== "POST" || (!isResponses && !isMessages && !isCountTokens)) {
       return anthropicError("Not found", 404, "not_found_error");
     }
-    const requestError = (message: string, status = 400, type = "invalid_request_error") =>
-      isResponses ? openAIError(message, status, type) : anthropicError(message, status, type);
+    const requestId = crypto.randomUUID();
+    let model = "";
+    let stream = false;
+    const identify = (response: Response) => { response.headers.set("request-id", requestId); return response; };
+    const requestError = (message: string, status = 400, type = "invalid_request_error") => {
+      metadataLog("REQUEST", { requestId, model, stream, status, phase: "failed", category: type });
+      return identify(isResponses ? openAIError(message, status, type) : anthropicError(message, status, type));
+    };
 
     let body: Record<string, unknown>;
     try {
@@ -367,7 +398,7 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
       return requestError("Request body must be valid JSON");
     }
 
-    const model = typeof body.model === "string" ? body.model : "";
+    model = typeof body.model === "string" ? body.model : "";
     if (!model || !config.models[model]) {
       return requestError(`Unknown model: ${model || "(missing)"}`);
     }
@@ -389,7 +420,7 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
       return requestError("Unable to load configured credentials", 500, "api_error");
     }
 
-    const stream = body.stream === true;
+    stream = body.stream === true;
     const log = executorLog(model);
     if (expiresWithin(credentials, REFRESH_LEAD_MS)) {
       const proactive = await refreshAccount(model, log);
@@ -445,20 +476,20 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
     }
 
     if (!result.response.ok) {
-      return upstreamError(result.response, isResponses);
+      return upstreamError(result.response, isResponses, { requestId, model, stream });
     }
-    metadataLog("REQUEST", { model, stream, status: result.response.status });
+    metadataLog("REQUEST", { requestId, model, stream, status: result.response.status, phase: "accepted" });
     try {
       if (isResponses) {
         const responseTools = responseToolMetadata(payload);
         const options = responsesOptions(payload);
-        return stream
+        return identify(stream
           ? responsesStream(result.response, model, responseTools, options)
-          : Response.json(await collectResponses(result.response, model, responseTools, options));
+          : Response.json(await collectResponses(result.response, model, responseTools, options)));
       }
-      return stream
+      return identify(stream
         ? openAIStreamToAnthropic(result.response, model)
-        : await collectAnthropicResponse(result.response, model);
+        : await collectAnthropicResponse(result.response, model));
     } catch (error) {
       return requestError(
         safeErrorMessage(error, "Unable to translate upstream response"),

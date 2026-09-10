@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { collectResponses, responsesStream } from "../src/responses/response.ts";
+import { buildKiroResponsesPayload } from "../src/responses/request.ts";
+
+function replayed(item: unknown, model: string): unknown {
+  const payload = buildKiroResponsesPayload(model, { model, input: [{ role: "user", content: "继续任务" }, item, { role: "user", content: "继续" }] }, false, {});
+  return payload.conversationState.history[1]?.assistantResponseMessage?.reasoningContent;
+}
 
 const upstream = (chunks: unknown[]) => new Response(chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join(""));
 const itemId = (event: { item?: unknown }) => {
@@ -27,9 +33,9 @@ describe("Responses formatter", () => {
     expect(result.usage?.input_tokens_details.cached_tokens).toBe(2);
     expect(result.output[0]).toMatchObject({
       type: "reasoning",
-      encrypted_content: "sig_1",
       content: [],
     });
+    expect(replayed(result.output[0], "gpt-5.6-sol")).toEqual({ reasoningText: { text: "think more", signature: "sig_1" } });
     expect(result.output[2]).toMatchObject({ type: "function_call", id: expect.stringMatching(/^fc_/), call_id: "call_1", arguments: '{"q":"x"}' });
   });
 
@@ -49,7 +55,7 @@ describe("Responses formatter", () => {
     const fields = itemFields(callAdded);
     expect(callAdded.item).toMatchObject({ id: expect.stringMatching(/^fc_/), call_id: "call_2", type: "function_call", name: "f" });
     expect(fields.id).not.toBe(fields.call_id);
-    expect(done[0]?.item).toMatchObject({ type: "reasoning", encrypted_content: "sig_2" });
+    expect(replayed(done[0]?.item, "gpt-5.6-sol")).toEqual({ reasoningText: { text: "why", signature: "sig_2" } });
     expect(output.find((e) => e.type === "response.function_call_arguments.delta")).toMatchObject({ output_index: 2, item_id: fields.id, call_id: fields.call_id });
     expect(output.at(-1)?.type).toBe("response.completed");
   });
@@ -63,9 +69,9 @@ describe("Responses formatter", () => {
     const result = await collectResponses(response, "gpt-5.6-luna", {}, { includeEncryptedContent: true });
     expect(result.output[0]).toMatchObject({
       type: "reasoning",
-      encrypted_content: "opaque-signature",
       summary: [],
     });
+    expect(replayed(result.output[0], "gpt-5.6-luna")).toEqual({ reasoningText: { text: "", signature: "opaque-signature" } });
     expect(result.output_text).toBe("answer");
 
     const streamed = responsesStream(
@@ -87,9 +93,9 @@ describe("Responses formatter", () => {
       (event) => event.type === "response.output_item.done" && event.item?.type === "reasoning"
     );
     expect(reasoningDone?.item).toMatchObject({
-      encrypted_content: "stream-signature",
       summary: [],
     });
+    expect(replayed(reasoningDone?.item, "gpt-5.6-luna")).toEqual({ reasoningText: { text: "", signature: "stream-signature" } });
   });
 
   test("reconstructs Codex custom tool calls from Kiro functions", async () => {
@@ -141,18 +147,6 @@ describe("Responses formatter", () => {
       )
     ).toMatchObject({ item: { namespace: "functions", input: 'text("ok")' } });
   });
-  test("closes signature-less reasoning before text", async () => {
-    const output = await events(responsesStream(upstream([
-      { id: "up_no_sig", choices: [{ delta: { reasoning_content: "thinking" } }] },
-      { choices: [{ delta: { content: "answer" } }] },
-      { choices: [{ delta: {}, finish_reason: "stop" }] },
-    ]), "gpt-5.6-luna"));
-    const done = output.find((event) => event.type === "response.output_item.done" && event.item?.type === "reasoning");
-    const textDelta = output.find((event) => event.type === "response.output_text.delta");
-    expect(done).toBeDefined();
-    expect(output.indexOf(done!)).toBeLessThan(output.indexOf(textDelta!));
-    expect(done?.item).toMatchObject({ summary: [{ type: "summary_text", text: "thinking" }] });
-  });
 
   test("honors encrypted reasoning include option", async () => {
     const chunks = [
@@ -161,7 +155,7 @@ describe("Responses formatter", () => {
       { choices: [{ delta: {}, finish_reason: "stop" }] },
     ];
     const included = await collectResponses(upstream(chunks), "gpt-5.6-luna", {}, { includeEncryptedContent: true });
-    expect(included.output[0]).toHaveProperty("encrypted_content", "secret");
+    expect(replayed(included.output[0], "gpt-5.6-luna")).toEqual({ reasoningText: { text: "", signature: "secret" } });
     const omitted = await collectResponses(upstream(chunks), "gpt-5.6-luna", {}, { includeEncryptedContent: false });
     expect(omitted.output[0]).not.toHaveProperty("encrypted_content");
   });
@@ -173,5 +167,21 @@ describe("Responses formatter", () => {
     expect(output.at(-1)?.type).toBe("response.failed");
     expect(output.at(-1)?.response).toMatchObject({ id: "up_failed", status: "failed", output_text: "partial" });
     expect(output.at(-1)).toHaveProperty("sequence_number");
+  });
+
+  test("晚到的分片签名和隐藏推理在终态与续轮中保持完整", async () => {
+    const output = await events(responsesStream(upstream([
+      { choices: [{ delta: { reasoning_content: "先检查状态" } }] },
+      { choices: [{ delta: { content: "开始处理" } }] },
+      { choices: [{ delta: { reasoning_signature: "签名甲" } }] },
+      { choices: [{ delta: { reasoning_signature: "签名乙" } }] },
+      { choices: [{ delta: { reasoning_redacted: "UkVEQUNURUQ=" } }] },
+      { choices: [{ finish_reason: "stop" }] },
+    ]), "gpt-5.6-sol", {}, { includeEncryptedContent: true }));
+    const done = output.filter(event => event.type === "response.output_item.done").map(event => event.item);
+    expect(output.at(-1)?.response).toMatchObject({ output: done });
+    expect(replayed(done[0], "gpt-5.6-sol")).toEqual({ reasoningText: { text: "先检查状态", signature: "签名甲签名乙" } });
+    expect(replayed(done[2], "gpt-5.6-sol")).toEqual({ redactedContent: "UkVEQUNURUQ=" });
+    expect(() => replayed(done[0], "gpt-5.6-luna")).toThrow("requested model");
   });
 });

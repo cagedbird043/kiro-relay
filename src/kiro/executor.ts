@@ -42,6 +42,7 @@ type UsageSummary = {
   total_tokens: number;
   cache_read_input_tokens?: number;
   cache_creation_input_tokens?: number;
+  estimated?: boolean;
 };
 
 type KiroStreamState = {
@@ -49,6 +50,8 @@ type KiroStreamState = {
   finishEmitted: boolean;
   startEmitted: boolean;
   stopSeen: boolean;
+  stopReason?: string;
+  stopDetails?: JsonRecord;
   hasToolCalls: boolean;
   toolCallIndex: number;
   seenToolIds: Map<string, number>;
@@ -135,7 +138,8 @@ function buildKiroFinishChunk(
       {
         index: 0,
         delta: {},
-        finish_reason: state.hasToolCalls ? "tool_calls" : "stop",
+        finish_reason: state.stopReason ?? (state.hasToolCalls ? "tool_calls" : "stop"),
+        ...(state.stopDetails ? { kiro_stop_details: state.stopDetails } : {}),
       },
     ],
   };
@@ -154,23 +158,11 @@ function buildKiroFinishChunk(
  * configured model context length; output tokens remain a text-length estimate.
  */
 function ensureKiroUsage(state: KiroStreamState, model: string) {
-  if (state.usage?.total_tokens !== undefined) return;
-  const completionTokens =
-    state.totalContentLength && state.totalContentLength > 0
-      ? Math.max(1, Math.floor(state.totalContentLength / 4))
-      : 0;
-  const promptTokens =
-    state.contextUsagePercentage && state.contextUsagePercentage > 0
-      ? Math.round((state.contextUsagePercentage / 100) * contextLengthForModel(model))
-      : 0;
-
-  if (promptTokens <= 0 && completionTokens <= 0) return;
-  state.usage = {
-    ...state.usage,
-    prompt_tokens: promptTokens,
-    completion_tokens: completionTokens,
-    total_tokens: promptTokens + completionTokens,
-  };
+  const usage = state.usage ?? {};
+  const estimated = usage.prompt_tokens === undefined || usage.completion_tokens === undefined;
+  const completionTokens = usage.completion_tokens ?? (state.totalContentLength ? Math.max(1, Math.floor(state.totalContentLength / 4)) : 0);
+  const promptTokens = usage.prompt_tokens ?? (state.contextUsagePercentage ? Math.round(state.contextUsagePercentage / 100 * contextLengthForModel(model)) : 0);
+  state.usage = { ...usage, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens, ...(estimated ? { estimated: true } : {}) };
 }
 
 /**
@@ -578,6 +570,11 @@ export class KiroExecutor extends BaseExecutor {
             }
 
             const eventType = event.headers[":event-type"] || "";
+            if (event.headers[":message-type"] === "exception" || event.headers[":message-type"] === "error") {
+              const value = event.headers[":exception-type"] ?? event.headers[":error-code"] ?? eventType;
+              const code = /^[A-Za-z][A-Za-z0-9_]{0,79}$/.test(value) ? value : "upstream_error";
+              throw new Error(`Kiro upstream stream failed (${code})`);
+            }
 
             // Track total content length for token estimation
             if (!state.totalContentLength) state.totalContentLength = 0;
@@ -613,15 +610,16 @@ export class KiroExecutor extends BaseExecutor {
                 const nestedSignature = rt && typeof rt === "object" && "signature" in rt ? rt.signature : undefined;
                 const signature = typeof rp?.signature === "string" ? rp.signature
                   : typeof nestedSignature === "string" ? nestedSignature : undefined;
-                const visibleNativeReasoning =
-                  nativeReasoning.trim() === "..." ? "" : nativeReasoning;
-                if (visibleNativeReasoning || signature) {
+                const visibleNativeReasoning = nativeReasoning;
+                const redacted = typeof rp?.redactedContent === "string" ? rp.redactedContent : undefined;
+                if (visibleNativeReasoning || signature || redacted) {
                   if (visibleNativeReasoning) state.hasReasoningContent = true;
                   const reasoningDelta: JsonRecord = {
                     ...(visibleNativeReasoning
                       ? { reasoning_content: visibleNativeReasoning }
                       : {}),
                     ...(signature ? { reasoning_signature: signature } : {}),
+                    ...(redacted ? { reasoning_redacted: redacted } : {}),
                   };
                   if ((state.reasoningChunkCount ?? 0) === 0 && chunkIndex === 0) {
                     reasoningDelta.role = "assistant";
@@ -879,92 +877,37 @@ export class KiroExecutor extends BaseExecutor {
               state.hasMeteringEvent = true;
             }
 
-            // Handle token usage. Kiro reports it under more than one frame: the
-            // `metricsEvent` shape covered by unit tests, and a `metadataEvent`
-            // carrying a nested `usage` object — the shape observed on live
-            // API-key traffic (see tests/unit/executor-kiro.test.ts, the
-            // "live API-key event shape" case, whose frames are
-            // assistantResponseEvent / metadataEvent / contextUsageEvent /
-            // meteringEvent with no metricsEvent at all). Reading only
-            // `metricsEvent` meant cache tokens were never picked up in
-            // production even after their field names were corrected, because
-            // the branch holding that code never ran.
             if (eventType === "metricsEvent" || eventType === "metadataEvent") {
-              const metrics =
-                event.payload?.metricsEvent ||
-                event.payload?.usage ||
-                (event.payload?.metadataEvent as JsonRecord)?.usage ||
-                event.payload;
-              if (metrics && typeof metrics === "object") {
-                const readNumber = (...candidates: unknown[]) =>
-                  candidates.find((value) => typeof value === "number") as number | undefined;
-
-                // Bedrock-style (`inputTokens`) and OpenAI-style
-                // (`prompt_tokens`) spellings both appear across Kiro frames.
-                const inputTokens =
-                  readNumber(
-                    (metrics as JsonRecord).inputTokens,
-                    (metrics as JsonRecord).prompt_tokens
-                  ) || 0;
-                const outputTokens =
-                  readNumber(
-                    (metrics as JsonRecord).outputTokens,
-                    (metrics as JsonRecord).completion_tokens
-                  ) || 0;
-
-                const cacheReadTokens = readNumber(
-                  (metrics as JsonRecord).cacheReadInputTokens,
-                  (metrics as JsonRecord).cacheReadTokens,
-                  (metrics as JsonRecord).cache_read_input_tokens
-                );
-
-                const cacheCreationTokens = readNumber(
-                  (metrics as JsonRecord).cacheWriteInputTokens,
-                  (metrics as JsonRecord).cacheCreationTokens,
-                  (metrics as JsonRecord).cache_creation_input_tokens
-                );
-
-                if (inputTokens > 0 || outputTokens > 0) {
-                  state.usage = {
-                    prompt_tokens: inputTokens,
-                    completion_tokens: outputTokens,
-                    total_tokens: inputTokens + outputTokens,
-                    ...((cacheReadTokens || 0) > 0 && {
-                      cache_read_input_tokens: cacheReadTokens,
-                    }),
-                    ...((cacheCreationTokens || 0) > 0 && {
-                      cache_creation_input_tokens: cacheCreationTokens,
-                    }),
-                  };
-                } else if ((cacheReadTokens || 0) > 0 || (cacheCreationTokens || 0) > 0) {
-                  // Cache counts can arrive on a frame that carries no
-                  // input/output totals. Preserve them instead of dropping the
-                  // whole frame, and let ensureKiroUsage() fill the totals from
-                  // contextUsagePercentage.
-                  state.usage = {
-                    ...(state.usage || {}),
-                    ...((cacheReadTokens || 0) > 0 && {
-                      cache_read_input_tokens: cacheReadTokens,
-                    }),
-                    ...((cacheCreationTokens || 0) > 0 && {
-                      cache_creation_input_tokens: cacheCreationTokens,
-                    }),
+              const payload = event.payload ?? {};
+              const metadata = payload.metadataEvent && typeof payload.metadataEvent === "object" ? payload.metadataEvent as JsonRecord : payload;
+              const rawMetrics = metadata.tokenUsage ?? metadata.usage ?? metadata.metricsEvent ?? metadata;
+              if (rawMetrics && typeof rawMetrics === "object") {
+                const metrics = rawMetrics as JsonRecord;
+                const readNumber = (...values: unknown[]): number | undefined => values.find((value): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0);
+                const input = readNumber(metrics.uncachedInputTokens, metrics.inputTokens, metrics.prompt_tokens);
+                const output = readNumber(metrics.outputTokens, metrics.completion_tokens);
+                const read = readNumber(metrics.cacheReadInputTokens, metrics.cacheReadTokens, metrics.cache_read_input_tokens);
+                const write = readNumber(metrics.cacheWriteInputTokens, metrics.cacheCreationTokens, metrics.cache_creation_input_tokens);
+                if (input !== undefined || output !== undefined || read !== undefined || write !== undefined) {
+                  state.usage = { ...state.usage,
+                    ...(input === undefined ? {} : { prompt_tokens: input }),
+                    ...(output === undefined ? {} : { completion_tokens: output }),
+                    ...(read === undefined ? {} : { cache_read_input_tokens: read }),
+                    ...(write === undefined ? {} : { cache_creation_input_tokens: write }),
                   };
                 }
               }
-            }
-            // Node closes Kiro's HTTP body after the response, but Bun may keep
-            // it open. meteringEvent is Kiro's final protocol frame; unlike
-            // contextUsageEvent, no response or cache-usage frames follow it.
-            if (eventType === "meteringEvent" && !state.finishEmitted) {
-              if (!flushPendingWrapperToolCalls(controller)) return;
-              flushBufferedToolArgs(state, controller, { responseId, created, model });
-              state.finishEmitted = true;
-              ensureKiroUsage(state, model);
-              const finishChunk = buildKiroFinishChunk(state, responseId, created, model, true);
-              controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(finishChunk)}\n\n`));
-              controller.enqueue(TEXT_ENCODER.encode("data: [DONE]\n\n"));
-              return;
+              if (typeof metadata.stopReason === "string" && metadata.stopReason) {
+                state.stopSeen = true;
+                state.stopReason = metadata.stopReason;
+                if (metadata.stopDetails && typeof metadata.stopDetails === "object") {
+                  const refusal = (metadata.stopDetails as JsonRecord).refusal;
+                  if (refusal && typeof refusal === "object") {
+                    const fields = Object.entries(refusal).filter(([key, value]) => ["category", "explanation", "recommendedModel"].includes(key) && typeof value === "string");
+                    state.stopDetails = { refusal: Object.fromEntries(fields) };
+                  }
+                }
+              }
             }
 
           }
@@ -975,7 +918,8 @@ export class KiroExecutor extends BaseExecutor {
         },
 
         flush(controller) {
-          if (!state.stopSeen && !state.finishEmitted) {
+          // 物理结束时确认终止证据，保留计量帧之后到达的元数据。
+          if (buffer.length > 0 || (!state.stopSeen && !state.hasMeteringEvent && !state.finishEmitted)) {
             throw new KiroStreamProtocolError();
           }
           if (!flushPendingWrapperToolCalls(controller)) return;
@@ -1041,26 +985,9 @@ export class KiroExecutor extends BaseExecutor {
           controller.close();
         },
       });
-    const sourceReader = responseBody.getReader();
-    const writer = transformStream.writable.getWriter();
     const transformedStream = transformStream.readable;
-    void (async () => {
-      try {
-        while (true) {
-          const { value, done } = await sourceReader.read();
-          if (done) break;
-          await writer.write(value);
-          if (state.finishEmitted) {
-            void sourceReader.cancel().catch(() => undefined);
-            break;
-          }
-        }
-        await writer.close();
-      } catch (error) {
-        if (state.finishEmitted) await writer.close().catch(() => undefined);
-        else await writer.abort(error).catch(() => undefined);
-      }
-    })();
+    // pipeTo 将下游取消传给 HTTP 响应体；错误仍由 readable 交付消费者。
+    void responseBody.pipeTo(transformStream.writable).catch(() => undefined);
 
     return new Response(transformedStream, {
       status: response.status,

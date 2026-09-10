@@ -27,6 +27,33 @@ test("maps reasoning and function call output", () => {
   assert.deepEqual(p.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults, [{ toolUseId: "call_1", status: "success", content: [{ text: "result" }] }]);
 });
 
+test("并行工具保持同轮且依赖工具结果的后续调用保持独立回合", () => {
+  const payload = buildKiroResponsesPayload(model, req({ input: [
+    { role: "user", content: "先读取两份配置再执行修改" },
+    { type: "function_call", call_id: "a", name: "read", arguments: '{"path":"a"}' },
+    { type: "function_call", call_id: "b", name: "read", arguments: '{"path":"b"}' },
+    { type: "function_call_output", call_id: "b", output: "配置乙" },
+    { type: "function_call_output", call_id: "a", output: "配置甲" },
+    { role: "assistant", content: "根据两份配置修改" },
+    { type: "custom_tool_call", call_id: "c", name: "edit", input: "修改指令" },
+    { type: "custom_tool_call_output", call_id: "c", output: "修改成功" },
+  ] }), false, {});
+  assert.deepEqual(payload.conversationState.history, [
+    { userInputMessage: { content: "先读取两份配置再执行修改", modelId: model, origin: "AI_EDITOR" } },
+    { assistantResponseMessage: { content: "", toolUses: [
+      { toolUseId: "a", name: "read", input: { path: "a" } },
+      { toolUseId: "b", name: "read", input: { path: "b" } },
+    ] } },
+    { userInputMessage: { content: "", modelId: model, origin: "AI_EDITOR", userInputMessageContext: { toolResults: [
+      { toolUseId: "b", status: "success", content: [{ text: "配置乙" }] },
+      { toolUseId: "a", status: "success", content: [{ text: "配置甲" }] },
+    ] } } },
+    { assistantResponseMessage: { content: "根据两份配置修改", toolUses: [{ toolUseId: "c", name: "edit", input: { input: "修改指令" } }] } },
+  ]);
+  assert.deepEqual(payload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults,
+    [{ toolUseId: "c", status: "success", content: [{ text: "修改成功" }] }]);
+});
+
 test("sanitizes function tools and rejects hosted/stateful features", () => {
   const p = buildKiroResponsesPayload(model, req({ tools: [{ type: "function", name: "x", parameters: { type: "object", additionalProperties: false } }]}), false, {});
   const tool = p.conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools?.[0] as { toolSpecification: { inputSchema: { json: Record<string, unknown> } } };
@@ -55,7 +82,7 @@ test("accepts OMP stateless defaults and cache keys", () => {
     false,
     {}
   );
-  assert.equal(first.conversationState.conversationId, second.conversationState.conversationId);
+  assert.notEqual(first.conversationState.conversationId, second.conversationState.conversationId);
   assert.deepEqual(first.additionalModelRequestFields, {
     reasoning: { effort: "low", summary: "auto" },
   });
@@ -114,6 +141,7 @@ test("accepts OMP reasoning history and merges assistant tool calls", () => {
     {
       assistantResponseMessage: {
         content: "I will inspect it.",
+        reasoningContent: { reasoningText: { text: "..." } },
         toolUses: [
           { toolUseId: "call_read", name: "read", input: { path: "." } },
         ],
