@@ -19,25 +19,25 @@ import { createHash } from "node:crypto";
 const MAX_TOOL_NAME_LENGTH = 64;
 
 /** JSON-Schema keywords Kiro rejects anywhere in a tool schema. */
-const STRIP_KEYS = new Set<string>([
-  "additionalProperties",
-  "anyOf",
-  "oneOf",
-  "allOf",
-  "not",
-  "$schema",
-  "$id",
-  "$ref",
-  "$defs",
-  "definitions",
-  "if",
-  "then",
-  "else",
-  "unevaluatedProperties",
-  "unevaluatedItems",
-  "contentEncoding",
-  "contentMediaType",
-]);
+const STRIP_KEYS: Readonly<Record<string, true>> = {
+  additionalProperties: true,
+  anyOf: true,
+  oneOf: true,
+  allOf: true,
+  not: true,
+  $schema: true,
+  $id: true,
+  $ref: true,
+  $defs: true,
+  definitions: true,
+  if: true,
+  then: true,
+  else: true,
+  unevaluatedProperties: true,
+  unevaluatedItems: true,
+  contentEncoding: true,
+  contentMediaType: true,
+};
 
 /**
  * Recursively drop unsupported JSON-Schema keys and empty `required` arrays.
@@ -48,10 +48,16 @@ function stripKeys(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stripKeys);
 
   const cleaned: Record<string, unknown> = {};
-  for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
-    if (STRIP_KEYS.has(key)) continue;
-    if (key === "required" && Array.isArray(val) && val.length === 0) continue;
-    cleaned[key] = stripKeys(val);
+  for (const [key, val] of Object.entries(value)) {
+    if (Object.hasOwn(STRIP_KEYS, key) || (key === "required" && Array.isArray(val) && val.length === 0)) continue;
+    let result = val;
+    // 属性映射的键是业务名称；枚举、默认值等普通数据不能按 Schema 清洗。
+    if ((key === "properties" || key === "patternProperties" || key === "dependentSchemas" || key === "dependencies") && val && typeof val === "object" && !Array.isArray(val)) {
+      result = Object.fromEntries(Object.entries(val).map(([name, schema]) => [name, stripKeys(schema)]));
+    } else if (key === "items" || key === "prefixItems" || key === "contains" || key === "propertyNames" || key === "additionalItems") {
+      result = stripKeys(val);
+    }
+    Object.defineProperty(cleaned, key, { value: result, enumerable: true, writable: true, configurable: true });
   }
   return cleaned;
 }
@@ -150,4 +156,16 @@ export function sanitizeKiroTools<T>(tools: T): SanitizeKiroToolsResult<T> {
   });
 
   return { tools: sanitized as T, nameMap };
+}
+
+type KiroToolHistoryItem = { assistantResponseMessage?: { toolUses?: Array<{ name: string }> } };
+
+/** 将新构造历史中的工具名称映射到本次声明使用的上游名称。 */
+export function remapKiroToolHistory(history: readonly KiroToolHistoryItem[], nameMap: ReadonlyMap<string, string>): void {
+  if (!nameMap.size) return;
+  const forward = new Map<string, string>();
+  for (const [sanitized, original] of nameMap) if (!forward.has(original)) forward.set(original, sanitized);
+  for (const item of history) {
+    for (const tool of item.assistantResponseMessage?.toolUses ?? []) tool.name = forward.get(tool.name) ?? tool.name;
+  }
 }

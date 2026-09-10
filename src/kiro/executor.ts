@@ -325,6 +325,7 @@ export class KiroExecutor extends BaseExecutor {
       if (response.ok || !hasFallback || !KIRO_ENDPOINT_FALLBACK_STATUSES.has(response.status)) {
         break;
       }
+      await response.body?.cancel().catch(() => undefined);
     }
 
     if (!response.ok) {

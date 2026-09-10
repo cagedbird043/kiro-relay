@@ -14,8 +14,8 @@ import {
   supportsKiroNativeReasoning,
 } from "./adaptiveThinking.ts";
 import { supportsKiroImages } from "../modelCapabilities.ts";
-import { sanitizeKiroTools } from "../sanitizer.ts";
-import type { KiroReasoningContent } from "../reasoning.ts";
+import { remapKiroToolHistory, sanitizeKiroTools } from "../sanitizer.ts";
+import { mergeKiroReasoning, type KiroReasoningContent } from "../reasoning.ts";
 
 /**
  * Anthropic's direct-provider `[1m]` context-1m beta suffix. Kiro is AWS
@@ -435,13 +435,13 @@ function convertMessages(messages, tools, model) {
       let toolUses = [];
 
       if (Array.isArray(msg.content)) {
-        // 与官方客户端一致，回放最后一个带签名或隐藏内容的推理块。
+        // 单个原生槽不能表达多个独立签名或隐藏块，不能静默覆盖。
         for (const block of msg.content) {
           if (block?.type === "thinking" && typeof block.thinking === "string" &&
               typeof block.signature === "string" && block.signature.length > 0) {
-            pendingReasoning = { reasoningText: { text: block.thinking, signature: block.signature } };
+            pendingReasoning = mergeKiroReasoning(pendingReasoning, { reasoningText: { text: block.thinking, signature: block.signature } });
           } else if (block?.type === "redacted_thinking" && typeof block.data === "string" && block.data.length > 0) {
-            pendingReasoning = { redactedContent: block.data };
+            pendingReasoning = mergeKiroReasoning(pendingReasoning, { redactedContent: block.data });
           }
         }
         const textBlocks = msg.content.filter((c) => c.type === "text");
@@ -626,7 +626,7 @@ function convertMessages(messages, tools, model) {
         : currentContent;
 
       if (item.assistantResponseMessage.reasoningContent) {
-        previous.assistantResponseMessage.reasoningContent = item.assistantResponseMessage.reasoningContent;
+        previous.assistantResponseMessage.reasoningContent = mergeKiroReasoning(previous.assistantResponseMessage.reasoningContent, item.assistantResponseMessage.reasoningContent);
       }
       if (item.assistantResponseMessage.toolUses) {
         const existingToolUses = previous.assistantResponseMessage.toolUses || [];
@@ -967,6 +967,7 @@ export function buildKiroPayload(model, body, stream, credentials) {
   if (Array.isArray(context?.tools)) {
     const { tools: sanitizedTools, nameMap } = sanitizeKiroTools(context.tools);
     context.tools = sanitizedTools;
+    remapKiroToolHistory(payload.conversationState.history ?? [], nameMap);
     if (nameMap.size > 0) {
       (payload as typeof payload & { _toolNameMap: Record<string, string> })._toolNameMap =
         Object.fromEntries(nameMap);

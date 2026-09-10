@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHandler, type ExecutorLike } from "../src/server.ts";
@@ -21,6 +21,60 @@ async function fixture() {
   await writeFile(credentials, JSON.stringify({ accessToken: "old", refreshToken: "refresh" }));
   return { dir, credentials, config: config(credentials) };
 }
+
+test("刷新重试前释放旧响应且不影响新响应内容", async () => {
+  const f = await fixture();
+  let calls = 0;
+  let cancelled = false;
+  try {
+    const handler = createHandler(f.config, {
+      execute: async () => {
+        if (++calls === 1) return { response: new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status: 401 }) };
+        expect(cancelled).toBe(true);
+        return { response: upstream(false, "恢复完成") };
+      },
+      refreshCredentials: async () => ({ accessToken: "new", refreshToken: "rotated", expiresIn: 3600 }),
+    });
+    const response = await handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "任务" }] }));
+    expect(response.status).toBe(200);
+    expect((await response.json()).content[0].text).toBe("恢复完成");
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
+test("轮换后保存失败保留新凭据并在文件恢复后共享重试保存", async () => {
+  const f = await fixture();
+  const backup = join(f.dir, "old.json");
+  let refreshes = 0;
+  let executions = 0;
+  try {
+    await writeFile(f.credentials, JSON.stringify({ accessToken: "expired", refreshToken: "old", expiresAt: "2020-01-01T00:00:00Z" }));
+    const handler = createHandler(f.config, {
+      refreshCredentials: async () => {
+        refreshes++;
+        if (refreshes > 1) return { error: "unrecoverable_refresh_error", code: "invalid_grant" };
+        // 目录占用目标文件名，确定性地令原子替换失败，不依赖进程权限。
+        await rename(f.credentials, backup);
+        await mkdir(f.credentials);
+        return { accessToken: "new", refreshToken: "rotated", expiresIn: 3600 };
+      },
+      execute: async ({ credentials }) => {
+        executions++;
+        return { response: credentials.accessToken === "new" ? upstream(false, "恢复完成") : new Response("expired", { status: 401 }) };
+      },
+    });
+    const body = { model: "claude-opus-5", messages: [{ role: "user", content: "任务" }] };
+    expect((await handler(request("/v1/messages", body))).status).toBe(500);
+    expect((await handler(request("/v1/messages", body))).status).toBe(500);
+    expect(executions).toBe(0);
+    await rm(f.credentials, { recursive: true });
+    await rename(backup, f.credentials);
+    const responses = await Promise.all([handler(request("/v1/messages", body)), handler(request("/v1/messages", body))]);
+    expect(responses.map(response => response.status)).toEqual([200, 200]);
+    for (const response of responses) expect((await response.json()).content[0].text).toBe("恢复完成");
+    expect(refreshes).toBe(1);
+    expect(JSON.parse(await Bun.file(f.credentials).text()).refreshToken).toBe("rotated");
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
 
 test("失败响应保留协议原因与关联编号且不泄漏原始正文", async () => {
   const f = await fixture();

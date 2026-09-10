@@ -1,9 +1,9 @@
 import { v4 as uuidv4 } from "uuid";
 import type { ResponseCreateParamsBase } from "openai/resources/responses/responses";
-import { sanitizeKiroTools } from "../kiro/sanitizer.ts";
+import { remapKiroToolHistory, sanitizeKiroTools } from "../kiro/sanitizer.ts";
 import type { ProviderCredentials } from "../kiro/base.ts";
 import { getKiroModelCapabilities } from "../kiro/modelCapabilities.ts";
-import { decodeReasoning, type KiroReasoningContent } from "../kiro/reasoning.ts";
+import { decodeReasoning, mergeKiroReasoning, type KiroReasoningContent } from "../kiro/reasoning.ts";
 
 /** Responses request accepted by the native Kiro adapter. */
 export type KiroResponsesRequest = Partial<ResponseCreateParamsBase> & Record<string, unknown> & {
@@ -194,7 +194,7 @@ function flattenToolDefinitions(
     }
     const originalName = value.name;
     const flattenedName = namespace ? `${namespace}__${originalName}` : originalName;
-    if (seenNames[flattenedName]) throw new Error(`Duplicate tool: ${flattenedName}`);
+    if (Object.hasOwn(seenNames, flattenedName)) throw new Error(`Duplicate tool: ${flattenedName}`);
     seenNames[flattenedName] = true;
     if (namespace || value.type === "custom") {
       metadata[flattenedName] = {
@@ -292,7 +292,8 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
       const reasoningContent = reasoningHistoryItem(item, model);
       if (reasoningContent) {
         appendAssistantHistory(history, "");
-        history.at(-1)!.assistantResponseMessage!.reasoningContent = reasoningContent;
+        const assistant = history.at(-1)!.assistantResponseMessage!;
+        assistant.reasoningContent = mergeKiroReasoning(assistant.reasoningContent, reasoningContent);
       }
       continue;
     }
@@ -341,17 +342,18 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   let responseToolMetadata: Record<string, { name: string; namespace?: string; custom: boolean }> | undefined;
   if (declaredTools.length) {
     const flattened: Obj[] = [];
-    const metadata: Record<string, { name: string; namespace?: string; custom: boolean }> = {};
-    flattenToolDefinitions(declaredTools, flattened, metadata, {});
+    const metadata: Record<string, { name: string; namespace?: string; custom: boolean }> = Object.create(null);
+    flattenToolDefinitions(declaredTools, flattened, metadata, Object.create(null));
     const tools = flattened.map((tool) => {
       const fn = isObj(tool.function) ? tool.function : tool;
       if (typeof fn.name !== "string" || !fn.name) throw new Error("function tool requires a name");
       return { toolSpecification: { name: fn.name, description: typeof fn.description === "string" ? fn.description : undefined, inputSchema: { json: isObj(fn.parameters) ? fn.parameters : { type: "object", properties: {} } } } };
     });
     const sanitized = sanitizeKiroTools(tools);
+    remapKiroToolHistory(history, sanitized.nameMap);
     context.tools = sanitized.tools;
     if (sanitized.nameMap.size) nameMap = Object.fromEntries(sanitized.nameMap);
-    const restoredMetadata: Record<string, { name: string; namespace?: string; custom: boolean }> = {};
+    const restoredMetadata: Record<string, { name: string; namespace?: string; custom: boolean }> = Object.create(null);
     for (const tool of sanitized.tools) {
       const sanitizedName = tool.toolSpecification.name;
       const flattenedName = sanitized.nameMap.get(sanitizedName) ?? sanitizedName;

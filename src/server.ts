@@ -252,6 +252,8 @@ function responsesOptions(payload: unknown): ResponsesOptions {
 export function createHandler(config: AppConfig, executor: ExecutorLike = new KiroExecutor()) {
   const account = config.accounts[0];
   const refreshFlights = new Map<string, Promise<CredentialRefreshOutcome>>();
+  // 刷新令牌可能已轮换；落盘成功前由当前进程持有，后续请求先重试保存。
+  let pendingCredentials: ProviderCredentials | undefined;
 
   const refreshAccount = async (
     model: string,
@@ -265,11 +267,21 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
     const flight = (async (): Promise<CredentialRefreshOutcome> => {
       let latest: ProviderCredentials;
       try {
-        latest = await loadCredentials(path);
+        latest = pendingCredentials ?? await loadCredentials(path);
       } catch {
         metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_reload", code: "credential_reload_failed" });
         return { error: "refresh_failed", code: "credential_reload_failed" };
       }
+      if (pendingCredentials) {
+        try {
+          await saveCredentials(path, latest);
+          pendingCredentials = undefined;
+        } catch {
+          metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_persistence", code: "persist_failed" });
+          return { error: "persist_failed", code: "persist_failed" };
+        }
+      }
+
 
       const anotherRequestRefreshed = rejectedAccessToken !== undefined &&
         latest.accessToken !== rejectedAccessToken && !expiresWithin(latest, 0);
@@ -297,8 +309,10 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
         metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_refresh", code });
         return { error: "refresh_failed", code };
       }
+      pendingCredentials = refreshed;
       try {
         await saveCredentials(path, refreshed);
+        pendingCredentials = undefined;
       } catch {
         metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_persistence", code: "persist_failed" });
         return { error: "persist_failed", code: "persist_failed" };
@@ -415,14 +429,14 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
 
     let credentials: ProviderCredentials;
     try {
-      credentials = await loadCredentials(account.credentialFile);
+      credentials = pendingCredentials ?? await loadCredentials(account.credentialFile);
     } catch {
       return requestError("Unable to load configured credentials", 500, "api_error");
     }
 
     stream = body.stream === true;
     const log = executorLog(model);
-    if (expiresWithin(credentials, REFRESH_LEAD_MS)) {
+    if (pendingCredentials || expiresWithin(credentials, REFRESH_LEAD_MS)) {
       const proactive = await refreshAccount(model, log);
       if ("credentials" in proactive) {
         credentials = proactive.credentials;
@@ -459,6 +473,7 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
 
     const credentialsExpired = expiresWithin(credentials, 60_000);
     if (result.response.status === 401 || (result.response.status === 403 && credentialsExpired)) {
+      await result.response.body?.cancel().catch(() => undefined);
       const rejectedAccessToken = credentials.accessToken;
       const reactive = await refreshAccount(model, log, rejectedAccessToken);
       if (!("credentials" in reactive)) {

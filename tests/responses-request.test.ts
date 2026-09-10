@@ -1,10 +1,55 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildKiroResponsesPayload } from "../src/responses/request.ts";
+import { encodeReasoning } from "../src/kiro/reasoning.ts";
+import { collectResponses } from "../src/responses/response.ts";
 
 const credentials = { providerSpecificData: { profileArn: "arn:aws:demo" } };
 const model = "gpt-5.6-sol";
 const req = (extra: Record<string, unknown> = {}) => ({ model, ...extra });
+
+test("多个无签名摘要完整合并而独立签名不会被静默覆盖", () => {
+  const first = { type: "reasoning", summary: [{ type: "summary_text", text: "第一段" }] };
+  const second = { type: "reasoning", summary: [{ type: "summary_text", text: "第二段" }] };
+  const input = [{ role: "user", content: "任务" }, first, { role: "assistant", content: "中间正文" }, second, { role: "user", content: "继续" }];
+  const merged = buildKiroResponsesPayload(model, req({ input }), false, credentials);
+  assert.deepEqual(merged.conversationState.history[1].assistantResponseMessage?.reasoningContent, { reasoningText: { text: "第一段\n\n第二段" } });
+  const signed = { ...first, encrypted_content: encodeReasoning(model, { reasoningText: { text: "第一段", signature: "签名甲" } }) };
+  const hidden = { type: "reasoning", summary: [], encrypted_content: encodeReasoning(model, { redactedContent: "UkVEQUNURUQ=" }) };
+  const single = buildKiroResponsesPayload(model, req({ input: [{ role: "user", content: "任务" }, signed, { role: "user", content: "继续" }] }), false, credentials);
+  assert.deepEqual(single.conversationState.history[1].assistantResponseMessage?.reasoningContent, { reasoningText: { text: "第一段", signature: "签名甲" } });
+  assert.throws(() => buildKiroResponsesPayload(model, req({ input: [{ role: "user", content: "任务" }, signed, second, { role: "user", content: "继续" }] }), false, credentials));
+  assert.throws(() => buildKiroResponsesPayload(model, req({ input: [{ role: "user", content: "任务" }, signed, hidden, { role: "user", content: "继续" }] }), false, credentials));
+  const separate = buildKiroResponsesPayload(model, req({ input: [{ role: "user", content: "任务" }, signed, { role: "user", content: "下一轮" }, hidden, { role: "user", content: "继续" }] }), false, credentials);
+  assert.deepEqual(separate.conversationState.history.filter(item => item.assistantResponseMessage).map(item => item.assistantResponseMessage?.reasoningContent), [
+    { reasoningText: { text: "第一段", signature: "签名甲" } }, { redactedContent: "UkVEQUNURUQ=" },
+  ]);
+});
+
+test("命名空间合成超长工具的声明选择和历史使用同一个上游名称", () => {
+  const namespace = "repo_namespace_".repeat(3);
+  const name = "read_source_file_for_analysis";
+  const payload = buildKiroResponsesPayload(model, req({
+    tools: [{ type: "namespace", name: namespace, tools: [{ type: "function", name, parameters: { type: "object", properties: {} } }] }],
+    tool_choice: { type: "function", namespace, name },
+    input: [{ role: "user", content: "任务" }, { type: "function_call", call_id: "a", namespace, name, arguments: "{}" }, { type: "function_call_output", call_id: "a", output: "完成" }],
+  }), false, credentials);
+  const context = payload.conversationState.currentMessage.userInputMessage.userInputMessageContext;
+  const wire = JSON.parse(JSON.stringify(context));
+  const declared = wire.tools[0].toolSpecification.name;
+  assert.ok(declared.length <= 64);
+  assert.equal(wire.toolChoice.tool.name, declared);
+  assert.equal(payload.conversationState.history[1].assistantResponseMessage?.toolUses?.[0].name, declared);
+  assert.equal(payload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults?.[0].toolUseId, "a");
+});
+
+test("继承属性同名工具可声明和返回且真正重复仍被拒绝", async () => {
+  const tools = ["constructor", "__proto__"].map(name => ({ type: "function", name, parameters: { type: "object", properties: {} } }));
+  const payload = buildKiroResponsesPayload(model, req({ input: "调用工具", tools }), false, credentials);
+  const response = await collectResponses(new Response(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: tools.map((tool, index) => ({ index, id: String(index), function: { name: tool.name, arguments: "{}" } })) }, finish_reason: "tool_calls" }] })}\n\n`), model, payload._responseToolMetadata);
+  assert.deepEqual(response.output.filter(item => item.type === "function_call").map(item => item.name), ["constructor", "__proto__"]);
+  for (const tool of tools) assert.throws(() => buildKiroResponsesPayload(model, req({ input: "调用工具", tools: [tool, tool] }), false, credentials));
+});
 
 test("builds native Kiro payload with instructions and output limit", () => {
   const p = buildKiroResponsesPayload(model, req({ input: "Hello", instructions: "Be brief", max_output_tokens: 123, stream: false }), false, credentials);

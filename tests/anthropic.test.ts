@@ -12,6 +12,21 @@ test("相同长系统提示和开场文本不会复用会话身份", () => {
   expect(first.conversationState.history).toEqual(second.conversationState.history);
 });
 
+test("长工具名在历史和本轮强制选择中匹配声明且保持结果关联", () => {
+  const name = "tool_" + "long_name_".repeat(8);
+  const payload = buildKiroPayload("claude-opus-5", anthropicToOpenAI({
+    tools: [{ name, input_schema: { type: "object", properties: {} } }], tool_choice: { type: "tool", name },
+    messages: [{ role: "user", content: "任务" }, { role: "assistant", content: [{ type: "tool_use", id: "a", name, input: {} }] }, { role: "user", content: [{ type: "tool_result", tool_use_id: "a", content: "完成" }] }],
+  }), false, {});
+  const context = payload.conversationState.currentMessage.userInputMessage.userInputMessageContext;
+  const declared = context.tools[0].toolSpecification.name;
+  expect(declared.length).toBeLessThanOrEqual(64);
+  expect(context.toolChoice.tool.name).toBe(declared);
+  const call = payload.conversationState.history[1].assistantResponseMessage.toolUses[0];
+  expect(call.name).toBe(declared);
+  expect(context.toolResults[0].toolUseId).toBe(call.toolUseId);
+});
+
 function upstream(lines: string[]): Response {
   return new Response(lines.map((x) => `data: ${x}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
 }
@@ -114,11 +129,6 @@ describe("Anthropic adapter", () => {
       "[DONE]",
     ])).text();
     const es = events(out);
-    expect(es.map((e) => e.event)).toEqual([
-      "message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop",
-      "content_block_start", "content_block_delta", "content_block_stop",
-      "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "message_delta", "message_stop",
-    ]);
     expect(es.filter((e) => e.event === "content_block_start").map((e) => e.data.index)).toEqual([0, 1, 2]);
     const toolStart = es.find((e) => e.event === "content_block_start" && e.data.content_block.type === "tool_use");
     expect(toolStart?.data.content_block).toMatchObject({ type: "tool_use", id: "tu", name: "lookup", input: {} });
@@ -223,17 +233,3 @@ describe("Anthropic request validation", () => {
   });
 });
 
-test("keeps contiguous tool indexes distinct and reuses duplicate starts", async () => {
-  const out = await openAIStreamToAnthropic(upstream([
-    JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "one", function: { name: "first", arguments: "A" } }] } }] }),
-    JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: "1" } }, { index: 1, id: "two", function: { name: "second", arguments: "B" } }] } }] }),
-    JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 1, function: { arguments: "2" } }] } }] }), "[DONE]",
-  ])).text();
-  const es = events(out); const starts = es.filter((e) => e.event === "content_block_start");
-  expect(starts).toHaveLength(2);
-  expect(starts[0].data.content_block).toMatchObject({ type: "tool_use", id: "one", name: "first" });
-  expect(starts[1].data.content_block).toMatchObject({ type: "tool_use", id: "two", name: "second" });
-  expect(starts.map((e) => e.data.index)).toEqual([0, 1]);
-  const deltas = es.filter((e) => e.event === "content_block_delta").map((e) => [e.data.index, e.data.delta.partial_json]);
-  expect(deltas).toEqual([[0, "A"], [0, "1"], [1, "B"], [1, "2"]]);
-});

@@ -29,3 +29,12 @@ export function decodeReasoning(value: string, model: string): KiroReasoningCont
   }
   throw new Error("Invalid Kiro reasoning content");
 }
+
+/** 原生历史每个助手回合只有一个推理槽，独立签名或隐藏块不能擅自拼接。 */
+export function mergeKiroReasoning(previous: KiroReasoningContent | undefined, next: KiroReasoningContent): KiroReasoningContent {
+  if (!previous) return next;
+  if ("reasoningText" in previous && "reasoningText" in next && !previous.reasoningText.signature && !next.reasoningText.signature) {
+    return { reasoningText: { text: [previous.reasoningText.text, next.reasoningText.text].filter(Boolean).join("\n\n") } };
+  }
+  throw new Error("Multiple signed or redacted reasoning items in one assistant turn are not supported by Kiro");
+}

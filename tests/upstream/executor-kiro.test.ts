@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { KiroExecutor } from "../../src/kiro/executor.ts";
-import { anthropicToOpenAI, collectAnthropicResponse } from "../../src/anthropic.ts";
+import { anthropicToOpenAI, collectAnthropicResponse, openAIStreamToAnthropic } from "../../src/anthropic.ts";
 import { buildKiroPayload } from "../../src/kiro/request/openai-to-kiro.ts";
 import { collectResponses, responsesStream } from "../../src/responses/response.ts";
 import { buildKiroResponsesPayload } from "../../src/responses/request.ts";
@@ -112,6 +112,91 @@ function parseSSEJsonChunks(text) {
     .filter((payload) => payload && payload !== "[DONE]")
     .map((payload) => JSON.parse(payload));
 }
+
+test("并行对象参数和交错参数在两种 Anthropic 输出中保持完整且块不重开", async () => {
+  const cases = [
+    [
+      buildEventFrame("toolUseEvent", { toolUseId: "a", name: "read_a", input: { path: "a" }, stop: true }),
+      buildEventFrame("toolUseEvent", { toolUseId: "b", name: "read_b", input: { path: "b" }, stop: true }),
+    ],
+    [
+      buildEventFrame("toolUseEvent", { toolUseId: "a", name: "read_a", input: '{"path":' }),
+      buildEventFrame("toolUseEvent", { toolUseId: "b", name: "read_b", input: '{"path":"b"}', stop: true }),
+      buildEventFrame("toolUseEvent", { toolUseId: "a", name: "read_a", input: '"a"}', stop: true }),
+    ],
+  ];
+  for (const frames of cases) {
+    const raw = () => new KiroExecutor().transformEventStreamToSSE(buildEventStreamResponse([...frames, buildEventFrame("messageStopEvent", {})]), "claude-opus-5");
+    const events = parseSSEJsonChunks(await openAIStreamToAnthropic(raw()).text());
+    const tools: Array<{ type: string; id: string; name: string; input: unknown }> = [];
+    let active: number | undefined;
+    let argumentsText = "";
+    for (const event of events) {
+      assert.notEqual(event.type, "error");
+      if (event.type === "content_block_start") {
+        assert.equal(active, undefined);
+        assert.equal(event.index, tools.length);
+        active = event.index;
+        tools.push(event.content_block);
+      } else if (event.type === "content_block_delta") {
+        assert.equal(event.index, active);
+        argumentsText += event.delta.partial_json;
+      } else if (event.type === "content_block_stop") {
+        assert.equal(event.index, active);
+        tools[event.index].input = JSON.parse(argumentsText);
+        argumentsText = "";
+        active = undefined;
+      }
+    }
+    assert.equal(events.at(-1).type, "message_stop");
+    const expected = [
+      { type: "tool_use", id: "a", name: "read_a", input: { path: "a" } },
+      { type: "tool_use", id: "b", name: "read_b", input: { path: "b" } },
+    ];
+    assert.deepEqual(tools, expected);
+    assert.deepEqual((await (await collectAnthropicResponse(raw())).json()).content, expected);
+  }
+});
+
+test("正文和工具之后到达的分片签名仍属于原推理且可续轮", async () => {
+  const frames = [
+    buildEventFrame("reasoningContentEvent", { text: "先读取状态" }),
+    buildEventFrame("assistantResponseEvent", { content: "开始执行" }),
+    buildEventFrame("toolUseEvent", { toolUseId: "read-1", name: "read", input: "{}" }),
+    buildEventFrame("reasoningContentEvent", { signature: "签名甲" }),
+    buildEventFrame("reasoningContentEvent", { signature: "签名乙" }),
+    buildEventFrame("messageStopEvent", {}),
+  ];
+  const raw = () => new KiroExecutor().transformEventStreamToSSE(buildEventStreamResponse(frames), "claude-opus-5");
+  const events = parseSSEJsonChunks(await openAIStreamToAnthropic(raw()).text());
+  const deltas = events.filter(event => event.type === "content_block_delta" && event.index === 0);
+  assert.equal(deltas.filter(event => event.delta.type === "thinking_delta").map(event => event.delta.thinking).join(""), "先读取状态");
+  assert.equal(deltas.filter(event => event.delta.type === "signature_delta").map(event => event.delta.signature).join(""), "签名甲签名乙");
+  const closedAt = events.findIndex(event => event.type === "content_block_stop" && event.index === 0);
+  assert.ok(events.every((event, index) => event.delta?.type !== "signature_delta" || (event.index === 0 && index < closedAt)));
+  const result = await (await collectAnthropicResponse(raw())).json();
+  assert.deepEqual(result.content[0], { type: "thinking", thinking: "先读取状态", signature: "签名甲签名乙" });
+  const payload = buildKiroPayload("claude-opus-5", anthropicToOpenAI({ messages: [
+    { role: "user", content: "任务" }, { role: "assistant", content: result.content },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "read-1", content: "done" }] },
+  ] }), false, {});
+  assert.deepEqual(payload.conversationState.history[1].assistantResponseMessage.reasoningContent, { reasoningText: { text: "先读取状态", signature: "签名甲签名乙" } });
+});
+
+test("切换上游端点前取消被替换的失败响应体", async () => {
+  const original = globalThis.fetch;
+  let calls = 0;
+  let cancelled = false;
+  try {
+    globalThis.fetch = (async () => {
+      if (++calls === 1) return new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status: 403 });
+      assert.equal(cancelled, true);
+      return buildEventStreamResponse([buildEventFrame("assistantResponseEvent", { content: "ok" }), buildEventFrame("messageStopEvent", {})]);
+    }) as typeof fetch;
+    const result = await new KiroExecutor().execute({ model: "claude-opus-5", body: { conversationState: { currentMessage: { userInputMessage: { content: "hi" } } } }, stream: false, credentials: { accessToken: "fake" } });
+    assert.equal((await (await collectAnthropicResponse(result.response)).json()).content[0].text, "ok");
+  } finally { globalThis.fetch = original; }
+});
 
 test("计量帧后分片到达的官方元数据保留真实用量和停止原因", async () => {
   const frames = [

@@ -2,6 +2,27 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { sanitizeKiroTools } from "../../src/kiro/sanitizer.ts";
+
+test("清洗 Schema 时保留关键字同名属性和字面数据", () => {
+  const literal = { if: "literal", not: { anyOf: "data" } };
+  const { tools } = sanitizeKiroTools([{ toolSpecification: { name: "filter", inputSchema: { json: {
+    type: "object", not: { type: "null" },
+    properties: {
+      if: { type: "boolean" }, not: { type: "string" }, ["__proto__"]: { type: "string" },
+      nested: { type: "array", items: { type: "object", properties: { then: { type: "string" } }, additionalProperties: false } },
+    },
+    required: ["if", "not"], default: literal, enum: [literal],
+  } } } }]);
+  const schema = JSON.parse(JSON.stringify(tools[0].toolSpecification.inputSchema.json));
+  assert.deepEqual(schema.properties.if, { type: "boolean" });
+  assert.deepEqual(schema.properties.not, { type: "string" });
+  assert.deepEqual(schema.properties.__proto__, { type: "string" });
+  assert.deepEqual(schema.properties.nested.items, { type: "object", properties: { then: { type: "string" } } });
+  assert.deepEqual(schema.required, ["if", "not"]);
+  assert.deepEqual(schema.default, literal);
+  assert.deepEqual(schema.enum, [literal]);
+  assert.equal(Object.hasOwn(schema, "not"), false);
+});
 const { convertKiroToOpenAI } = await import(
   "../../src/kiro/response/kiro-to-openai.ts"
 );

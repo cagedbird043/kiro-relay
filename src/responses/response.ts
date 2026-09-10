@@ -123,7 +123,7 @@ function applyEvent(s: State, e: KiroEvent, emit?: Emit): void {
     emit?.("response.output_text.delta", { type: "response.output_text.delta", item_id: entry.id, output_index: entry.index, content_index: 0, delta: e.text });
   } else if (e.type === "tool_start" && !s.calls.has(e.index)) {
     s.activeReasoning = undefined; s.activeMessage = undefined;
-    const metadata = s.responseTools[e.name];
+    const metadata = Object.hasOwn(s.responseTools, e.name) ? s.responseTools[e.name] : undefined;
     const entry: Call = { kind: "tool", id: id(metadata?.custom ? "ctc" : "fc"), index: s.entries.length, callId: e.id, name: e.name, args: "", metadata };
     s.calls.set(e.index, entry);
     added(s, entry, emit);
