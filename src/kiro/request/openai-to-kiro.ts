@@ -192,15 +192,7 @@ function convertMessages(messages, tools, model) {
 
   const flushPending = () => {
     if (currentRole === "user") {
-      // Kiro accepts an empty user `content` when the turn carries toolResults or
-      // images (the agentic tool-loop case), so the "(empty)" placeholder is only
-      // needed for a genuinely bare turn. Without this check, a trailing
-      // tool-result-only turn (no follow-up user text) would get the literal
-      // "(empty)" injected as if the user had typed it, which can confuse Kiro.
-      // See decolua/9router#2183 for the same bug class.
-      const text = pendingUserContent.join("\n\n").trim();
-      const hasContext = pendingToolResults.length > 0 || pendingImages.length > 0;
-      const content = text || (hasContext ? "" : "(empty)");
+      const content = pendingUserContent.join("\n\n").trim();
       const userMsg: {
         userInputMessage: {
           content: string;
@@ -259,13 +251,13 @@ function convertMessages(messages, tools, model) {
       if (deferredAssistantContent.length > 0) {
         history.push({
           assistantResponseMessage: {
-            content: deferredAssistantContent.join("\n\n").trim() || "(empty)",
+            content: deferredAssistantContent.join("\n\n").trim(),
           },
         });
         deferredAssistantContent = [];
       }
     } else if (currentRole === "assistant") {
-      const content = pendingAssistantContent.join("\n\n").trim() || "(empty)";
+      const content = pendingAssistantContent.join("\n\n").trim();
       const assistantMsg = {
         assistantResponseMessage: {
           content: content,
@@ -645,7 +637,7 @@ function convertMessages(messages, tools, model) {
   if (mergedHistory.length > 0 && mergedHistory[0].assistantResponseMessage) {
     const syntheticUserTurn = {
       userInputMessage: {
-        content: "(empty)",
+        content: "",
         modelId: model,
         origin: "AI_EDITOR",
       },
@@ -727,7 +719,7 @@ function convertMessages(messages, tools, model) {
     const last = alternatingHistory[alternatingHistory.length - 1];
     if (item.userInputMessage && last?.userInputMessage) {
       const syntheticAssistantTurn = {
-        assistantResponseMessage: { content: "(empty)" },
+        assistantResponseMessage: { content: "" },
       };
       alternatingHistory.push(syntheticAssistantTurn);
     }

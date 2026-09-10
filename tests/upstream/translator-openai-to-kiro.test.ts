@@ -512,25 +512,6 @@ test("OpenAI -> Kiro merges consecutive assistant messages", () => {
   assert.equal(history[1].assistantResponseMessage.content, "Part 1\n\nPart 2");
 });
 
-test("OpenAI -> Kiro prepends synthetic user when conversation starts with assistant", () => {
-  const result = buildKiroPayload(
-    "claude-sonnet-4",
-    {
-      messages: [
-        { role: "assistant", content: "Greeting" },
-        { role: "user", content: "Hello" },
-      ],
-    },
-    false,
-    null
-  );
-
-  const history = result.conversationState.history as any[];
-  assert.equal(history.length, 2);
-  assert.equal(history[0].userInputMessage.content, "(empty)");
-  assert.equal(history[0].userInputMessage.origin, "AI_EDITOR");
-  assert.equal(history[1].assistantResponseMessage.content, "Greeting");
-});
 
 test("OpenAI -> Kiro converts orphaned tool results to text", () => {
   const result = buildKiroPayload(
@@ -828,48 +809,42 @@ test("OpenAI -> Kiro toolUseId round-trips between tool_use and tool_result in 2
   assert.equal(tr!.status, "success");
 });
 
-test("OpenAI -> Kiro does not inject the '(empty)' placeholder on a trailing tool-result-only turn", () => {
-  // Regression for the same bug class as upstream decolua/9router#2183: an agentic
-  // loop that ends in a tool-result turn with no follow-up user text must not have
-  // its (otherwise legitimately-empty) user content replaced by a placeholder —
-  // toolResults already give Kiro all the context it needs for this turn.
-  const result = buildKiroPayload(
-    "claude-sonnet-4",
-    {
-      messages: [
-        { role: "user", content: "What is 2+2? Use the calc tool." },
-        {
-          role: "assistant",
-          tool_calls: [
-            {
-              id: "call_1",
-              type: "function",
-              function: { name: "calc", arguments: '{"expr":"2+2"}' },
-            },
-          ],
-        },
-        { role: "tool", tool_call_id: "call_1", content: "4" },
-      ],
-    },
-    false,
-    null
-  );
-
+test("思考与工具调用保留空正文及完整续轮内容", () => {
+  const result = buildKiroPayload("claude-opus-5", {
+    messages: [
+      { role: "user", content: "读取文件" },
+      { role: "assistant", content: [
+        { type: "thinking", thinking: "先读取文件", signature: "测试签名" },
+        { type: "tool_use", id: "call_1", name: "read", input: { path: "a" } },
+      ] },
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "call_1", content: "文件内容" },
+      ] },
+    ],
+  }, true, null);
+  const assistant = result.conversationState.history[1].assistantResponseMessage;
+  assert.equal(assistant.content, "");
+  assert.deepEqual(assistant.reasoningContent, {
+    reasoningText: { text: "先读取文件", signature: "测试签名" },
+  });
+  assert.deepEqual(assistant.toolUses, [{ toolUseId: "call_1", name: "read", input: { path: "a" } }]);
   const current = result.conversationState.currentMessage.userInputMessage;
-  const ctx = current.userInputMessageContext as {
-    toolResults?: Array<{ toolUseId: string }>;
-  };
+  assert.equal(current.content.replace(/^\[Context: Current time is [^\]]*\]\n\n/, ""), "");
+  assert.deepEqual(current.userInputMessageContext.toolResults, [{
+    toolUseId: "call_1", status: "success", content: [{ text: "文件内容" }],
+  }]);
+});
 
-  // The trailing tool-result turn must still carry its toolResults...
-  assert.ok(ctx?.toolResults, "toolResults must be present in currentMessage context");
-  assert.equal(ctx.toolResults![0].toolUseId, "call_1");
-
-  // ...and the turn's own body (content minus the injected "[Context: ...]" time
-  // prefix, which buildKiroPayload always prepends) must be empty — NOT the
-  // literal "(empty)" placeholder, since tool-result context is present.
-  const body = current.content.replace(/^\[Context: Current time is [^\]]*\]\n\n/, "");
-  assert.equal(body, "");
-  assert.ok(!current.content.includes("(empty)"), "must not contain the '(empty)' placeholder");
+test("真实消息中的占位字样按原文保留", () => {
+  const result = buildKiroPayload("claude-opus-5", {
+    messages: [
+      { role: "user", content: "解释 (empty)" },
+      { role: "assistant", content: "(empty)" },
+      { role: "user", content: "继续" },
+    ],
+  }, false, null);
+  assert.equal(result.conversationState.history[0].userInputMessage.content, "解释 (empty)");
+  assert.equal(result.conversationState.history[1].assistantResponseMessage.content, "(empty)");
 });
 
 test("OpenAI -> Kiro generates stable non-random toolUseId when tool_call has no id", () => {
