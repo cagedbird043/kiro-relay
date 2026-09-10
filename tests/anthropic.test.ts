@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { anthropicToOpenAI, collectAnthropicResponse, countAnthropicTokens, openAIStreamToAnthropic } from "../src/anthropic.ts";
+import { buildKiroPayload } from "../src/kiro/request/openai-to-kiro.ts";
 
 function upstream(lines: string[]): Response {
   return new Response(lines.map((x) => `data: ${x}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
@@ -7,6 +8,36 @@ function upstream(lines: string[]): Response {
 function events(text: string) {
   return [...text.matchAll(/event: ([^\n]+)\ndata: ([^\n]+)/g)].map((m) => ({ event: m[1], data: JSON.parse(m[2]) }));
 }
+
+describe("系统提示传入 Kiro", () => {
+  const first = "设备说明：向 xd://lsp 写入 JSON 调用代码导航。";
+  const second = "行为约束：超出需求必须先询问用户。";
+  for (const [name, system] of [
+    ["字符串", `${first}\n${second}`],
+    ["多文本块", [{ type: "text", text: first, cache_control: { type: "ephemeral" } }, { type: "text", text: second }]],
+  ] as const) {
+    test(`${name}系统提示在首轮及工具续轮保持完整顺序且仅出现一次`, () => {
+      const messages = [{ role: "user", content: "用户任务" }];
+      const toolHistory = [
+        ...messages,
+        { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "write", input: { path: "xd://lsp", content: "{}" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "导航结果" }] },
+      ];
+      for (const turns of [messages, toolHistory]) {
+        const body = { system, messages: turns, tools: [{ name: "write", description: "写入工具", input_schema: { type: "object", properties: {} } }] };
+        const before = JSON.stringify(body);
+        const payload = buildKiroPayload("claude-opus-5", anthropicToOpenAI(body), true, {});
+        const text = JSON.stringify(payload);
+        const wrapped = JSON.stringify(`<system-reminder>\n${first}\n${second}\n</system-reminder>`).slice(1, -1);
+        expect(text).toContain(wrapped);
+        expect(text.split(first)).toHaveLength(2);
+        expect(text.split(second)).toHaveLength(2);
+        expect(text.indexOf(first)).toBeLessThan(text.indexOf("用户任务"));
+        expect(JSON.stringify(body)).toBe(before);
+      }
+    });
+  }
+});
 
 describe("Anthropic adapter", () => {
   test("emits valid ordered events for role-only and DONE", async () => {

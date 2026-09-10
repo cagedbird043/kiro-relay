@@ -48,7 +48,7 @@ export function anthropicToOpenAI(body: Json): Json {
   if (Array.isArray(body.system)) {
     for (const block of body.system) validateBlock(block, "system");
   }
-  const out: Json = { ...body };
+  const { system, ...out }: Json = body;
   if (Array.isArray(body.messages)) out.messages = body.messages.map((message) => {
     if (!message || typeof message !== "object") return message;
     const m = { ...(message as Json) }; const content = m.content;
@@ -63,7 +63,11 @@ export function anthropicToOpenAI(body: Json): Json {
     if (m.role === "assistant" && Array.isArray(m.content)) { const calls = m.content.filter((b): b is Json => !!b && typeof b === "object" && (b as Json).type === "tool_use"); if (calls.length) m.tool_calls = calls.map((b) => ({ id: b.id, type: "function", function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) } })); }
     return m;
   });
-  if (Array.isArray(body.system)) out.system = body.system.map((b) => ({ ...(b as Json) }));
+  // Anthropic 将系统提示放在顶层，Kiro 转换器只读取消息序列。
+  if (typeof system === "string" || Array.isArray(system)) {
+    const content = Array.isArray(system) ? system.map((block) => ({ ...(block as Json) })) : system;
+    out.messages = [{ role: "system", content }, ...(Array.isArray(out.messages) ? out.messages : [])];
+  }
   return out;
 }
 function makeId(prefix: string): string { try { return `${prefix}_${crypto.randomUUID()}`; } catch { return `${prefix}_${Date.now()}`; } }
