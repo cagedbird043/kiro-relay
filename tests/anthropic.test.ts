@@ -39,6 +39,36 @@ describe("系统提示传入 Kiro", () => {
   }
 });
 
+test("低档遵循官方 effort 编码且不改写用户思考指令", () => {
+  const payload = buildKiroPayload("claude-opus-5", anthropicToOpenAI({
+    thinking: { type: "adaptive" }, output_config: { effort: "low" }, max_tokens: 128000,
+    messages: [{ role: "user", content: "只回答结果" }],
+  }), true, {});
+  expect(payload.additionalModelRequestFields).toEqual({ output_config: { effort: "low" } });
+  expect(payload.conversationState.currentMessage.userInputMessage.content.split("\n\n").slice(1).join("\n\n")).toBe("只回答结果");
+});
+
+test("显式关闭思考不被 effort 再次开启", () => {
+  const payload = buildKiroPayload("claude-opus-5", anthropicToOpenAI({
+    thinking: { type: "disabled" }, output_config: { effort: "low" },
+    messages: [{ role: "user", content: "直接回答" }],
+  }), true, {});
+  expect(payload.additionalModelRequestFields).toEqual({ output_config: { effort: "low" }, thinking: { type: "disabled" } });
+});
+
+test("无可见摘要的分片签名在流式和非流式响应中完整保留", async () => {
+  const lines = [
+    JSON.stringify({ choices: [{ delta: { reasoning_signature: "签名甲" } }] }),
+    JSON.stringify({ choices: [{ delta: { reasoning_signature: "签名乙" } }] }),
+    JSON.stringify({ choices: [{ delta: { content: "结果" }, finish_reason: "stop" }] }),
+  ];
+  const streamed = events(await openAIStreamToAnthropic(upstream(lines)).text());
+  expect(streamed.find(e => e.event === "content_block_start")?.data.content_block).toMatchObject({ type: "thinking", thinking: "" });
+  expect(streamed.filter(e => e.data.delta?.type === "signature_delta").map(e => e.data.delta.signature).join("")).toBe("签名甲签名乙");
+  const collected = await collectAnthropicResponse(upstream(lines)).then(r => r.json());
+  expect(collected.content[0]).toEqual({ type: "thinking", thinking: "", signature: "签名甲签名乙" });
+});
+
 describe("Anthropic adapter", () => {
   test("emits valid ordered events for role-only and DONE", async () => {
     const out = await openAIStreamToAnthropic(upstream([

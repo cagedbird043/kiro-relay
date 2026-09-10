@@ -3,7 +3,6 @@
  * Converts OpenAI Chat Completions format to Kiro/AWS CodeWhisperer format
  */
 import { v4 as uuidv4, v5 as uuidv5 } from "uuid";
-import { capMaxOutputTokens, capThinkingBudget } from "../capabilities.ts";
 import {
   parseToolInput,
   normalizeKiroToolSchema,
@@ -163,6 +162,8 @@ function hasFollowingToolResult(messages, index: number): boolean {
   return false;
 }
 
+type KiroReasoningContent = { reasoningText: { text: string; signature: string } };
+
 /**
  * Convert OpenAI messages to Kiro format
  * Rules: system/tool/user -> user role, merge consecutive same roles
@@ -173,6 +174,7 @@ function convertMessages(messages, tools, model) {
 
   let pendingUserContent = [];
   let pendingAssistantContent = [];
+  let pendingReasoning: KiroReasoningContent | undefined;
   let pendingToolResults = [];
   // Text-only assistant turns that arrived in the middle of an open tool-result
   // batch. They are held back so the batch stays contiguous, then emitted as
@@ -267,10 +269,12 @@ function convertMessages(messages, tools, model) {
       const assistantMsg = {
         assistantResponseMessage: {
           content: content,
+          ...(pendingReasoning ? { reasoningContent: pendingReasoning } : {}),
         },
       };
       history.push(assistantMsg);
       pendingAssistantContent = [];
+      pendingReasoning = undefined;
     }
   };
 
@@ -431,6 +435,13 @@ function convertMessages(messages, tools, model) {
       let toolUses = [];
 
       if (Array.isArray(msg.content)) {
+        // 与官方客户端一致：仅回传带签名的推理，使用本轮最后一个有效块。
+        for (const block of msg.content) {
+          if (block?.type === "thinking" && typeof block.thinking === "string" &&
+              typeof block.signature === "string" && block.signature.length > 0) {
+            pendingReasoning = { reasoningText: { text: block.thinking, signature: block.signature } };
+          }
+        }
         const textBlocks = msg.content.filter((c) => c.type === "text");
         textContent = textBlocks
           .map((b) => b.text)
@@ -612,6 +623,9 @@ function convertMessages(messages, tools, model) {
         ? `${previousContent}\n\n${currentContent}`
         : currentContent;
 
+      if (item.assistantResponseMessage.reasoningContent) {
+        previous.assistantResponseMessage.reasoningContent = item.assistantResponseMessage.reasoningContent;
+      }
       if (item.assistantResponseMessage.toolUses) {
         const existingToolUses = previous.assistantResponseMessage.toolUses || [];
         previous.assistantResponseMessage.toolUses = [
@@ -786,28 +800,6 @@ function effortFromBudget(budget: number): string {
   return "";
 }
 
-/**
- * Soft `<max_thinking_length>` budget for the Kiro prompt directive, per effort
- * level. Anthropic publishes no effort→token mapping (effort is "a behavioral
- * signal, not a strict token budget"), so this is a heuristic tuned against the
- * live CodeWhisperer stream, where a larger budget measurably deepens reasoning
- * up to the model cap. It is a hint the model may honor, not a hard cap (the hard
- * enable signal is `<thinking_mode>`); the caller clamps it to the model's cap.
- */
-function thinkingLengthForEffort(effort: string): number {
-  switch (effort) {
-    case "max":
-      return 120000;
-    case "xhigh":
-      return 64000;
-    case "high":
-      return 32000;
-    case "medium":
-      return 16000;
-    default:
-      return 8000; // low
-  }
-}
 
 /**
  * Build Kiro payload from OpenAI format
@@ -921,9 +913,8 @@ export function buildKiroPayload(model, body, stream, credentials) {
     };
     additionalModelRequestFields?: {
       reasoning?: { effort: string };
-      thinking?: { type: string; display?: string };
+      thinking?: { type: string };
       output_config?: { effort: string };
-      max_tokens?: number;
     };
   } = {
     conversationState: {
@@ -996,56 +987,19 @@ export function buildKiroPayload(model, body, stream, credentials) {
     if (topP !== undefined) payload.inferenceConfig.topP = topP;
   }
 
-  // Thinking mode for Claude models on Kiro (ported from javargasm/pi-kiro).
-  // Two coordinated signals steer reasoning on the CodeWhisperer surface:
-  //   1. a `<thinking_mode>enabled</thinking_mode><max_thinking_length>N</...>`
-  //      directive prepended to the user message — makes Claude emit reasoning
-  //      INLINE, split back into `reasoning_content` by the executor (kiroThinking.ts);
-  //   2. top-level `additionalModelRequestFields` (output_config.effort +
-  //      thinking:{type:"adaptive"} + a clamped max_tokens), forwarded to AWS by
-  //      the Kiro executor's transformRequest allowlist — the graded effort lever,
-  //      gated on Kiro's adaptive-thinking allowlist (#6576), not supportsReasoning().
-  // GPT-5.6 models use the native `reasoning:{effort}` field instead. They must
-  // not receive the Claude `output_config`/`thinking` envelope: Kiro rejects it
-  // as an unknown field for the GPT-5.6 family.
+  // 官方客户端按模型目录声明的路径发送 effort，不向消息注入思考指令。
   const requestedEffort = resolveKiroEffort(body) || (modelRequestsThinking ? "high" : "");
   const usesNativeReasoning = supportsKiroNativeReasoning(normalizedModel);
   const usesAdaptiveThinking = supportsKiroAdaptiveThinking(normalizedModel);
   const kiroEffort = usesNativeReasoning || usesAdaptiveThinking ? requestedEffort : "";
-  if (kiroEffort) {
-    const fields: {
-      reasoning?: { effort: string };
-      output_config?: { effort: string };
-      thinking?: { type: string; display: string };
-      max_tokens?: number;
-    } = usesNativeReasoning
+  const thinkingDisabled = usesAdaptiveThinking && body.thinking?.type === "disabled";
+  if (kiroEffort || thinkingDisabled) {
+    payload.additionalModelRequestFields = usesNativeReasoning
       ? { reasoning: { effort: kiroEffort } }
       : {
-          output_config: { effort: kiroEffort },
-          thinking: { type: "adaptive", display: "summarized" },
+          ...(kiroEffort ? { output_config: { effort: kiroEffort } } : {}),
+          ...(thinkingDisabled ? { thinking: { type: "disabled" } } : {}),
         };
-
-    if (usesAdaptiveThinking) {
-      // `<thinking_mode>` / `<max_thinking_length>` are Kiro/CodeWhisperer prompt
-      // conventions (NOT Anthropic API params); the length is a soft hint (the hard
-      // enable signal is `<thinking_mode>`), clamped to the model's thinking cap.
-      const thinkingLength = capThinkingBudget(
-        normalizedModel,
-        thinkingLengthForEffort(kiroEffort)
-      );
-      const directive =
-        `<thinking_mode>enabled</thinking_mode>` +
-        `<max_thinking_length>${thinkingLength}</max_thinking_length>`;
-      payload.conversationState.currentMessage.userInputMessage.content = `${directive}\n\n${payload.conversationState.currentMessage.userInputMessage.content}`;
-    }
-
-    // Forward max_tokens only when the client set one, clamped to the model's
-    // output window (floor 1024) — matches pi-kiro and avoids an over-budget reject.
-    if (usesAdaptiveThinking && maxTokens > 0) {
-      const capped = capMaxOutputTokens(normalizedModel, maxTokens) ?? maxTokens;
-      fields.max_tokens = Math.max(Math.floor(capped), 1024);
-    }
-    payload.additionalModelRequestFields = fields;
 
     // Adaptive-only Claude models (Opus 4.7/4.8, Sonnet 5, Fable 5) reject a
     // non-default temperature / top_p with a 400 while thinking is active, so

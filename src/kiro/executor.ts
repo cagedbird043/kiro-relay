@@ -263,10 +263,7 @@ export class KiroExecutor extends BaseExecutor {
     if (b.conversationState !== undefined) kiroPayload.conversationState = b.conversationState;
     if (b.profileArn !== undefined) kiroPayload.profileArn = b.profileArn;
     if (b.inferenceConfig !== undefined) kiroPayload.inferenceConfig = b.inferenceConfig;
-    // Thinking control: `additionalModelRequestFields` ({output_config.effort,
-    // thinking:{type:"adaptive"}, max_tokens}) is a recognized top-level field on
-    // GenerateAssistantResponse — it steers adaptive reasoning. Built by the
-    // openai-to-kiro translator only when the request asked for thinking.
+    // 按模型目录声明的路径透传 effort，以及调用方显式要求的思考开关。
     if (b.additionalModelRequestFields !== undefined)
       kiroPayload.additionalModelRequestFields = b.additionalModelRequestFields;
 
@@ -613,7 +610,9 @@ export class KiroExecutor extends BaseExecutor {
                 } else if (typeof rp?.text === "string") {
                   nativeReasoning = rp.text as string;
                 }
-                const signature = typeof rp?.signature === "string" ? rp.signature : undefined;
+                const nestedSignature = rt && typeof rt === "object" && "signature" in rt ? rt.signature : undefined;
+                const signature = typeof rp?.signature === "string" ? rp.signature
+                  : typeof nestedSignature === "string" ? nestedSignature : undefined;
                 const visibleNativeReasoning =
                   nativeReasoning.trim() === "..." ? "" : nativeReasoning;
                 if (visibleNativeReasoning || signature) {

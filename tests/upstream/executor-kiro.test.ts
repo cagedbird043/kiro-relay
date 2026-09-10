@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { KiroExecutor } from "../../src/kiro/executor.ts";
+import { anthropicToOpenAI, collectAnthropicResponse } from "../../src/anthropic.ts";
+import { buildKiroPayload } from "../../src/kiro/request/openai-to-kiro.ts";
 
 function hasStreamReadinessSignal(text: string): boolean {
   const match = text.match(/data:\s*(\{.*\})/);
@@ -517,6 +519,29 @@ test("KiroExecutor.transformEventStreamToSSE surfaces native reasoning frames as
     "reasoningContentEvent frames + reasoningText variant must all surface"
   );
   assert.match(content, /The answer is 42\./, "normal content must still flow");
+});
+
+test("原生嵌套推理签名经过响应适配后随工具结果回传", async () => {
+  const executor = new KiroExecutor();
+  const raw = buildEventStreamResponse([
+    buildEventFrame("reasoningContentEvent", { reasoningText: { text: "已确认只需修改一处。", signature: "签名甲" } }),
+    buildEventFrame("toolUseEvent", { toolUseId: "call_1", name: "read", input: "{}", stop: true }),
+    buildEventFrame("messageStopEvent", {}),
+  ]);
+  const response = await collectAnthropicResponse(executor.transformEventStreamToSSE(raw, "claude-opus-5"), "claude-opus-5").then(r => r.json());
+  assert.deepEqual(response.content[0], { type: "thinking", thinking: "已确认只需修改一处。", signature: "签名甲" });
+  const payload = buildKiroPayload("claude-opus-5", anthropicToOpenAI({
+    messages: [
+      { role: "user", content: "检查文件" },
+      { role: "assistant", content: response.content },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "文件内容" }] },
+    ],
+    tools: [{ name: "read", input_schema: { type: "object", properties: {} } }],
+  }), true, {});
+  const assistant = payload.conversationState.history.find(item => item.assistantResponseMessage)?.assistantResponseMessage;
+  assert.deepEqual(assistant.reasoningContent, { reasoningText: { text: "已确认只需修改一处。", signature: "签名甲" } });
+  assert.equal(assistant.toolUses[0].toolUseId, "call_1");
+  assert.equal(payload.conversationState.currentMessage.userInputMessage.userInputMessageContext.toolResults[0].toolUseId, "call_1");
 });
 
 

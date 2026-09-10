@@ -105,7 +105,7 @@ export function openAIStreamToAnthropic(response: Response, model = "unknown"): 
       try { for await (const event of readKiroEvents(response, model)) {
         if (event.type === "start") { if (!started) { started = true; emit("message_start", { type: "message_start", message: { id: event.responseId || messageId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }); } }
         else if (event.type === "thinking_delta") { const index = ensure("thinking"); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: event.thinking } }); }
-        else if (event.type === "thinking_signature") { const index = (activeType === "thinking" && active !== undefined && !closed.has(active)) ? active : [...blocks].map((b, i) => [b, i] as const).reverse().find(([b, i]) => b.type === "thinking" && !closed.has(i))?.[1]; if (index !== undefined) { blocks[index].signature = event.signature; emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "signature_delta", signature: event.signature } }); } }
+        else if (event.type === "thinking_signature") { const index = (activeType === "thinking" && active !== undefined && !closed.has(active)) ? active : [...blocks].map((b, i) => [b, i] as const).reverse().find(([b, i]) => b.type === "thinking" && !closed.has(i))?.[1] ?? ensure("thinking"); blocks[index].signature = (blocks[index].signature || "") + event.signature; emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "signature_delta", signature: event.signature } }); }
         else if (event.type === "text_delta") { const index = ensure("text"); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: event.text } }); }
         else if (event.type === "tool_start") { const mapped = toolBlocks.get(event.index); const index = mapped === undefined ? ensure("tool_use", { id: event.id, name: event.name }, true) : ensureTool(event.index, { id: event.id, name: event.name }); toolBlocks.set(event.index, index); }
         else if (event.type === "tool_input_delta") { const mapped = toolBlocks.get(event.index); if (mapped === undefined || closed.has(mapped)) throw new Error(`unknown or closed tool index ${event.index}`); const index = ensureTool(event.index, {}); emit("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: event.delta } }); }
@@ -120,7 +120,30 @@ export function openAIStreamToAnthropic(response: Response, model = "unknown"): 
 export async function collectAnthropicResponse(response: Response, model = "unknown"): Promise<Response> {
   const events: KiroEvent[] = []; for await (const event of readKiroEvents(response, model)) events.push(event);
   const start = events.find((e): e is Extract<KiroEvent, {type:"start"}> => e.type === "start"); const content: Block[] = []; const args = new Map<number, string>(); const toolBlocks = new Map<number, number>(); let current: number | undefined;
-  for (const event of events) { if (event.type === "text_delta") { if (current === undefined || content[current]?.type !== "text") { current = content.length; content.push({ type: "text", text: "" }); } content[current].text = (content[current].text || "") + event.text; } else if (event.type === "thinking_delta") { if (current === undefined || content[current]?.type !== "thinking") { current = content.length; content.push({ type: "thinking", thinking: "" }); } content[current].thinking = (content[current].thinking || "") + event.thinking; } else if (event.type === "thinking_signature") { const i = [...content].map((b, i) => [b, i] as const).reverse().find(([b]) => b.type === "thinking")?.[1]; if (i !== undefined) content[i].signature = event.signature; } else if (event.type === "tool_start") { const blockIndex = toolBlocks.get(event.index) ?? content.length; toolBlocks.set(event.index, blockIndex); current = blockIndex; content[blockIndex] = { type: "tool_use", id: event.id, name: event.name, input: {} }; } else if (event.type === "tool_input_delta") args.set(event.index, (args.get(event.index) || "") + event.delta); }
+  for (const event of events) {
+    if (event.type === "text_delta") {
+      if (current === undefined || content[current]?.type !== "text") { current = content.length; content.push({ type: "text", text: "" }); }
+      content[current].text = (content[current].text || "") + event.text;
+    } else if (event.type === "thinking_delta") {
+      if (current === undefined || content[current]?.type !== "thinking") { current = content.length; content.push({ type: "thinking", thinking: "" }); }
+      content[current].thinking = (content[current].thinking || "") + event.thinking;
+    } else if (event.type === "thinking_signature") {
+      let index = [...content].map((block, i) => [block, i] as const).reverse().find(([block]) => block.type === "thinking")?.[1];
+      if (index === undefined || (current !== undefined && content[current]?.type === "tool_use")) {
+        index = content.length;
+        content.push({ type: "thinking", thinking: "" });
+        current = index;
+      }
+      content[index].signature = (content[index].signature || "") + event.signature;
+    } else if (event.type === "tool_start") {
+      const blockIndex = toolBlocks.get(event.index) ?? content.length;
+      toolBlocks.set(event.index, blockIndex);
+      current = blockIndex;
+      content[blockIndex] = { type: "tool_use", id: event.id, name: event.name, input: {} };
+    } else if (event.type === "tool_input_delta") {
+      args.set(event.index, (args.get(event.index) || "") + event.delta);
+    }
+  }
   for (const [index, raw] of args) { const blockIndex = toolBlocks.get(index); const b = blockIndex === undefined ? undefined : content[blockIndex]; if (b) { try { b.input = JSON.parse(raw); } catch { b.input = raw; } } }
   const usageEvent = events.find((e): e is Extract<KiroEvent, {type:"usage"}> => e.type === "usage"); const stop = [...events].reverse().find((e): e is Extract<KiroEvent, {type:"stop"}> => e.type === "stop"); const usage: Json = { input_tokens: usageEvent?.inputTokens || 0, output_tokens: usageEvent?.outputTokens || 0 }; if (usageEvent?.cacheReadInputTokens !== undefined) usage.cache_read_input_tokens = usageEvent.cacheReadInputTokens; if (usageEvent?.cacheCreationInputTokens !== undefined) usage.cache_creation_input_tokens = usageEvent.cacheCreationInputTokens;
   return Response.json({ id: start?.responseId || makeId("msg"), type: "message", role: "assistant", model, content: content.filter(Boolean), stop_reason: stop?.reason || "end_turn", stop_sequence: null, usage });

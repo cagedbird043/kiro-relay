@@ -1112,33 +1112,6 @@ test("buildKiroPayload leaves already-two-dash Claude ids unchanged (#2270)", ()
   );
 });
 
-test("buildKiroPayload enables thinking mode for Claude models via reasoning_effort", () => {
-  const body = {
-    messages: [{ role: "user", content: "Solve a hard problem" }],
-    reasoning_effort: "high",
-    max_tokens: 64000,
-  };
-
-  const result = buildKiroPayload("claude-sonnet-5", body, false, null); // only Kiro model accepting adaptive thinking (#6576)
-
-  assert.ok(result.additionalModelRequestFields, "additionalModelRequestFields must be set");
-  assert.deepEqual(result.additionalModelRequestFields.thinking, {
-    type: "adaptive",
-    display: "summarized",
-  });
-  assert.equal(result.additionalModelRequestFields.output_config.effort, "high");
-  assert.equal(result.additionalModelRequestFields.max_tokens, 64000);
-  assert.match(
-    result.conversationState.currentMessage.userInputMessage.content,
-    /<thinking_mode>enabled<\/thinking_mode>/,
-    "thinking_mode directive must be injected into user content"
-  );
-  assert.match(
-    result.conversationState.currentMessage.userInputMessage.content,
-    /<max_thinking_length>\d+<\/max_thinking_length>/,
-    "max_thinking_length directive must be injected into user content"
-  );
-});
 
 test("buildKiroPayload uses native Max reasoning for Kiro GPT-5.6 models", () => {
   for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
