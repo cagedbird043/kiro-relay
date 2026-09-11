@@ -859,8 +859,6 @@ export function buildKiroPayload(model, body, stream, credentials) {
   const profileArn = credentials?.providerSpecificData?.profileArn || "";
 
   let finalContent = currentMessage?.userInputMessage?.content || "";
-  const timestamp = new Date().toISOString();
-  finalContent = `[Context: Current time is ${timestamp}]\n\n${finalContent}`;
 
   // Prepend documentation for tools whose description was relocated out of
   // `toolSpecification` (see buildKiroToolSpecs). Driven by convertMessages'

@@ -69,10 +69,7 @@ test("OpenAI -> Kiro builds a conversation payload with deterministic structure"
   assert.match(result.conversationState.conversationId, /^[0-9a-f-]{36}$/);
   assert.equal(result.conversationState.currentMessage.userInputMessage.modelId, "claude-sonnet-4");
   assert.equal(result.conversationState.currentMessage.userInputMessage.origin, "AI_EDITOR");
-  assert.match(
-    result.conversationState.currentMessage.userInputMessage.content,
-    /^\[Context: Current time is .*Z\]\n\nThanks$/
-  );
+  assert.equal(result.conversationState.currentMessage.userInputMessage.content, "Thanks");
 });
 
 test("OpenAI -> Kiro preserves prior history, tool uses and accumulated tool results", () => {
@@ -218,10 +215,7 @@ test("OpenAI -> Kiro uses a neutral filler currentMessage when the request ends 
     null
   );
 
-  assert.match(
-    result.conversationState.currentMessage.userInputMessage.content,
-    /^\[Context: Current time is .*Z\]\n\n\.\.\.$/
-  );
+  assert.equal(result.conversationState.currentMessage.userInputMessage.content, "...");
   assert.deepEqual(result.conversationState.history, [
     {
       userInputMessage: { content: "First user", modelId: "claude-sonnet-4", origin: "AI_EDITOR" },
@@ -242,10 +236,7 @@ test("OpenAI -> Kiro still returns a valid payload for minimal requests", () => 
   );
 
   assert.equal(result.conversationState.history.length, 0);
-  assert.match(
-    result.conversationState.currentMessage.userInputMessage.content,
-    /^\[Context: Current time is .*Z\]\n\nHi$/
-  );
+  assert.equal(result.conversationState.currentMessage.userInputMessage.content, "Hi");
   assert.equal(result.conversationState.currentMessage.userInputMessage.modelId, "claude-sonnet-4");
 });
 
@@ -829,7 +820,7 @@ test("思考与工具调用保留空正文及完整续轮内容", () => {
   });
   assert.deepEqual(assistant.toolUses, [{ toolUseId: "call_1", name: "read", input: { path: "a" } }]);
   const current = result.conversationState.currentMessage.userInputMessage;
-  assert.equal(current.content.replace(/^\[Context: Current time is [^\]]*\]\n\n/, ""), "");
+  assert.equal(current.content, "");
   assert.deepEqual(current.userInputMessageContext.toolResults, [{
     toolUseId: "call_1", status: "success", content: [{ text: "文件内容" }],
   }]);

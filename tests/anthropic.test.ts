@@ -70,7 +70,7 @@ test("低档遵循官方 effort 编码且不改写用户思考指令", () => {
     messages: [{ role: "user", content: "只回答结果" }],
   }), true, {});
   expect(payload.additionalModelRequestFields).toEqual({ output_config: { effort: "low" } });
-  expect(payload.conversationState.currentMessage.userInputMessage.content.split("\n\n").slice(1).join("\n\n")).toBe("只回答结果");
+  expect(payload.conversationState.currentMessage.userInputMessage.content).toBe("只回答结果");
 });
 
 test("显式关闭思考不被 effort 再次开启", () => {

@@ -22,7 +22,7 @@ test("#5231: assistant-text-ending request never leaks the literal 'Continue' fi
   );
 
   const synthesized = result.conversationState.currentMessage.userInputMessage.content;
-  assert.match(synthesized, /\n\n\.\.\.$/, "synthesized trailing turn must end with the neutral filler");
+  assert.equal(synthesized, "...", "synthesized trailing turn must be the neutral filler");
   assert.ok(
     !/\bContinue\b/.test(synthesized),
     `synthesized trailing turn must not contain the literal "Continue", got: ${synthesized}`
