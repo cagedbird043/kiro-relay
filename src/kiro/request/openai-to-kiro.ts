@@ -39,6 +39,16 @@ export function hasUnsupportedKiroContextSuffix(model: unknown): boolean {
 }
 
 /**
+ * `origin` tells Kiro which surface is calling. `AI_EDITOR` is the Kiro IDE, and
+ * the service answers it with the full IDE treatment: a ~3700-token "you are
+ * Kiro" persona prepended server-side, plus contextUsage and metering frames.
+ * Other accepted surfaces (notably `CLI`) skip the persona entirely — the model
+ * then answers as plain Amazon Q — but their streams carry only
+ * assistantResponse/toolUse frames, with no usage and no terminal event.
+ */
+export const KIRO_DEFAULT_ORIGIN = "AI_EDITOR";
+
+/**
  * Wrap system-prompt content in <system-reminder> tags before it is merged into
  * a Kiro user message. Kiro/CodeWhisperer has no `system` role, so without this
  * the system prompt would appear as raw user text (issue #2306).
@@ -168,7 +178,7 @@ function hasFollowingToolResult(messages, index: number): boolean {
  * Convert OpenAI messages to Kiro format
  * Rules: system/tool/user -> user role, merge consecutive same roles
  */
-function convertMessages(messages, tools, model) {
+function convertMessages(messages, tools, model, origin = KIRO_DEFAULT_ORIGIN) {
   let history = [];
   let currentMessage = null;
 
@@ -208,7 +218,7 @@ function convertMessages(messages, tools, model) {
         userInputMessage: {
           content: content,
           modelId: "",
-          origin: "AI_EDITOR",
+          origin,
         },
       };
 
@@ -567,7 +577,7 @@ function convertMessages(messages, tools, model) {
 
     // Kiro API requires `origin` on every userInputMessage
     if (item.userInputMessage && !item.userInputMessage.origin) {
-      item.userInputMessage.origin = "AI_EDITOR";
+      item.userInputMessage.origin = origin;
     }
   });
 
@@ -639,7 +649,7 @@ function convertMessages(messages, tools, model) {
       userInputMessage: {
         content: "",
         modelId: model,
-        origin: "AI_EDITOR",
+        origin,
       },
     };
     mergedHistory.unshift(syntheticUserTurn);
@@ -784,7 +794,7 @@ function effortFromBudget(budget: number): string {
 /**
  * Build Kiro payload from OpenAI format
  */
-export function buildKiroPayload(model, body, stream, credentials) {
+export function buildKiroPayload(model, body, stream, credentials, origin = KIRO_DEFAULT_ORIGIN) {
   // Reject the Anthropic-only `[1m]` context beta before it reaches Bedrock —
   // Kiro cannot honor it and a forwarded `kr/*[1m]` id is malformed upstream.
   if (hasUnsupportedKiroContextSuffix(model)) {
@@ -853,7 +863,8 @@ export function buildKiroPayload(model, body, stream, credentials) {
   const { history, currentMessage, toolsAttached, toolDocs } = convertMessages(
     messages,
     tools,
-    normalizedModel
+    normalizedModel,
+    origin
   );
 
   const profileArn = credentials?.providerSpecificData?.profileArn || "";
@@ -904,7 +915,7 @@ export function buildKiroPayload(model, body, stream, credentials) {
         userInputMessage: {
           content: finalContent,
           modelId: normalizedModel,
-          origin: "AI_EDITOR",
+          origin,
           ...(currentMessage?.userInputMessage?.images?.length && {
             images: currentMessage.userInputMessage.images,
           }),
