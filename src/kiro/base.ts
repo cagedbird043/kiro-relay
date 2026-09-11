@@ -23,6 +23,12 @@ export type ExecuteInput = {
   signal?: AbortSignal | null;
   log?: ExecutorLog | null;
   upstreamExtraHeaders?: Record<string, string> | null;
+  /**
+   * Context window to scale the synthesized usage estimate with. Supplied by the
+   * live model catalog when discovery is active. Omitted -> the static
+   * MODEL_CONTEXT_LENGTHS table is consulted, which fails closed on unknown ids.
+   */
+  contextLength?: number | null;
 };
 
 export type ProviderConfig = {

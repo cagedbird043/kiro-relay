@@ -20,6 +20,7 @@ import {
   type ResponsesOptions,
   type ResponseToolMetadata,
 } from "./responses/response.ts";
+import { createCatalog, type Catalog } from "./catalog.ts";
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
 
@@ -120,7 +121,7 @@ function metadataLog(tag: string, data: Record<string, unknown>) {
 }
 
 export type ExecutorLike = {
-  execute(input: { model: string; body: unknown; stream: boolean; credentials: ProviderCredentials; signal?: AbortSignal; log?: unknown }): Promise<{ response: Response }>;
+  execute(input: { model: string; body: unknown; stream: boolean; credentials: ProviderCredentials; signal?: AbortSignal; log?: unknown; contextLength?: number }): Promise<{ response: Response }>;
   refreshCredentials(credentials: ProviderCredentials, log?: unknown): Promise<unknown>;
 };
 
@@ -249,7 +250,12 @@ function responsesOptions(payload: unknown): ResponsesOptions {
       isRecord(payload) && payload._includeEncryptedContent === true,
   };
 }
-export function createHandler(config: AppConfig, executor: ExecutorLike = new KiroExecutor()) {
+export function createHandler(
+  config: AppConfig,
+  executor: ExecutorLike = new KiroExecutor(),
+  options: { catalog?: Catalog } = {}
+) {
+  const { catalog } = options;
   const account = config.accounts[0];
   const refreshFlights = new Map<string, Promise<CredentialRefreshOutcome>>();
   // 刷新令牌可能已轮换；落盘成功前由当前进程持有，后续请求先重试保存。
@@ -334,7 +340,11 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
     const method = request.method.toUpperCase();
     if (method === "GET" && url.pathname === "/healthz") return Response.json({ status: "ok" });
     if (method === "GET" && url.pathname === "/v1/models") {
-      const entries = Object.entries(config.models);
+      // With discovery active the catalog is Kiro's own entitlement list; without
+      // it the hand-listed config models are served exactly as before.
+      const entries: Array<[string, { contextLength: number }]> = catalog
+        ? catalog.list().map((entry) => [entry.id, { contextLength: entry.contextLength }])
+        : Object.entries(config.models);
       const catalogFingerprint = entries
         .map(([id, spec]) => ({ id, contextLength: spec.contextLength }))
         .sort((a, b) => a.id.localeCompare(b.id));
@@ -413,7 +423,10 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
     }
 
     model = typeof body.model === "string" ? body.model : "";
-    if (!model || !config.models[model]) {
+    const modelContextLength = catalog
+      ? catalog.contextLengthFor(model)
+      : config.models[model]?.contextLength;
+    if (!model || modelContextLength === undefined) {
       return requestError(`Unknown model: ${model || "(missing)"}`);
     }
     if (isCountTokens) {
@@ -463,7 +476,9 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
     } catch (error) {
       return requestError(safeErrorMessage(error, "Unable to translate request"));
     }
-    const execute = () => executor.execute({ model, body: payload, stream, credentials, signal: request.signal, log });
+    // Only a live catalog may override the executor's static context table, so
+    // with discovery off the usage estimate resolves exactly as it did before.
+    const execute = () => executor.execute({ model, body: payload, stream, credentials, signal: request.signal, log, contextLength: catalog ? modelContextLength : undefined });
     let result: { response: Response };
     try {
       result = await execute();
@@ -518,7 +533,21 @@ export function createHandler(config: AppConfig, executor: ExecutorLike = new Ki
 export async function startServer(configPath?: string) {
   const config = await loadConfig(configPath);
   const { hostname, port } = listenAddress(config.listen);
-  const server = Bun.serve({ hostname, port, idleTimeout: 255, fetch: createHandler(config) });
+  const catalog = config.discovery?.enabled
+    ? createCatalog({
+        models: config.models,
+        loadCredentials: () => loadCredentials(config.accounts[0].credentialFile),
+      })
+    : undefined;
+  // Warm the catalog so the first request already sees a live snapshot; a failed
+  // warm-up is absorbed and simply leaves the static fallback in place.
+  void catalog?.refresh();
+  const server = Bun.serve({
+    hostname,
+    port,
+    idleTimeout: 255,
+    fetch: createHandler(config, new KiroExecutor(), { catalog }),
+  });
   return server;
 }
 

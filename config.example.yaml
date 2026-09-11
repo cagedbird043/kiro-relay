@@ -1,4 +1,7 @@
 listen: 127.0.0.1:4000
+# With discovery enabled these entries are only a fallback for when Kiro's
+# catalog is unreachable, plus an override for a context window reported wrong
+# upstream. They no longer restrict which models are exposed.
 models:
   claude-opus-5:
     contextLength: 1000000
@@ -10,5 +13,9 @@ models:
     contextLength: 272000
   gpt-5.6-luna:
     contextLength: 272000
+discovery:
+  # Serve the models the account is actually entitled to, read from Kiro's own
+  # ListAvailableModels. Off by default; set false to pin the list above again.
+  enabled: true
 accounts:
   - credentialFile: ~/.config/kiro-relay/account.json

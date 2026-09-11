@@ -154,14 +154,22 @@ function buildKiroFinishChunk(
 
 /**
  * Synthesize usage when Kiro reports only contextUsagePercentage. The
- * percentage is converted directly to Anthropic input tokens using the
- * configured model context length; output tokens remain a text-length estimate.
+ * percentage is converted directly to Anthropic input tokens using the model's
+ * context window; output tokens remain a text-length estimate.
+ *
+ * `contextLength` is the window reported by Kiro's live catalog. When it is
+ * absent the static MODEL_CONTEXT_LENGTHS table decides, which fails closed on
+ * unknown ids. It is resolved lazily so a response that never reported a
+ * percentage never needs a context window at all.
  */
-function ensureKiroUsage(state: KiroStreamState, model: string) {
+function ensureKiroUsage(state: KiroStreamState, model: string, contextLength?: number | null) {
   const usage = state.usage ?? {};
   const estimated = usage.prompt_tokens === undefined || usage.completion_tokens === undefined;
   const completionTokens = usage.completion_tokens ?? (state.totalContentLength ? Math.max(1, Math.floor(state.totalContentLength / 4)) : 0);
-  const promptTokens = usage.prompt_tokens ?? (state.contextUsagePercentage ? Math.round(state.contextUsagePercentage / 100 * contextLengthForModel(model)) : 0);
+  const promptTokens = usage.prompt_tokens ?? (state.contextUsagePercentage
+    ? Math.round(state.contextUsagePercentage / 100 *
+        (typeof contextLength === "number" && contextLength > 0 ? contextLength : contextLengthForModel(model)))
+    : 0);
   state.usage = { ...usage, prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens, ...(estimated ? { estimated: true } : {}) };
 }
 
@@ -280,6 +288,7 @@ export class KiroExecutor extends BaseExecutor {
     signal,
     log,
     upstreamExtraHeaders,
+    contextLength,
   }: ExecuteInput) {
     // Route to the region-specific CodeWhisperer/Amazon Q endpoint. Enterprise IAM Identity
     // Center accounts (e.g. eu-central-1) are rejected by the default us-east-1 host; only the
@@ -364,6 +373,7 @@ export class KiroExecutor extends BaseExecutor {
     const transformedResponse = this.transformEventStreamToSSE(response, model, {
       thinkingExpected,
       toolNameMap,
+      contextLength,
     });
 
     return { response: transformedResponse, url, headers, transformedBody };
@@ -382,6 +392,9 @@ export class KiroExecutor extends BaseExecutor {
    *   Required for Claude on Kiro when `<thinking_mode>enabled</thinking_mode>`
    *   is in the system prompt, because Kiro streams reasoning inline rather
    *   than as separate `reasoningContentEvent` frames.
+   * @param opts.contextLength  Context window from Kiro's live catalog, used to
+   *   scale the synthesized usage estimate. Omitted -> the static
+   *   MODEL_CONTEXT_LENGTHS table decides and fails closed on unknown ids.
    */
   transformEventStreamToSSE(
     response: Response,
@@ -389,6 +402,7 @@ export class KiroExecutor extends BaseExecutor {
     opts: {
       thinkingExpected?: boolean;
       toolNameMap?: Map<string, string>;
+      contextLength?: number | null;
     } = {}
   ) {
     const thinkingExpected = !!opts.thinkingExpected;
@@ -966,7 +980,7 @@ export class KiroExecutor extends BaseExecutor {
           // Emit finish chunk if not already sent
           if (!state.finishEmitted) {
             state.finishEmitted = true;
-            ensureKiroUsage(state, model);
+            ensureKiroUsage(state, model, opts.contextLength);
             const finishChunk = buildKiroFinishChunk(state, responseId, created, model, true);
             controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(finishChunk)}\n\n`));
           }

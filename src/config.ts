@@ -5,6 +5,11 @@ export type AppConfig = {
   listen: string;
   models: Record<string, { contextLength: number }>;
   accounts: AccountConfig[];
+  /**
+   * Live model discovery. Off unless configured, so an untouched config keeps
+   * exposing exactly the hand-listed `models` and nothing else.
+   */
+  discovery?: { enabled: boolean };
 };
 
 export type AccountConfig = {
@@ -78,5 +83,17 @@ export async function loadConfig(path?: string): Promise<AppConfig> {
     return { credentialFile: expandHome(credentialFile) };
   });
 
-  return { listen: input.listen, models, accounts };
+  let discovery = { enabled: false };
+  if (input.discovery !== undefined) {
+    if (!input.discovery || typeof input.discovery !== "object" || Array.isArray(input.discovery)) {
+      throw configError("discovery must be a mapping");
+    }
+    const enabled = (input.discovery as Record<string, unknown>).enabled;
+    if (enabled !== undefined && typeof enabled !== "boolean") {
+      throw configError("discovery.enabled must be a boolean");
+    }
+    if (typeof enabled === "boolean") discovery = { enabled };
+  }
+
+  return { listen: input.listen, models, accounts, discovery };
 }
