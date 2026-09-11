@@ -21,8 +21,24 @@ import {
   type ResponseToolMetadata,
 } from "./responses/response.ts";
 import { createCatalog, type Catalog } from "./catalog.ts";
+import { collectChatCompletion } from "./chat.ts";
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
+
+/**
+ * Browser-based clients call this relay directly, so every response carries CORS
+ * headers and OPTIONS is answered before the real request is sent. The origin is
+ * unrestricted because access is gated by an API key header rather than by an
+ * ambient cookie, so a permissive origin grants no authority on its own.
+ */
+const CORS_HEADERS: Record<string, string> = {
+  "access-control-allow-origin": "*",
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers":
+    "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, openai-beta, openai-organization, openai-project",
+  "access-control-expose-headers": "request-id, etag",
+  "access-control-max-age": "86400",
+};
 
 function anthropicError(message: string, status = 400, type = "invalid_request_error"): Response {
   return new Response(JSON.stringify({ type: "error", error: { type, message } }), {
@@ -335,10 +351,29 @@ export function createHandler(
     }
   };
 
-  return async function handler(request: Request): Promise<Response> {
+  /**
+   * Keys are compared only when configured; an empty list leaves the relay open,
+   * which is the historical behaviour and safe only on loopback. Both header
+   * spellings are accepted because OpenAI clients send `Authorization: Bearer`
+   * while Anthropic clients send `x-api-key`.
+   */
+  const authorized = (request: Request): boolean => {
+    const keys = config.auth?.keys;
+    if (!keys || keys.length === 0) return true;
+    const bearer = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
+    const presented = bearer || request.headers.get("x-api-key")?.trim();
+    return Boolean(presented) && keys.includes(presented as string);
+  };
+
+  const route = async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
     if (method === "GET" && url.pathname === "/healthz") return Response.json({ status: "ok" });
+    if (!authorized(request)) {
+      return url.pathname.startsWith("/v1/messages")
+        ? anthropicError("Invalid API key", 401, "authentication_error")
+        : openAIError("Invalid API key", 401, "invalid_request_error");
+    }
     if (method === "GET" && url.pathname === "/v1/models") {
       // With discovery active the catalog is Kiro's own entitlement list; without
       // it the hand-listed config models are served exactly as before.
@@ -399,9 +434,10 @@ export function createHandler(
     }
 
     const isResponses = url.pathname === "/v1/responses";
+    const isChat = url.pathname === "/v1/chat/completions";
     const isMessages = url.pathname === "/v1/messages";
     const isCountTokens = url.pathname === "/v1/messages/count_tokens";
-    if (method !== "POST" || (!isResponses && !isMessages && !isCountTokens)) {
+    if (method !== "POST" || (!isResponses && !isChat && !isMessages && !isCountTokens)) {
       return anthropicError("Not found", 404, "not_found_error");
     }
     const requestId = crypto.randomUUID();
@@ -410,7 +446,7 @@ export function createHandler(
     const identify = (response: Response) => { response.headers.set("request-id", requestId); return response; };
     const requestError = (message: string, status = 400, type = "invalid_request_error") => {
       metadataLog("REQUEST", { requestId, model, stream, status, phase: "failed", category: type });
-      return identify(isResponses ? openAIError(message, status, type) : anthropicError(message, status, type));
+      return identify(isResponses || isChat ? openAIError(message, status, type) : anthropicError(message, status, type));
     };
 
     let body: Record<string, unknown>;
@@ -438,6 +474,14 @@ export function createHandler(
     }
     if (isMessages && !Array.isArray(body.messages)) {
       return requestError("messages must be an array");
+    }
+    if (isChat) {
+      if (!Array.isArray(body.messages)) return requestError("messages must be an array");
+      // Kiro cannot honor stop sequences. An empty or null `stop` is the default
+      // most web clients send and means "none", so only a populated one is a
+      // request the relay has to turn down.
+      const stops = body.stop === undefined || body.stop === null ? [] : Array.isArray(body.stop) ? body.stop : [body.stop];
+      if (stops.length > 0) return requestError("Unsupported stop on this relay");
     }
 
     let credentials: ProviderCredentials;
@@ -468,7 +512,9 @@ export function createHandler(
         buildPayload = (currentCredentials) =>
           buildKiroResponsesPayload(model, responsesBody, stream, currentCredentials);
       } else {
-        const openaiBody = anthropicToOpenAI(body);
+        // Chat Completions is already the shape the Kiro translator consumes, so
+        // only the Anthropic surface needs converting first.
+        const openaiBody = isChat ? body : anthropicToOpenAI(body);
         buildPayload = (currentCredentials) =>
           buildKiroPayload(model, openaiBody, stream, currentCredentials);
       }
@@ -506,7 +552,7 @@ export function createHandler(
     }
 
     if (!result.response.ok) {
-      return upstreamError(result.response, isResponses, { requestId, model, stream });
+      return upstreamError(result.response, isResponses || isChat, { requestId, model, stream });
     }
     metadataLog("REQUEST", { requestId, model, stream, status: result.response.status, phase: "accepted" });
     try {
@@ -516,6 +562,15 @@ export function createHandler(
         return identify(stream
           ? responsesStream(result.response, model, responseTools, options)
           : Response.json(await collectResponses(result.response, model, responseTools, options)));
+      }
+      if (isChat) {
+        // The executor already speaks Chat Completions, so a streaming turn is
+        // forwarded verbatim rather than translated and rebuilt.
+        return identify(stream
+          ? new Response(result.response.body, {
+              headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" },
+            })
+          : await collectChatCompletion(result.response, model));
       }
       return identify(stream
         ? openAIStreamToAnthropic(result.response, model)
@@ -527,6 +582,15 @@ export function createHandler(
         "api_error"
       );
     }
+  };
+
+  return async function handler(request: Request): Promise<Response> {
+    if (request.method.toUpperCase() === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+    const response = await route(request);
+    for (const [name, value] of Object.entries(CORS_HEADERS)) response.headers.set(name, value);
+    return response;
   };
 }
 

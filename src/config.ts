@@ -10,6 +10,12 @@ export type AppConfig = {
    * exposing exactly the hand-listed `models` and nothing else.
    */
   discovery?: { enabled: boolean };
+  /**
+   * API keys accepted on the `/v1` surface. Absent or empty leaves the relay
+   * unauthenticated, which is only safe while it stays bound to loopback.
+   * Required before exposing it to a browser-based client.
+   */
+  auth?: { keys: string[] };
 };
 
 export type AccountConfig = {
@@ -95,5 +101,19 @@ export async function loadConfig(path?: string): Promise<AppConfig> {
     if (typeof enabled === "boolean") discovery = { enabled };
   }
 
-  return { listen: input.listen, models, accounts, discovery };
+  let auth: { keys: string[] } | undefined;
+  if (input.auth !== undefined) {
+    if (!input.auth || typeof input.auth !== "object" || Array.isArray(input.auth)) {
+      throw configError("auth must be a mapping");
+    }
+    const keys = (input.auth as Record<string, unknown>).keys;
+    if (keys !== undefined) {
+      if (!Array.isArray(keys) || keys.some((key) => typeof key !== "string" || key.trim() === "")) {
+        throw configError("auth.keys must be a list of non-empty strings");
+      }
+      auth = { keys: keys as string[] };
+    }
+  }
+
+  return { listen: input.listen, models, accounts, discovery, ...(auth ? { auth } : {}) };
 }

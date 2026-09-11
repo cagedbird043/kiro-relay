@@ -17,5 +17,11 @@ discovery:
   # Serve the models the account is actually entitled to, read from Kiro's own
   # ListAvailableModels. Off by default; set false to pin the list above again.
   enabled: true
+# Keys accepted on /v1, sent as `Authorization: Bearer <key>` or `x-api-key`.
+# Omit the whole block to leave the relay unauthenticated — only safe while it
+# stays bound to loopback. REQUIRED before exposing it to a browser client.
+# auth:
+#   keys:
+#     - replace-with-a-long-random-string
 accounts:
   - credentialFile: ~/.config/kiro-relay/account.json
