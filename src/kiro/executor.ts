@@ -21,7 +21,6 @@ import {
 import { KiroStreamProtocolError } from "./events.ts";
 import { ByteQueue, parseEventFrame, TEXT_ENCODER } from "./eventstream.ts";
 import { kiroRuntimeHost, resolveKiroRuntimeRegion } from "./region.ts";
-import { KIRO_DEFAULT_ORIGIN } from "./request/openai-to-kiro.ts";
 import {
   KIRO_TOOL_CALL_WRAPPER,
   appendBufferedKiroToolInput,
@@ -361,15 +360,6 @@ export class KiroExecutor extends BaseExecutor {
           >
         )?.userInputMessage as Record<string, unknown>
       )?.content as string) || "";
-    const requestOrigin =
-      ((
-        (
-          (tb?.conversationState as Record<string, unknown>)?.currentMessage as Record<
-            string,
-            unknown
-          >
-        )?.userInputMessage as Record<string, unknown>
-      )?.origin as string) || KIRO_DEFAULT_ORIGIN;
     const thinkingExpected = userContent.includes("<thinking_mode>enabled</thinking_mode>");
     const rawToolNameMap =
       body && typeof body === "object" && "_toolNameMap" in body ? body._toolNameMap : undefined;
@@ -384,10 +374,6 @@ export class KiroExecutor extends BaseExecutor {
       thinkingExpected,
       toolNameMap,
       contextLength,
-      // Only the IDE surface is answered with metering and messageStop frames;
-      // other origins end the stream after the last content frame, so demanding
-      // terminal evidence there would reject every well-formed response.
-      terminalEventExpected: requestOrigin === KIRO_DEFAULT_ORIGIN,
     });
 
     return { response: transformedResponse, url, headers, transformedBody };
@@ -417,13 +403,6 @@ export class KiroExecutor extends BaseExecutor {
       thinkingExpected?: boolean;
       toolNameMap?: Map<string, string>;
       contextLength?: number | null;
-      /**
-       * Whether upstream is expected to announce the end of the turn. True for
-       * the IDE origin, whose streams always carry metering/messageStop frames;
-       * false for surfaces that simply stop after the last content frame, where
-       * a clean EOF is the only terminal evidence there will ever be.
-       */
-      terminalEventExpected?: boolean;
     } = {}
   ) {
     const thinkingExpected = !!opts.thinkingExpected;
@@ -955,10 +934,7 @@ export class KiroExecutor extends BaseExecutor {
 
         flush(controller) {
           // 物理结束时确认终止证据，保留计量帧之后到达的元数据。
-          // 半个帧留在缓冲区始终是截断；缺少终止帧只有在上游承诺发送时才算异常。
-          const terminalEventExpected = opts.terminalEventExpected !== false;
-          const missingTerminal = !state.stopSeen && !state.hasMeteringEvent && !state.finishEmitted;
-          if (buffer.length > 0 || (terminalEventExpected && missingTerminal)) {
+          if (buffer.length > 0 || (!state.stopSeen && !state.hasMeteringEvent && !state.finishEmitted)) {
             throw new KiroStreamProtocolError();
           }
           if (!flushPendingWrapperToolCalls(controller)) return;

@@ -4,7 +4,6 @@ import { remapKiroToolHistory, sanitizeKiroTools } from "../kiro/sanitizer.ts";
 import type { ProviderCredentials } from "../kiro/base.ts";
 import { getKiroModelCapabilities } from "../kiro/modelCapabilities.ts";
 import { decodeReasoning, mergeKiroReasoning, type KiroReasoningContent } from "../kiro/reasoning.ts";
-import { KIRO_DEFAULT_ORIGIN } from "../kiro/request/openai-to-kiro.ts";
 
 /** Responses request accepted by the native Kiro adapter. */
 export type KiroResponsesRequest = Partial<ResponseCreateParamsBase> & Record<string, unknown> & {
@@ -19,7 +18,7 @@ export type KiroResponsesRequest = Partial<ResponseCreateParamsBase> & Record<st
 };
 
 export type KiroResponsesPayload = {
-  conversationState: { chatTriggerType: "MANUAL"; conversationId: string; currentMessage: { userInputMessage: { content: string; modelId: string; origin: string; images?: Array<{ format: string; source: { bytes: string } }>; userInputMessageContext?: { tools?: unknown[]; toolResults?: unknown[]; toolChoice?: unknown } } }; history: KiroHistoryItem[] };
+  conversationState: { chatTriggerType: "MANUAL"; conversationId: string; currentMessage: { userInputMessage: { content: string; modelId: string; origin: "AI_EDITOR"; images?: Array<{ format: string; source: { bytes: string } }>; userInputMessageContext?: { tools?: unknown[]; toolResults?: unknown[]; toolChoice?: unknown } } }; history: KiroHistoryItem[] };
   profileArn?: string;
   inferenceConfig?: { maxTokens?: number };
   additionalModelRequestFields?: { reasoning: { effort: string; summary?: string } };
@@ -59,7 +58,7 @@ type KiroHistoryItem = {
   userInputMessage?: {
     content: string;
     modelId: string;
-    origin: string;
+    origin: "AI_EDITOR";
     images?: Array<{ format: string; source: { bytes: string } }>;
     userInputMessageContext?: { toolResults: KiroToolResult[] };
   };
@@ -70,12 +69,12 @@ type KiroHistoryItem = {
   };
 };
 
-function historyUserMessage(parts: InputParts, model: string, origin: string): KiroHistoryItem {
+function historyUserMessage(parts: InputParts, model: string): KiroHistoryItem {
   return {
     userInputMessage: {
       content: parts.text,
       modelId: model,
-      origin,
+      origin: "AI_EDITOR",
       ...(parts.images.length
         ? {
             images: parts.images.map((image) => ({
@@ -226,7 +225,7 @@ function flattenToolDefinitions(
   }
 }
 /** Build the exact conversationState wire payload consumed by the Kiro executor. */
-export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequest, stream: boolean, credentials: ProviderCredentials, origin: string = KIRO_DEFAULT_ORIGIN): KiroResponsesPayload {
+export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequest, stream: boolean, credentials: ProviderCredentials): KiroResponsesPayload {
   void stream;
   const capabilities = getKiroModelCapabilities(model);
   const includeEncryptedContent = Array.isArray(body.include) && body.include.includes("reasoning.encrypted_content");
@@ -302,7 +301,7 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
       if (typeof item.call_id !== "string" || !item.call_id) throw new Error(`${type} requires call_id`);
       let user = history.at(-1)?.userInputMessage;
       if (!user) {
-        const turn = historyUserMessage({ text: "", images: [] }, model, origin);
+        const turn = historyUserMessage({ text: "", images: [] }, model);
         history.push(turn);
         user = turn.userInputMessage!;
       }
@@ -325,7 +324,7 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
     if (previous) {
       previous.content = [previous.content, parts.text].filter(Boolean).join("\n\n");
       if (parts.images.length) (previous.images ??= []).push(...parts.images.map(image => ({ format: image.format, source: { bytes: image.bytes } })));
-    } else history.push(historyUserMessage(parts, model, origin));
+    } else history.push(historyUserMessage(parts, model));
   }
   const lastUser = history.at(-1)?.userInputMessage;
   if (lastUser) history.pop();
@@ -385,7 +384,7 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
         userInputMessage: {
           content: instruction + current.text,
           modelId: model,
-          origin,
+          origin: "AI_EDITOR",
           ...(current.images.length
             ? {
                 images: current.images.map((image) => ({

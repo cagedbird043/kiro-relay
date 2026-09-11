@@ -272,8 +272,6 @@ export function createHandler(
   options: { catalog?: Catalog } = {}
 ) {
   const { catalog } = options;
-  // Undefined leaves the payload builders on their own default surface.
-  const upstreamOrigin = config.upstream?.origin;
   const account = config.accounts[0];
   const refreshFlights = new Map<string, Promise<CredentialRefreshOutcome>>();
   // 刷新令牌可能已轮换；落盘成功前由当前进程持有，后续请求先重试保存。
@@ -512,13 +510,13 @@ export function createHandler(
       if (isResponses) {
         const responsesBody = { ...body, model } satisfies KiroResponsesRequest;
         buildPayload = (currentCredentials) =>
-          buildKiroResponsesPayload(model, responsesBody, stream, currentCredentials, upstreamOrigin);
+          buildKiroResponsesPayload(model, responsesBody, stream, currentCredentials);
       } else {
         // Chat Completions is already the shape the Kiro translator consumes, so
         // only the Anthropic surface needs converting first.
         const openaiBody = isChat ? body : anthropicToOpenAI(body);
         buildPayload = (currentCredentials) =>
-          buildKiroPayload(model, openaiBody, stream, currentCredentials, upstreamOrigin);
+          buildKiroPayload(model, openaiBody, stream, currentCredentials);
       }
       payload = buildPayload(credentials);
     } catch (error) {

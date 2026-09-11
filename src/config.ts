@@ -16,13 +16,6 @@ export type AppConfig = {
    * Required before exposing it to a browser-based client.
    */
   auth?: { keys: string[] };
-  /**
-   * Surface reported to Kiro as `origin`. The default `AI_EDITOR` is the Kiro
-   * IDE and is answered with a ~3700-token "you are Kiro" persona plus usage and
-   * metering frames. `CLI` drops the persona — the model answers as plain Amazon
-   * Q — at the cost of usage data. Tool calls work on both.
-   */
-  upstream?: { origin: string };
 };
 
 export type AccountConfig = {
@@ -122,26 +115,5 @@ export async function loadConfig(path?: string): Promise<AppConfig> {
     }
   }
 
-  let upstream: { origin: string } | undefined;
-  if (input.upstream !== undefined) {
-    if (!input.upstream || typeof input.upstream !== "object" || Array.isArray(input.upstream)) {
-      throw configError("upstream must be a mapping");
-    }
-    const origin = (input.upstream as Record<string, unknown>).origin;
-    if (origin !== undefined) {
-      if (typeof origin !== "string" || origin.trim() === "") {
-        throw configError("upstream.origin must be a non-empty string");
-      }
-      upstream = { origin: origin.trim() };
-    }
-  }
-
-  return {
-    listen: input.listen,
-    models,
-    accounts,
-    discovery,
-    ...(auth ? { auth } : {}),
-    ...(upstream ? { upstream } : {}),
-  };
+  return { listen: input.listen, models, accounts, discovery, ...(auth ? { auth } : {}) };
 }
