@@ -33,7 +33,11 @@ import {
   KIRO_EXTERNAL_IDP_TOKEN_TYPE_VALUE,
 } from "./externalIdp.ts";
 import { resolveKiroRuntimeRegion } from "./region.ts";
-import { supportsKiroAdaptiveThinking } from "./request/adaptiveThinking.ts";
+import {
+  deriveKiroThinkingMode,
+  supportsKiroAdaptiveThinking,
+  type KiroThinkingMode,
+} from "./request/adaptiveThinking.ts";
 
 type RawRecord = Record<string, unknown>;
 
@@ -70,6 +74,8 @@ export type KiroModel = {
     thinking: boolean;
     agentic: boolean;
   };
+  /** Envelope the model accepts, read off its live catalog schema. */
+  thinkingMode?: KiroThinkingMode;
   contextLength?: number;
   rateMultiplier?: number;
   upstreamModelId?: string;
@@ -140,7 +146,11 @@ function formatDisplayName(modelName: unknown, modelId: string, rateMultiplier: 
   return `Kiro ${base} (${rate.toFixed(1)}x credit)`;
 }
 
-function buildVariants(upstream: string, displayName: string): KiroModel[] {
+function buildVariants(
+  upstream: string,
+  displayName: string,
+  thinkingMode: KiroThinkingMode
+): KiroModel[] {
   const display = displayName || `Kiro ${upstream}`;
   const variants: KiroModel[] = [
     {
@@ -148,15 +158,17 @@ function buildVariants(upstream: string, displayName: string): KiroModel[] {
       name: display,
       owned_by: "kiro",
       capabilities: { thinking: false, agentic: false },
+      thinkingMode,
     },
   ];
 
-  if (supportsKiroAdaptiveThinking(upstream)) {
+  if (thinkingMode === "adaptive") {
     variants.push({
       id: `${upstream}-thinking`,
       name: `${display} (Thinking)`,
       owned_by: "kiro",
       capabilities: { thinking: true, agentic: false },
+      thinkingMode,
     });
   }
 
@@ -190,8 +202,9 @@ function expandKiroModels(data: unknown): KiroModel[] {
     const contextLength = Number(tokenLimits.maxInputTokens) || 200000;
     const rateMultiplier = Number(item.rateMultiplier);
     const promptCaching = parsePromptCaching(item.promptCaching);
+    const thinkingMode = deriveKiroThinkingMode(item.additionalModelRequestFieldsSchema);
 
-    for (const variant of buildVariants(upstreamId, display)) {
+    for (const variant of buildVariants(upstreamId, display, thinkingMode)) {
       if (seen.has(variant.id)) continue;
       seen.add(variant.id);
       expanded.push({

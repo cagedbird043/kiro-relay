@@ -69,7 +69,10 @@ test("低档遵循官方 effort 编码且不改写用户思考指令", () => {
     thinking: { type: "adaptive" }, output_config: { effort: "low" }, max_tokens: 128000,
     messages: [{ role: "user", content: "只回答结果" }],
   }), true, {});
-  expect(payload.additionalModelRequestFields).toEqual({ output_config: { effort: "low" } });
+  expect(payload.additionalModelRequestFields).toEqual({
+    output_config: { effort: "low" },
+    thinking: { type: "adaptive" },
+  });
   expect(payload.conversationState.currentMessage.userInputMessage.content).toBe("只回答结果");
 });
 

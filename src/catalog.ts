@@ -20,14 +20,24 @@ import type { AppConfig } from "./config.ts";
 import type { ProviderCredentials } from "./kiro/base.ts";
 import { MODEL_CONTEXT_LENGTHS } from "./kiro/config.ts";
 import { fetchKiroAvailableModels, type KiroModel } from "./kiro/models.ts";
+import {
+  staticKiroThinkingMode,
+  type KiroThinkingMode,
+} from "./kiro/request/adaptiveThinking.ts";
 
-export type CatalogEntry = { id: string; contextLength: number };
+export type CatalogEntry = {
+  id: string;
+  contextLength: number;
+  /** Which `additionalModelRequestFields` envelope the model accepts upstream. */
+  thinkingMode: KiroThinkingMode;
+};
 
 export type Catalog = {
   /** Current snapshot; triggers a background refresh when stale. */
   list(): CatalogEntry[];
   has(id: string): boolean;
   contextLengthFor(id: string): number | undefined;
+  thinkingModeFor(id: string): KiroThinkingMode | undefined;
   /** Await a discovery pass. Used by tests and by startup warm-up. */
   refresh(): Promise<void>;
 };
@@ -54,42 +64,45 @@ const DEFAULT_ERROR_RETRY_MS = 30_000;
  */
 const EXCLUDED_MODEL_IDS: Record<string, true> = { auto: true };
 
-function entriesFrom(lengths: Map<string, number>): CatalogEntry[] {
-  const entries: CatalogEntry[] = [];
-  for (const [id, contextLength] of lengths) entries.push({ id, contextLength });
+/**
+ * Offline catalog: the static tables mirror Kiro's published windows and
+ * envelopes, and config.yaml may both add ids and override windows. Used before
+ * the first successful discovery and whenever discovery has never succeeded.
+ */
+function fallbackEntries(models: AppConfig["models"]): Map<string, CatalogEntry> {
+  const entries = new Map<string, CatalogEntry>();
+  for (const [id, contextLength] of Object.entries(MODEL_CONTEXT_LENGTHS)) {
+    if (!EXCLUDED_MODEL_IDS[id]) {
+      entries.set(id, { id, contextLength, thinkingMode: staticKiroThinkingMode(id) });
+    }
+  }
+  for (const [id, spec] of Object.entries(models)) {
+    if (!EXCLUDED_MODEL_IDS[id]) {
+      entries.set(id, {
+        id,
+        contextLength: spec.contextLength,
+        thinkingMode: entries.get(id)?.thinkingMode ?? staticKiroThinkingMode(id),
+      });
+    }
+  }
   return entries;
 }
 
 /**
- * Offline catalog: the static table mirrors Kiro's published windows, and
- * config.yaml may both add ids and override windows. Used before the first
- * successful discovery and whenever discovery has never succeeded.
- */
-function fallbackLengths(models: AppConfig["models"]): Map<string, number> {
-  const lengths = new Map<string, number>();
-  for (const [id, contextLength] of Object.entries(MODEL_CONTEXT_LENGTHS)) {
-    if (!EXCLUDED_MODEL_IDS[id]) lengths.set(id, contextLength);
-  }
-  for (const [id, spec] of Object.entries(models)) {
-    if (!EXCLUDED_MODEL_IDS[id]) lengths.set(id, spec.contextLength);
-  }
-  return lengths;
-}
-
-/**
- * Live catalog: exactly the ids Kiro routes on. Synthetic `-thinking` aliases
- * produced by the discovery expander are dropped — they are request-time
- * selectors, not separate models, and listing them would clutter the catalog
- * with ids that do not exist upstream.
+ * Live catalog: exactly the ids Kiro routes on, with the thinking envelope each
+ * one declares. Synthetic `-thinking` aliases produced by the discovery expander
+ * are dropped — they are request-time selectors, not separate models, and
+ * listing them would clutter the catalog with ids that do not exist upstream.
  *
  * config.yaml may override a discovered window (an escape hatch for a wrong
- * upstream value) but may not introduce ids the account lacks.
+ * upstream value) but may not introduce ids the account lacks, and never
+ * overrides the envelope: only Kiro knows which fields it will accept.
  */
-function discoveredLengths(
+function discoveredEntries(
   models: AppConfig["models"],
   discovered: KiroModel[]
-): Map<string, number> {
-  const lengths = new Map<string, number>();
+): Map<string, CatalogEntry> {
+  const entries = new Map<string, CatalogEntry>();
   for (const model of discovered) {
     if (!model.id || EXCLUDED_MODEL_IDS[model.id]) continue;
     if (model.upstreamModelId && model.upstreamModelId !== model.id) continue;
@@ -97,12 +110,18 @@ function discoveredLengths(
       typeof model.contextLength === "number" && model.contextLength > 0
         ? model.contextLength
         : MODEL_CONTEXT_LENGTHS[model.id];
-    if (contextLength) lengths.set(model.id, contextLength);
+    if (!contextLength) continue;
+    entries.set(model.id, {
+      id: model.id,
+      contextLength,
+      thinkingMode: model.thinkingMode ?? staticKiroThinkingMode(model.id),
+    });
   }
   for (const [id, spec] of Object.entries(models)) {
-    if (lengths.has(id)) lengths.set(id, spec.contextLength);
+    const entry = entries.get(id);
+    if (entry) entries.set(id, { ...entry, contextLength: spec.contextLength });
   }
-  return lengths;
+  return entries;
 }
 
 export function createCatalog(options: CatalogOptions): Catalog {
@@ -114,8 +133,8 @@ export function createCatalog(options: CatalogOptions): Catalog {
     errorRetryMs = DEFAULT_ERROR_RETRY_MS,
   } = options;
 
-  let lengths = fallbackLengths(models);
-  let snapshot = entriesFrom(lengths);
+  let entries = fallbackEntries(models);
+  let snapshot = [...entries.values()];
   let freshUntil = 0;
   let inFlight: Promise<void> | undefined;
 
@@ -134,10 +153,10 @@ export function createCatalog(options: CatalogOptions): Catalog {
     }
 
     if (discovered && discovered.length > 0) {
-      const next = discoveredLengths(models, discovered);
+      const next = discoveredEntries(models, discovered);
       if (next.size > 0) {
-        lengths = next;
-        snapshot = entriesFrom(next);
+        entries = next;
+        snapshot = [...next.values()];
         freshUntil = Date.now() + ttlMs;
         return;
       }
@@ -159,11 +178,15 @@ export function createCatalog(options: CatalogOptions): Catalog {
     },
     has(id: string) {
       ensureFresh();
-      return lengths.has(id);
+      return entries.has(id);
     },
     contextLengthFor(id: string) {
       ensureFresh();
-      return lengths.get(id);
+      return entries.get(id)?.contextLength;
+    },
+    thinkingModeFor(id: string) {
+      ensureFresh();
+      return entries.get(id)?.thinkingMode;
     },
     refresh,
   };

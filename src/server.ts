@@ -462,6 +462,9 @@ export function createHandler(
     const modelContextLength = catalog
       ? catalog.contextLengthFor(model)
       : config.models[model]?.contextLength;
+    // Only a live catalog knows which envelope Kiro accepts for this model;
+    // with discovery off the translator's static table decides as before.
+    const modelThinkingMode = catalog?.thinkingModeFor(model);
     if (!model || modelContextLength === undefined) {
       return requestError(`Unknown model: ${model || "(missing)"}`);
     }
@@ -516,7 +519,7 @@ export function createHandler(
         // only the Anthropic surface needs converting first.
         const openaiBody = isChat ? body : anthropicToOpenAI(body);
         buildPayload = (currentCredentials) =>
-          buildKiroPayload(model, openaiBody, stream, currentCredentials);
+          buildKiroPayload(model, openaiBody, stream, currentCredentials, modelThinkingMode);
       }
       payload = buildPayload(credentials);
     } catch (error) {

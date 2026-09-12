@@ -8,13 +8,27 @@ import { clearKiroModelCache, fetchKiroAvailableModels } from "../src/kiro/model
 
 /**
  * Shape of a real `ListAvailableModels` response, trimmed to the cases that
- * matter: the `auto` router, a thinking-capable Claude (whose expansion emits a
- * synthetic `-thinking` alias), and text-only models with non-default windows.
+ * matter: the `auto` router, a thinking-capable Claude (whose
+ * `additionalModelRequestFieldsSchema` declares the adaptive envelope and whose
+ * expansion emits a synthetic `-thinking` alias), and text-only models that
+ * declare no schema at all.
  */
+const ADAPTIVE_SCHEMA = {
+  type: "object",
+  properties: {
+    thinking: {
+      type: "object",
+      properties: { type: { type: "string", enum: ["adaptive", "disabled"] } },
+      required: ["type"],
+    },
+    output_config: { type: "object", properties: { effort: { type: "string" } } },
+  },
+};
+
 const UPSTREAM_PAYLOAD = {
   models: [
     { modelId: "auto", modelName: "Auto", rateMultiplier: 1.0, tokenLimits: { maxInputTokens: 1_000_000 } },
-    { modelId: "claude-opus-5", modelName: "Claude Opus 5", rateMultiplier: 2.2, tokenLimits: { maxInputTokens: 1_000_000 } },
+    { modelId: "claude-opus-5", modelName: "Claude Opus 5", rateMultiplier: 2.2, tokenLimits: { maxInputTokens: 1_000_000 }, additionalModelRequestFieldsSchema: ADAPTIVE_SCHEMA },
     { modelId: "deepseek-3.2", modelName: "Deepseek v3.2", rateMultiplier: 0.25, tokenLimits: { maxInputTokens: 164_000 } },
     { modelId: "qwen3-coder-next", modelName: "Qwen3 Coder Next", rateMultiplier: 0.05, tokenLimits: { maxInputTokens: 256_000 } },
   ],
@@ -51,12 +65,52 @@ describe("live model catalog", () => {
     await catalog.refresh();
 
     expect(catalog.list()).toEqual([
-      { id: "claude-opus-5", contextLength: 1_000_000 },
-      { id: "deepseek-3.2", contextLength: 164_000 },
-      { id: "qwen3-coder-next", contextLength: 256_000 },
+      { id: "claude-opus-5", contextLength: 1_000_000, thinkingMode: "adaptive" },
+      { id: "deepseek-3.2", contextLength: 164_000, thinkingMode: "none" },
+      { id: "qwen3-coder-next", contextLength: 256_000, thinkingMode: "none" },
     ]);
     expect(catalog.has("auto")).toBe(false);
     expect(catalog.has("claude-opus-5-thinking")).toBe(false);
+  });
+
+  // Kiro declares the envelope it accepts per model. Reading it off the wire is
+  // what lets a model that gains thinking upstream start receiving it without a
+  // relay release, and keeps a model that never had it from being sent a field
+  // Kiro answers with a 400.
+  test("derives each model's thinking envelope from its advertised schema", async () => {
+    const payload = {
+      models: [
+        { modelId: "claude-opus-4.6", tokenLimits: { maxInputTokens: 1_000_000 }, additionalModelRequestFieldsSchema: ADAPTIVE_SCHEMA },
+        {
+          modelId: "gpt-5.6-sol",
+          tokenLimits: { maxInputTokens: 272_000 },
+          additionalModelRequestFieldsSchema: {
+            type: "object",
+            properties: { reasoning: { type: "object", properties: { effort: { type: "string" } } } },
+          },
+        },
+        { modelId: "glm-5", tokenLimits: { maxInputTokens: 200_000 }, additionalModelRequestFieldsSchema: null },
+      ],
+    };
+    const { loadCredentials, fetchModels } = harness(() => Response.json(payload));
+    const catalog = createCatalog({ models: {}, loadCredentials, fetchModels });
+
+    await catalog.refresh();
+
+    expect(catalog.thinkingModeFor("claude-opus-4.6")).toBe("adaptive");
+    expect(catalog.thinkingModeFor("gpt-5.6-sol")).toBe("native");
+    expect(catalog.thinkingModeFor("glm-5")).toBe("none");
+  });
+
+  test("falls back to the static envelope table when discovery never succeeds", async () => {
+    const { loadCredentials, fetchModels } = harness(() => new Response("nope", { status: 500 }));
+    const catalog = createCatalog({ models: {}, loadCredentials, fetchModels });
+
+    await catalog.refresh();
+
+    expect(catalog.thinkingModeFor("claude-opus-4.6")).toBe("adaptive");
+    expect(catalog.thinkingModeFor("gpt-5.6-sol")).toBe("native");
+    expect(catalog.thinkingModeFor("glm-5")).toBe("none");
   });
 
   test("reports the window Kiro advertises, not the hand-maintained default", async () => {

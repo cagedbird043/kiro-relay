@@ -782,9 +782,13 @@ function effortFromBudget(budget: number): string {
 
 
 /**
- * Build Kiro payload from OpenAI format
+ * Build Kiro payload from OpenAI format.
+ *
+ * `thinkingMode` is the envelope Kiro's live catalog says this model accepts.
+ * Omitted -> the static table decides, which is what discovery-disabled
+ * deployments and the offline fallback path get.
  */
-export function buildKiroPayload(model, body, stream, credentials) {
+export function buildKiroPayload(model, body, stream, credentials, thinkingMode) {
   // Reject the Anthropic-only `[1m]` context beta before it reaches Bedrock —
   // Kiro cannot honor it and a forwarded `kr/*[1m]` id is malformed upstream.
   if (hasUnsupportedKiroContextSuffix(model)) {
@@ -928,17 +932,27 @@ export function buildKiroPayload(model, body, stream, credentials) {
   }
 
   // 官方客户端按模型目录声明的路径发送 effort，不向消息注入思考指令。
+  // The live catalog wins when present: Kiro publishes each model's accepted
+  // envelope as `additionalModelRequestFieldsSchema`, so a model that gains
+  // thinking upstream starts getting it here without a code change.
   const requestedEffort = resolveKiroEffort(body) || (modelRequestsThinking ? "high" : "");
-  const usesNativeReasoning = supportsKiroNativeReasoning(normalizedModel);
-  const usesAdaptiveThinking = supportsKiroAdaptiveThinking(normalizedModel);
+  const usesNativeReasoning = thinkingMode
+    ? thinkingMode === "native"
+    : supportsKiroNativeReasoning(normalizedModel);
+  const usesAdaptiveThinking = thinkingMode
+    ? thinkingMode === "adaptive"
+    : supportsKiroAdaptiveThinking(normalizedModel);
   const kiroEffort = usesNativeReasoning || usesAdaptiveThinking ? requestedEffort : "";
   const thinkingDisabled = usesAdaptiveThinking && body.thinking?.type === "disabled";
   if (kiroEffort || thinkingDisabled) {
+    // `thinking.type` is required by Kiro's adaptive schema. Sending only
+    // `output_config.effort` leaves adaptive thinking off, which is why every
+    // Claude 4.6+ model stayed silent no matter what effort was requested.
     payload.additionalModelRequestFields = usesNativeReasoning
       ? { reasoning: { effort: kiroEffort } }
       : {
           ...(kiroEffort ? { output_config: { effort: kiroEffort } } : {}),
-          ...(thinkingDisabled ? { thinking: { type: "disabled" } } : {}),
+          thinking: { type: thinkingDisabled ? "disabled" : "adaptive" },
         };
 
     // Adaptive-only Claude models (Opus 4.7/4.8, Sonnet 5, Fable 5) reject a

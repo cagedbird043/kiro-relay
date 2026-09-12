@@ -1234,3 +1234,55 @@ test("sanitizes long forced tool names consistently and rejects invalid choices"
   assert.throws(() => choicePayload("required"), /tool_choice/);
   assert.throws(() => choicePayload({ type: "any", disable_parallel_tool_use: true }), /disable_parallel_tool_use/);
 });
+
+// Kiro's adaptive schema marks `thinking.type` as required. Sending only
+// `output_config.effort` left adaptive thinking switched off upstream, so every
+// Claude 4.6+ model answered without a single reasoning frame no matter what
+// effort the client asked for.
+test("buildKiroPayload sends the required thinking.type with the adaptive envelope", () => {
+  const result = buildKiroPayload(
+    "claude-sonnet-5",
+    { messages: [{ role: "user", content: "hard" }], reasoning_effort: "high" },
+    false,
+    null
+  );
+
+  assert.deepEqual(result.additionalModelRequestFields, {
+    output_config: { effort: "high" },
+    thinking: { type: "adaptive" },
+  });
+});
+
+// The live catalog publishes each model's accepted envelope. Honouring it is
+// what stops a hand-maintained allowlist from silently withholding thinking
+// from a model Kiro already supports.
+test("buildKiroPayload enables thinking for a catalog-adaptive model the static table omits", () => {
+  const body = { messages: [{ role: "user", content: "hard" }], reasoning_effort: "high" };
+
+  const result = buildKiroPayload("claude-opus-4.6", body, false, null, "adaptive");
+
+  assert.deepEqual(result.additionalModelRequestFields, {
+    output_config: { effort: "high" },
+    thinking: { type: "adaptive" },
+  });
+});
+
+test("buildKiroPayload withholds the envelope when the catalog reports no thinking support", () => {
+  const body = { messages: [{ role: "user", content: "hard" }], reasoning_effort: "high" };
+
+  const result = buildKiroPayload("claude-opus-5", body, false, null, "none");
+
+  assert.equal(
+    result.additionalModelRequestFields,
+    undefined,
+    "a model whose catalog entry declares no schema must not receive the field"
+  );
+});
+
+test("buildKiroPayload keeps the GPT-5.6 reasoning envelope when the catalog reports native", () => {
+  const body = { messages: [{ role: "user", content: "hard" }], reasoning_effort: "high" };
+
+  const result = buildKiroPayload("gpt-5.6-sol", body, false, null, "native");
+
+  assert.deepEqual(result.additionalModelRequestFields, { reasoning: { effort: "high" } });
+});
