@@ -943,8 +943,17 @@ export function buildKiroPayload(model, body, stream, credentials, thinkingMode)
     ? thinkingMode === "adaptive"
     : supportsKiroAdaptiveThinking(normalizedModel);
   const kiroEffort = usesNativeReasoning || usesAdaptiveThinking ? requestedEffort : "";
-  const thinkingDisabled = usesAdaptiveThinking && body.thinking?.type === "disabled";
-  if (kiroEffort || thinkingDisabled) {
+  // `output_config.effort` / `thinking` are Kiro-private fields; an OpenAI-format
+  // client has no way to reach them, so requiring one would mean no chat client
+  // ever gets reasoning out of these models. Adaptive thinking is the model
+  // deciding per turn whether it needs to think, so the compatible default is
+  // on — a client that wants it off says so explicitly. Native GPT-5.6 models
+  // already default to thinking upstream and are left alone.
+  const thinkingTurnedOff =
+    body.thinking?.type === "disabled" ||
+    (typeof body.reasoning_effort === "string" && body.reasoning_effort.toLowerCase() === "none");
+  const thinkingDisabled = usesAdaptiveThinking && thinkingTurnedOff;
+  if (kiroEffort || usesAdaptiveThinking) {
     // `thinking.type` is required by Kiro's adaptive schema. Sending only
     // `output_config.effort` leaves adaptive thinking off, which is why every
     // Claude 4.6+ model stayed silent no matter what effort was requested.

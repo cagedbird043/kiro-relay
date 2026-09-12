@@ -1107,7 +1107,7 @@ test("buildKiroPayload drops temperature when thinking is enabled", () => {
   );
 });
 
-test("buildKiroPayload ignores thinking request for unsupported effort levels", () => {
+test("buildKiroPayload discards an unsupported effort level instead of forwarding it", () => {
   const body = {
     messages: [{ role: "user", content: "Hello" }],
     reasoning_effort: "invalid",
@@ -1115,10 +1115,10 @@ test("buildKiroPayload ignores thinking request for unsupported effort levels", 
 
   const result = buildKiroPayload("claude-opus-4.8", body, false, null);
 
-  assert.equal(
+  assert.deepEqual(
     result.additionalModelRequestFields,
-    undefined,
-    "invalid effort must not enable thinking"
+    { thinking: { type: "adaptive" } },
+    "an unrecognised effort must not reach Kiro, and must not switch adaptive thinking off"
   );
 });
 
@@ -1134,17 +1134,37 @@ test("buildKiroPayload maps body.thinking budget_tokens to effort level", () => 
   assert.equal(result.additionalModelRequestFields.output_config.effort, "high");
 });
 
-test("buildKiroPayload leaves thinking off when no reasoning is requested", () => {
+// An OpenAI-format client cannot reach `output_config.effort` or `thinking` —
+// they are Kiro-private. Requiring one would mean no chat client ever gets
+// reasoning out of an adaptive model, so the envelope defaults on and the model
+// decides per turn whether it actually needs to think.
+test("buildKiroPayload defaults an adaptive model to thinking without injecting a directive", () => {
   const body = { messages: [{ role: "user", content: "Hi" }] };
 
   const result = buildKiroPayload("claude-opus-4.8", body, false, null);
 
-  assert.equal(result.additionalModelRequestFields, undefined, "no thinking fields by default");
+  assert.deepEqual(result.additionalModelRequestFields, { thinking: { type: "adaptive" } });
   assert.doesNotMatch(
     result.conversationState.currentMessage.userInputMessage.content,
     /<thinking_mode>/,
     "no directive injected by default"
   );
+});
+
+test("buildKiroPayload turns adaptive thinking off when the client asks for no reasoning", () => {
+  const body = { messages: [{ role: "user", content: "Hi" }], reasoning_effort: "none" };
+
+  const result = buildKiroPayload("claude-opus-4.8", body, false, null);
+
+  assert.deepEqual(result.additionalModelRequestFields, { thinking: { type: "disabled" } });
+});
+
+test("buildKiroPayload leaves a model without thinking support untouched by default", () => {
+  const body = { messages: [{ role: "user", content: "Hi" }] };
+
+  const result = buildKiroPayload("claude-sonnet-4.5", body, false, null);
+
+  assert.equal(result.additionalModelRequestFields, undefined);
 });
 
 test("buildKiroPayload maps reasoning_effort to the same Kiro effort level (no +1 shift)", () => {
