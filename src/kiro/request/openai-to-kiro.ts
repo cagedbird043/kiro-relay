@@ -9,9 +9,8 @@ import {
   serializeToolResultContent,
 } from "./messageHelpers.ts";
 import {
+  buildKiroThinkingEnvelope,
   resolveKiroModelAlias,
-  supportsKiroAdaptiveThinking,
-  supportsKiroNativeReasoning,
 } from "./adaptiveThinking.ts";
 import { supportsKiroImages } from "../modelCapabilities.ts";
 import { remapKiroToolHistory, sanitizeKiroTools } from "../sanitizer.ts";
@@ -729,8 +728,16 @@ function convertMessages(messages, tools, model) {
   return { history: alternatingHistory, currentMessage, toolsAttached, toolDocs };
 }
 
-/** Kiro's accepted reasoning-effort levels (`output_config.effort`). */
-const KIRO_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+/**
+ * Reasoning-effort levels Kiro accepts, across both envelopes.
+ *
+ * `none` appears only in the GPT-5.6 `reasoning.effort` enum, and is how a client
+ * turns thinking off on those models — without it they fall through to Kiro's own
+ * `high` default. Claude's `output_config.effort` has no such level; it is switched
+ * off through `thinking.type` instead, so the adaptive branch below drops `none`
+ * rather than forwarding a value Kiro would reject.
+ */
+const KIRO_EFFORT_LEVELS = ["none", "low", "medium", "high", "xhigh", "max"];
 
 /**
  * Resolve the Kiro effort level for a request, or "" when no reasoning was asked
@@ -936,38 +943,27 @@ export function buildKiroPayload(model, body, stream, credentials, thinkingMode)
   // envelope as `additionalModelRequestFieldsSchema`, so a model that gains
   // thinking upstream starts getting it here without a code change.
   const requestedEffort = resolveKiroEffort(body) || (modelRequestsThinking ? "high" : "");
-  const usesNativeReasoning = thinkingMode
-    ? thinkingMode === "native"
-    : supportsKiroNativeReasoning(normalizedModel);
-  const usesAdaptiveThinking = thinkingMode
-    ? thinkingMode === "adaptive"
-    : supportsKiroAdaptiveThinking(normalizedModel);
-  const kiroEffort = usesNativeReasoning || usesAdaptiveThinking ? requestedEffort : "";
-  // `output_config.effort` / `thinking` are Kiro-private fields; an OpenAI-format
-  // client has no way to reach them, so requiring one would mean no chat client
-  // ever gets reasoning out of these models. Adaptive thinking is the model
-  // deciding per turn whether it needs to think, so the compatible default is
-  // on — a client that wants it off says so explicitly. Native GPT-5.6 models
-  // already default to thinking upstream and are left alone.
+  // Adaptive thinking is the model deciding per turn whether it needs to think,
+  // so the compatible default is on — a client that wants it off says so. Native
+  // GPT-5.6 models default to `high` upstream, so "off" must be sent explicitly;
+  // {@link buildKiroThinkingEnvelope} owns that asymmetry.
   const thinkingTurnedOff =
     body.thinking?.type === "disabled" ||
     (typeof body.reasoning_effort === "string" && body.reasoning_effort.toLowerCase() === "none");
-  const thinkingDisabled = usesAdaptiveThinking && thinkingTurnedOff;
-  if (kiroEffort || usesAdaptiveThinking) {
-    // `thinking.type` is required by Kiro's adaptive schema. Sending only
-    // `output_config.effort` leaves adaptive thinking off, which is why every
-    // Claude 4.6+ model stayed silent no matter what effort was requested.
-    payload.additionalModelRequestFields = usesNativeReasoning
-      ? { reasoning: { effort: kiroEffort } }
-      : {
-          ...(kiroEffort ? { output_config: { effort: kiroEffort } } : {}),
-          thinking: { type: thinkingDisabled ? "disabled" : "adaptive" },
-        };
+  const envelope = buildKiroThinkingEnvelope(
+    normalizedModel,
+    requestedEffort,
+    thinkingTurnedOff,
+    thinkingMode,
+  );
+  if (envelope) {
+    payload.additionalModelRequestFields = envelope;
 
     // Adaptive-only Claude models (Opus 4.7/4.8, Sonnet 5, Fable 5) reject a
     // non-default temperature / top_p with a 400 while thinking is active, so
     // strip both. Drop inferenceConfig entirely if nothing else remains.
-    if (payload.inferenceConfig) {
+    // Thinking that was explicitly turned off imposes no such restriction.
+    if (payload.inferenceConfig && !thinkingTurnedOff) {
       delete payload.inferenceConfig.temperature;
       delete payload.inferenceConfig.topP;
       if (Object.keys(payload.inferenceConfig).length === 0) {

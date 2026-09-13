@@ -39,6 +39,62 @@ export function supportsKiroNativeReasoning(normalizedModel: string): boolean {
   return KIRO_NATIVE_REASONING_MODELS[normalizedModel] === true;
 }
 
+/** GPT-5.6 envelope: thinking level is stated directly, `none` included. */
+export type KiroNativeEnvelope = { reasoning: { effort: string; summary?: string } };
+/** Claude envelope: effort and the on/off switch are separate fields. */
+export type KiroAdaptiveEnvelope = {
+  output_config?: { effort: string };
+  thinking: { type: "adaptive" | "disabled" };
+};
+export type KiroThinkingEnvelope = KiroNativeEnvelope | KiroAdaptiveEnvelope;
+
+/**
+ * Build the `additionalModelRequestFields` envelope, or null when the model
+ * takes none.
+ *
+ * Every public interface — Chat Completions, Anthropic Messages, Responses —
+ * routes through here, so each one can keep its own protocol's standard way of
+ * asking for (or refusing) thinking and still produce the same upstream request.
+ * Envelope choice is a property of the model, never of the client protocol.
+ *
+ * @param effort      normalized Kiro level, or "" when the client said nothing
+ * @param thinkingOff the client explicitly asked for no thinking
+ */
+export function buildKiroThinkingEnvelope(
+  normalizedModel: string,
+  effort: string,
+  thinkingOff: boolean,
+  thinkingMode?: KiroThinkingMode,
+  summary?: string,
+): KiroThinkingEnvelope | null {
+  const usesNative = thinkingMode
+    ? thinkingMode === "native"
+    : supportsKiroNativeReasoning(normalizedModel);
+  const usesAdaptive = thinkingMode
+    ? thinkingMode === "adaptive"
+    : supportsKiroAdaptiveThinking(normalizedModel);
+
+  if (usesNative) {
+    // GPT-5.6 defaults to `high` upstream, so "off" has to be stated as a level.
+    const level = thinkingOff ? "none" : effort;
+    if (!level) return null;
+    return { reasoning: { effort: level, ...(summary ? { summary } : {}) } };
+  }
+
+  if (usesAdaptive) {
+    // Claude's effort enum has no "none"; thinking is switched off via `thinking.type`.
+    // `thinking.type` is required by the schema — sending only `output_config`
+    // leaves adaptive thinking off, which is why Claude 4.6+ stayed silent no
+    // matter what effort was requested.
+    return {
+      ...(effort && effort !== "none" ? { output_config: { effort } } : {}),
+      thinking: { type: thinkingOff ? "disabled" : "adaptive" },
+    };
+  }
+
+  return null;
+}
+
 /**
  * Read the envelope a model accepts off its catalog entry. `reasoning` and
  * `thinking` are the two top-level properties Kiro declares; a null/absent

@@ -4,6 +4,7 @@ import { remapKiroToolHistory, sanitizeKiroTools } from "../kiro/sanitizer.ts";
 import type { ProviderCredentials } from "../kiro/base.ts";
 import { getKiroModelCapabilities } from "../kiro/modelCapabilities.ts";
 import { decodeReasoning, mergeKiroReasoning, type KiroReasoningContent } from "../kiro/reasoning.ts";
+import { buildKiroThinkingEnvelope } from "../kiro/request/adaptiveThinking.ts";
 
 /** Responses request accepted by the native Kiro adapter. */
 export type KiroResponsesRequest = Partial<ResponseCreateParamsBase> & Record<string, unknown> & {
@@ -35,6 +36,13 @@ const UNSUPPORTED_FIELDS: Record<string, true> = {
   prompt: true,
   truncation: true,
 };
+/**
+ * Responses `reasoning.effort` → the Kiro level to send.
+ *
+ * `none` is a real GPT-5.6 level, not an absence: these models think at `high`
+ * by default upstream, so mapping it to "" would drop the field and silently
+ * give the client the opposite of what it asked for.
+ */
 const EFFORTS: Readonly<Record<string, string>> = {
   minimal: "low",
   low: "low",
@@ -42,7 +50,7 @@ const EFFORTS: Readonly<Record<string, string>> = {
   high: "high",
   xhigh: "xhigh",
   max: "max",
-  none: "",
+  none: "none",
 };
 type Obj = Record<string, unknown>;
 const isObj = (value: unknown): value is Obj =>
@@ -402,14 +410,19 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   payload._includeEncryptedContent = includeEncryptedContent;
   const profileArn = credentials.providerSpecificData?.profileArn; if (typeof profileArn === "string" && profileArn) payload.profileArn = profileArn;
   if (typeof body.max_output_tokens === "number") payload.inferenceConfig = { maxTokens: body.max_output_tokens };
-  if (reasoningEffort) {
-    payload.additionalModelRequestFields = {
-      reasoning: {
-        effort: reasoningEffort,
-        ...(reasoningSummary ? { summary: reasoningSummary } : {}),
-      },
-    };
-  }
+  // Shared with Chat Completions and Anthropic Messages so all three surfaces
+  // produce the same upstream envelope. This endpoint is native-only (asserted
+  // above), but routing through the same builder keeps the shapes from drifting.
+  const envelope = buildKiroThinkingEnvelope(
+    model,
+    reasoningEffort,
+    reasoningEffort === "none",
+    "native",
+    reasoningSummary,
+  );
+  // Native-only endpoint, so the builder can only produce the `reasoning` shape;
+  // the guard is what proves that to the type system.
+  if (envelope && "reasoning" in envelope) payload.additionalModelRequestFields = envelope;
   if (nameMap) payload._toolNameMap = nameMap;
   if (responseToolMetadata) payload._responseToolMetadata = responseToolMetadata;
   return payload;
