@@ -28,6 +28,8 @@ export const MODEL_CONTEXT_LENGTHS: Record<string, number> = {
   "qwen3-coder-next": 256_000,
   "claude-opus-5": 1_000_000,
   "claude-sonnet-5": 1_000_000,
+  "claude-opus-5.5": 1_000_000,
+  "claude-sonnet-5.5": 1_000_000,
   "gpt-5.6-sol": 272_000,
   "gpt-5.6-terra": 272_000,
   "gpt-5.6-luna": 272_000,

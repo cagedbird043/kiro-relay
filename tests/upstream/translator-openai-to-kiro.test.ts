@@ -1174,6 +1174,16 @@ test("buildKiroPayload keeps thinking on for a model that cannot disable it", ()
   }
 });
 
+test("buildKiroPayload keeps 5.5 thinking on from the static table when the live catalog is unavailable", () => {
+  for (const model of ["claude-opus-5.5", "claude-sonnet-5.5"]) {
+    const body = { messages: [{ role: "user", content: "Hi" }], reasoning_effort: "none" };
+
+    const result = buildKiroPayload(model, body, false, null);
+
+    assert.deepEqual(result.additionalModelRequestFields, { thinking: { type: "adaptive" } });
+  }
+});
+
 test("buildKiroPayload leaves a model without thinking support untouched by default", () => {
   const body = { messages: [{ role: "user", content: "Hi" }] };
 

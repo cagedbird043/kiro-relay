@@ -20,13 +20,15 @@
  */
 export type KiroThinkingMode = "adaptive" | "adaptive_only" | "native" | "none";
 
-const KIRO_ADAPTIVE_THINKING_MODELS: Record<string, true> = {
-  "claude-opus-4.6": true,
-  "claude-opus-4.7": true,
-  "claude-opus-4.8": true,
-  "claude-opus-5": true,
-  "claude-sonnet-4.6": true,
-  "claude-sonnet-5": true,
+const KIRO_ADAPTIVE_THINKING_MODELS: Record<string, "adaptive" | "adaptive_only"> = {
+  "claude-opus-4.6": "adaptive",
+  "claude-opus-4.7": "adaptive",
+  "claude-opus-4.8": "adaptive",
+  "claude-opus-5": "adaptive",
+  "claude-opus-5.5": "adaptive_only",
+  "claude-sonnet-4.6": "adaptive",
+  "claude-sonnet-5": "adaptive",
+  "claude-sonnet-5.5": "adaptive_only",
 };
 const KIRO_NATIVE_REASONING_MODELS: Record<string, true> = {
   "gpt-5.6-sol": true,
@@ -35,7 +37,7 @@ const KIRO_NATIVE_REASONING_MODELS: Record<string, true> = {
 };
 
 export function supportsKiroAdaptiveThinking(normalizedModel: string): boolean {
-  return KIRO_ADAPTIVE_THINKING_MODELS[normalizedModel] === true;
+  return KIRO_ADAPTIVE_THINKING_MODELS[normalizedModel] !== undefined;
 }
 
 export function supportsKiroNativeReasoning(normalizedModel: string): boolean {
@@ -71,12 +73,9 @@ export function buildKiroThinkingEnvelope(
   thinkingMode?: KiroThinkingMode,
   summary?: string,
 ): KiroThinkingEnvelope | null {
-  const usesNative = thinkingMode
-    ? thinkingMode === "native"
-    : supportsKiroNativeReasoning(normalizedModel);
-  const usesAdaptive = thinkingMode
-    ? thinkingMode === "adaptive" || thinkingMode === "adaptive_only"
-    : supportsKiroAdaptiveThinking(normalizedModel);
+  const mode = thinkingMode ?? staticKiroThinkingMode(normalizedModel);
+  const usesNative = mode === "native";
+  const usesAdaptive = mode === "adaptive" || mode === "adaptive_only";
 
   if (usesNative) {
     // GPT-5.6 defaults to `high` upstream, so "off" has to be stated as a level.
@@ -92,7 +91,7 @@ export function buildKiroThinkingEnvelope(
     // matter what effort was requested.
     return {
       ...(effort && effort !== "none" ? { output_config: { effort } } : {}),
-      thinking: { type: thinkingOff && thinkingMode !== "adaptive_only" ? "disabled" : "adaptive" },
+      thinking: { type: thinkingOff && mode !== "adaptive_only" ? "disabled" : "adaptive" },
     };
   }
 
@@ -121,8 +120,7 @@ export function deriveKiroThinkingMode(schema: unknown): KiroThinkingMode {
 /** Offline answer for a model id, used when the live catalog is unavailable. */
 export function staticKiroThinkingMode(normalizedModel: string): KiroThinkingMode {
   if (KIRO_NATIVE_REASONING_MODELS[normalizedModel]) return "native";
-  if (KIRO_ADAPTIVE_THINKING_MODELS[normalizedModel]) return "adaptive";
-  return "none";
+  return KIRO_ADAPTIVE_THINKING_MODELS[normalizedModel] ?? "none";
 }
 
 const KIRO_UNSUPPORTED_AGENTIC_MESSAGE =

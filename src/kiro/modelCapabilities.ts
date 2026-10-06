@@ -28,6 +28,8 @@ export const KIRO_MODEL_CAPABILITIES: Readonly<Record<string, KiroModelCapabilit
   "qwen3-coder-next": { contextLength: 256_000, supportsImages: false, supportsAdaptiveReasoning: false, supportsNativeReasoning: false },
   "claude-opus-5": { contextLength: 1_000_000, supportsImages: true, supportsAdaptiveReasoning: true, supportsNativeReasoning: false },
   "claude-sonnet-5": { contextLength: 1_000_000, supportsImages: true, supportsAdaptiveReasoning: true, supportsNativeReasoning: false },
+  "claude-opus-5.5": { contextLength: 1_000_000, supportsImages: true, supportsAdaptiveReasoning: true, supportsNativeReasoning: false },
+  "claude-sonnet-5.5": { contextLength: 1_000_000, supportsImages: true, supportsAdaptiveReasoning: true, supportsNativeReasoning: false },
   "gpt-5.6-sol": { contextLength: 272_000, supportsImages: true, supportsAdaptiveReasoning: false, supportsNativeReasoning: true },
   "gpt-5.6-terra": { contextLength: 272_000, supportsImages: true, supportsAdaptiveReasoning: false, supportsNativeReasoning: true },
   "gpt-5.6-luna": { contextLength: 272_000, supportsImages: true, supportsAdaptiveReasoning: false, supportsNativeReasoning: true },
