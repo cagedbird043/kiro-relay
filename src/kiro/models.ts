@@ -162,7 +162,7 @@ function buildVariants(
     },
   ];
 
-  if (thinkingMode === "adaptive") {
+  if (thinkingMode === "adaptive" || thinkingMode === "adaptive_only") {
     variants.push({
       id: `${upstream}-thinking`,
       name: `${display} (Thinking)`,

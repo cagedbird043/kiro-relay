@@ -102,6 +102,34 @@ describe("live model catalog", () => {
     expect(catalog.thinkingModeFor("glm-5")).toBe("none");
   });
 
+  // Opus/Sonnet 5.5 preview declare `thinking.type` without `disabled`; sending
+  // it is a 400 REQUEST_BODY_INVALID upstream, so the catalog has to tell these
+  // apart from Claude models that can switch thinking off.
+  test("marks a Claude model whose thinking cannot be disabled as adaptive_only", async () => {
+    const thinkingSchema = (types: string[]) => ({
+      type: "object",
+      properties: {
+        thinking: { type: "object", properties: { type: { type: "string", enum: types } }, required: ["type"] },
+        output_config: { type: "object", properties: { effort: { type: "string" } } },
+      },
+    });
+    const payload = {
+      models: [
+        { modelId: "claude-opus-5.5", tokenLimits: { maxInputTokens: 1_000_000 }, additionalModelRequestFieldsSchema: thinkingSchema(["adaptive"]) },
+        { modelId: "claude-sonnet-5.5", tokenLimits: { maxInputTokens: 1_000_000 }, additionalModelRequestFieldsSchema: thinkingSchema(["adaptive", "between_tools"]) },
+        { modelId: "claude-sonnet-5", tokenLimits: { maxInputTokens: 1_000_000 }, additionalModelRequestFieldsSchema: thinkingSchema(["adaptive", "disabled"]) },
+      ],
+    };
+    const { loadCredentials, fetchModels } = harness(() => Response.json(payload));
+    const catalog = createCatalog({ models: {}, loadCredentials, fetchModels });
+
+    await catalog.refresh();
+
+    expect(catalog.thinkingModeFor("claude-opus-5.5")).toBe("adaptive_only");
+    expect(catalog.thinkingModeFor("claude-sonnet-5.5")).toBe("adaptive_only");
+    expect(catalog.thinkingModeFor("claude-sonnet-5")).toBe("adaptive");
+  });
+
   test("falls back to the static envelope table when discovery never succeeds", async () => {
     const { loadCredentials, fetchModels } = harness(() => new Response("nope", { status: 500 }));
     const catalog = createCatalog({ models: {}, loadCredentials, fetchModels });

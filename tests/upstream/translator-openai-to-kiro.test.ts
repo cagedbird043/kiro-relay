@@ -1159,6 +1159,21 @@ test("buildKiroPayload turns adaptive thinking off when the client asks for no r
   assert.deepEqual(result.additionalModelRequestFields, { thinking: { type: "disabled" } });
 });
 
+// Kiro's 5.5 preview schema has no `thinking.type: "disabled"`; forwarding it is
+// a 400 no client can act on. "Off" is ignored, and since thinking stays on the
+// sampling knobs Kiro rejects alongside it must still be stripped.
+test("buildKiroPayload keeps thinking on for a model that cannot disable it", () => {
+  for (const body of [
+    { messages: [{ role: "user", content: "Hi" }], reasoning_effort: "none", temperature: 0.7, top_p: 0.9, max_tokens: 200 },
+    { messages: [{ role: "user", content: "Hi" }], thinking: { type: "disabled" }, temperature: 0.7, top_p: 0.9, max_tokens: 200 },
+  ]) {
+    const result = buildKiroPayload("claude-opus-5.5", body, false, null, "adaptive_only");
+
+    assert.deepEqual(result.additionalModelRequestFields, { thinking: { type: "adaptive" } });
+    assert.deepEqual(result.inferenceConfig, { maxTokens: 200 });
+  }
+});
+
 test("buildKiroPayload leaves a model without thinking support untouched by default", () => {
   const body = { messages: [{ role: "user", content: "Hi" }] };
 

@@ -962,8 +962,11 @@ export function buildKiroPayload(model, body, stream, credentials, thinkingMode)
     // Adaptive-only Claude models (Opus 4.7/4.8, Sonnet 5, Fable 5) reject a
     // non-default temperature / top_p with a 400 while thinking is active, so
     // strip both. Drop inferenceConfig entirely if nothing else remains.
-    // Thinking that was explicitly turned off imposes no such restriction.
-    if (payload.inferenceConfig && !thinkingTurnedOff) {
+    // Thinking that was actually turned off imposes no such restriction; read it
+    // off the envelope, since models that cannot disable thinking ignore "off".
+    const thinkingActive =
+      "thinking" in envelope ? envelope.thinking.type !== "disabled" : envelope.reasoning.effort !== "none";
+    if (payload.inferenceConfig && thinkingActive) {
       delete payload.inferenceConfig.temperature;
       delete payload.inferenceConfig.topP;
       if (Object.keys(payload.inferenceConfig).length === 0) {

@@ -1,11 +1,14 @@
 /**
  * Which `additionalModelRequestFields` envelope a Kiro model accepts.
  *
- *   "adaptive" — Claude shape: `{ thinking: { type }, output_config: { effort } }`
- *   "native"   — GPT-5.6 shape: `{ reasoning: { effort } }`
- *   "none"     — the model rejects the field entirely (issue #6576: Kiro 400s
- *                `claude-sonnet-4.5` / `claude-haiku-4.5` with
- *                "additionalModelRequestFields is not supported for this model")
+ *   "adaptive"      — Claude shape: `{ thinking: { type }, output_config: { effort } }`
+ *   "adaptive_only" — Claude shape whose `thinking.type` enum has no `disabled`
+ *                     (Opus/Sonnet 5.5 preview): thinking cannot be switched off,
+ *                     so a client's "off" is ignored rather than turned into a 400
+ *   "native"        — GPT-5.6 shape: `{ reasoning: { effort } }`
+ *   "none"          — the model rejects the field entirely (issue #6576: Kiro 400s
+ *                     `claude-sonnet-4.5` / `claude-haiku-4.5` with
+ *                     "additionalModelRequestFields is not supported for this model")
  *
  * Kiro publishes this per model in `ListAvailableModels` as
  * `additionalModelRequestFieldsSchema`, so the live catalog is authoritative and
@@ -15,7 +18,7 @@
  * envelope for the whole Opus/Sonnet 4.6+ line, and hard-coding just 4.7/4.8
  * silently withheld thinking from `claude-opus-4.6` and `claude-sonnet-4.6`.
  */
-export type KiroThinkingMode = "adaptive" | "native" | "none";
+export type KiroThinkingMode = "adaptive" | "adaptive_only" | "native" | "none";
 
 const KIRO_ADAPTIVE_THINKING_MODELS: Record<string, true> = {
   "claude-opus-4.6": true,
@@ -58,7 +61,8 @@ export type KiroThinkingEnvelope = KiroNativeEnvelope | KiroAdaptiveEnvelope;
  * Envelope choice is a property of the model, never of the client protocol.
  *
  * @param effort      normalized Kiro level, or "" when the client said nothing
- * @param thinkingOff the client explicitly asked for no thinking
+ * @param thinkingOff the client explicitly asked for no thinking; ignored for
+ *                    "adaptive_only" models, which cannot turn thinking off
  */
 export function buildKiroThinkingEnvelope(
   normalizedModel: string,
@@ -71,7 +75,7 @@ export function buildKiroThinkingEnvelope(
     ? thinkingMode === "native"
     : supportsKiroNativeReasoning(normalizedModel);
   const usesAdaptive = thinkingMode
-    ? thinkingMode === "adaptive"
+    ? thinkingMode === "adaptive" || thinkingMode === "adaptive_only"
     : supportsKiroAdaptiveThinking(normalizedModel);
 
   if (usesNative) {
@@ -88,7 +92,7 @@ export function buildKiroThinkingEnvelope(
     // matter what effort was requested.
     return {
       ...(effort && effort !== "none" ? { output_config: { effort } } : {}),
-      thinking: { type: thinkingOff ? "disabled" : "adaptive" },
+      thinking: { type: thinkingOff && thinkingMode !== "adaptive_only" ? "disabled" : "adaptive" },
     };
   }
 
@@ -98,14 +102,19 @@ export function buildKiroThinkingEnvelope(
 /**
  * Read the envelope a model accepts off its catalog entry. `reasoning` and
  * `thinking` are the two top-level properties Kiro declares; a null/absent
- * schema means the model takes no envelope at all.
+ * schema means the model takes no envelope at all. A declared `thinking.type`
+ * enum without `disabled` marks a model whose thinking cannot be switched off.
  */
 export function deriveKiroThinkingMode(schema: unknown): KiroThinkingMode {
   if (!schema || typeof schema !== "object" || !("properties" in schema)) return "none";
   const properties = schema.properties;
   if (!properties || typeof properties !== "object") return "none";
   if ("reasoning" in properties) return "native";
-  if ("thinking" in properties) return "adaptive";
+  if ("thinking" in properties) {
+    const typeEnum = (properties.thinking as { properties?: { type?: { enum?: unknown } } } | null)
+      ?.properties?.type?.enum;
+    return Array.isArray(typeEnum) && !typeEnum.includes("disabled") ? "adaptive_only" : "adaptive";
+  }
   return "none";
 }
 
