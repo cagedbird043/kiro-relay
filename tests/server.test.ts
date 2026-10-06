@@ -432,6 +432,34 @@ describe("server routes", () => {
     }
   });
 
+  // Observed live on claude-opus-5.5: Kiro answers a capacity shortfall with a
+  // plain 500 whose body names MODEL_TEMPORARILY_UNAVAILABLE.
+  test("reports an upstream capacity shortfall as an overload on both protocols", async () => {
+    const upstreamBody = JSON.stringify({
+      message: "Encountered unexpectedly high load when processing the request, please try again.",
+      reason: "MODEL_TEMPORARILY_UNAVAILABLE",
+    });
+    const cases = [
+      ["/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }, undefined],
+      ["/v1/chat/completions", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }, "MODEL_TEMPORARILY_UNAVAILABLE"],
+    ] as const;
+    for (const [path, body, code] of cases) {
+      const f = await fixture();
+      try {
+        const handler = createHandler(f.config, {
+          execute: async () => ({ response: new Response(upstreamBody, { status: 500 }) }),
+          refreshCredentials: async () => null,
+        });
+        const response = await handler(request(path, body));
+        const payload = await response.json() as { error: { type: string; message: string; code?: string } };
+        expect(response.status).toBe(529);
+        expect(payload.error.type).toBe("overloaded_error");
+        expect(payload.error.message).toBe("Kiro upstream request failed (500): MODEL_TEMPORARILY_UNAVAILABLE");
+        expect(payload.error.code).toBe(code);
+      } finally { await rm(f.dir, { recursive: true, force: true }); }
+    }
+  });
+
   test("executor and translator errors become Anthropic JSON errors", async () => {
 
     const f = await fixture();

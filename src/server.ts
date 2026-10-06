@@ -60,7 +60,7 @@ const UPSTREAM_REASONS: Record<string, true> = {
   INVALID_MODEL_ID: true, PROMPT_TOO_LONG: true, REQUEST_BODY_INVALID: true, REQUEST_BODY_INVALID_JSON: true,
   THINKING_SIGNATURE_INVALID: true, TOOL_CONFIG_MISSING: true, TOOL_DUPLICATE: true, TOOL_SCHEMA_INVALID: true,
   TOOL_USE_RESULT_MISMATCH: true, CONVERSATION_LIMIT_EXCEEDED: true, MONTHLY_REQUEST_COUNT: true,
-  OVERAGE_REQUEST_LIMIT_EXCEEDED: true, INVALID_KMS_GRANT: true,
+  OVERAGE_REQUEST_LIMIT_EXCEEDED: true, INVALID_KMS_GRANT: true, MODEL_TEMPORARILY_UNAVAILABLE: true,
 };
 
 async function upstreamReason(response: Response): Promise<string | undefined> {
@@ -82,13 +82,18 @@ async function upstreamError(
   context: { requestId: string; model: string; stream: boolean },
 ): Promise<Response> {
   const upstreamStatus = response.status;
+  const code = await upstreamReason(response);
   const isRateLimited = upstreamStatus === 429;
-  const isOverloaded = upstreamStatus === 529;
-  const status = isRateLimited || isOverloaded
+  // Kiro reports a model out of capacity as a plain 500 carrying this reason;
+  // surfacing it as an overload lets clients retry instead of seeing a bare 502.
+  const isOverloaded = upstreamStatus === 529 || code === "MODEL_TEMPORARILY_UNAVAILABLE";
+  const status = isRateLimited
     ? upstreamStatus
-    : upstreamStatus >= 500
-      ? 502
-      : upstreamStatus;
+    : isOverloaded
+      ? 529
+      : upstreamStatus >= 500
+        ? 502
+        : upstreamStatus;
   const type = isRateLimited
     ? "rate_limit_error"
     : isOverloaded
@@ -101,7 +106,6 @@ async function upstreamError(
     const value = response.headers.get(name);
     if (value !== null) headers.set(name, value);
   }
-  const code = await upstreamReason(response);
   headers.set("request-id", context.requestId);
   metadataLog("REQUEST", { ...context, status: upstreamStatus, phase: "failed", category: type, code });
   const message = `Kiro upstream request failed (${upstreamStatus})${code ? `: ${code}` : ""}`;
