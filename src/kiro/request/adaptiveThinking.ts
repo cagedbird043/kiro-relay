@@ -132,6 +132,16 @@ const KIRO_UNSUPPORTED_THINKING_MESSAGE =
 const KIRO_REMOVED_AUTO_ALIAS_MESSAGE =
   "'auto-kiro' is not a real Kiro upstream model. Select a model returned by the live catalog.";
 
+/** Anthropic API id (`claude-opus-5-5`) → the dotted id Kiro routes on (`claude-opus-5.5`). */
+export function kiroModelId(model: string): string {
+  return model.replace(/^(claude-(?:opus|sonnet|haiku|3-\d+)-\d+)-(\d{1,2})$/, "$1.$2");
+}
+
+/** Kiro's dotted id → the Anthropic API id clients see (`claude-opus-5.5` → `claude-opus-5-5`). */
+export function publicModelId(model: string): string {
+  return model.replace(/^(claude-(?:opus|sonnet|haiku)-\d+)\.(\d{1,2})$/, "$1-$2");
+}
+
 export function resolveKiroModelAlias(model: unknown): { upstream: string; thinking: boolean } {
   let upstream = String(model || "");
   if (upstream.endsWith("-agentic")) throw new Error(KIRO_UNSUPPORTED_AGENTIC_MESSAGE);
@@ -139,7 +149,7 @@ export function resolveKiroModelAlias(model: unknown): { upstream: string; think
 
   const thinking = upstream.endsWith("-thinking");
   if (thinking) upstream = upstream.slice(0, -"-thinking".length);
-  upstream = upstream.replace(/^(claude-(?:opus|sonnet|haiku|3-\d+)-\d+)-(\d{1,2})$/, "$1.$2");
+  upstream = kiroModelId(upstream);
 
   if (thinking && !supportsKiroAdaptiveThinking(upstream)) {
     throw new Error(KIRO_UNSUPPORTED_THINKING_MESSAGE);

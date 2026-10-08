@@ -8,6 +8,7 @@ import {
   countAnthropicTokens,
 } from "./anthropic.ts";
 import { buildKiroPayload } from "./kiro/request/openai-to-kiro.ts";
+import { kiroModelId, publicModelId } from "./kiro/request/adaptiveThinking.ts";
 import { KiroExecutor } from "./kiro/executor.ts";
 import type { ProviderCredentials } from "./kiro/base.ts";
 import {
@@ -382,8 +383,8 @@ export function createHandler(
       // With discovery active the catalog is Kiro's own entitlement list; without
       // it the hand-listed config models are served exactly as before.
       const entries: Array<[string, { contextLength: number }]> = catalog
-        ? catalog.list().map((entry) => [entry.id, { contextLength: entry.contextLength }])
-        : Object.entries(config.models);
+        ? catalog.list().map((entry) => [publicModelId(entry.id), { contextLength: entry.contextLength }])
+        : Object.entries(config.models).map(([id, spec]) => [publicModelId(id), spec]);
       const catalogFingerprint = entries
         .map(([id, spec]) => ({ id, contextLength: spec.contextLength }))
         .sort((a, b) => a.id.localeCompare(b.id));
@@ -463,12 +464,14 @@ export function createHandler(
     }
 
     model = typeof body.model === "string" ? body.model : "";
+    // 官方 Anthropic 写法 claude-opus-5-5 与 Kiro 点号写法 claude-opus-5.5 指向同一上游模型。
+    const upstreamModel = kiroModelId(model);
     const modelContextLength = catalog
-      ? catalog.contextLengthFor(model)
-      : config.models[model]?.contextLength;
+      ? catalog.contextLengthFor(upstreamModel)
+      : config.models[upstreamModel]?.contextLength ?? config.models[publicModelId(upstreamModel)]?.contextLength;
     // Only a live catalog knows which envelope Kiro accepts for this model;
     // with discovery off the translator's static table decides as before.
-    const modelThinkingMode = catalog?.thinkingModeFor(model);
+    const modelThinkingMode = catalog?.thinkingModeFor(upstreamModel);
     if (!model || modelContextLength === undefined) {
       return requestError(`Unknown model: ${model || "(missing)"}`);
     }
@@ -515,15 +518,15 @@ export function createHandler(
     let payload: unknown;
     try {
       if (isResponses) {
-        const responsesBody = { ...body, model } satisfies KiroResponsesRequest;
+        const responsesBody = { ...body, model: upstreamModel } satisfies KiroResponsesRequest;
         buildPayload = (currentCredentials) =>
-          buildKiroResponsesPayload(model, responsesBody, stream, currentCredentials);
+          buildKiroResponsesPayload(upstreamModel, responsesBody, stream, currentCredentials);
       } else {
         // Chat Completions is already the shape the Kiro translator consumes, so
         // only the Anthropic surface needs converting first.
         const openaiBody = isChat ? body : anthropicToOpenAI(body);
         buildPayload = (currentCredentials) =>
-          buildKiroPayload(model, openaiBody, stream, currentCredentials, modelThinkingMode);
+          buildKiroPayload(upstreamModel, openaiBody, stream, currentCredentials, modelThinkingMode);
       }
       payload = buildPayload(credentials);
     } catch (error) {
@@ -531,7 +534,7 @@ export function createHandler(
     }
     // Only a live catalog may override the executor's static context table, so
     // with discovery off the usage estimate resolves exactly as it did before.
-    const execute = () => executor.execute({ model, body: payload, stream, credentials, signal: request.signal, log, contextLength: catalog ? modelContextLength : undefined });
+    const execute = () => executor.execute({ model: upstreamModel, body: payload, stream, credentials, signal: request.signal, log, contextLength: catalog ? modelContextLength : undefined });
     let result: { response: Response };
     try {
       result = await execute();

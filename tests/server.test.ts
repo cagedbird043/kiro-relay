@@ -41,6 +41,30 @@ test("刷新重试前释放旧响应且不影响新响应内容", async () => {
   } finally { await rm(f.dir, { recursive: true, force: true }); }
 });
 
+test("官方模型名优先展示且点号写法路由到同一上游模型", async () => {
+  const f = await fixture();
+  try {
+    const seen: string[] = [];
+    const handler = createHandler({ ...f.config, models: { "claude-opus-5.5": { contextLength: 1_000_000 } } }, {
+      execute: async (input) => {
+        // 载荷由本仓库的 buildKiroPayload 生成，结构已知。
+        const payload = input.body as { conversationState: { currentMessage: { userInputMessage: { modelId: string } } } };
+        seen.push(input.model, payload.conversationState.currentMessage.userInputMessage.modelId);
+        return { response: upstream() };
+      },
+      refreshCredentials: async () => null,
+    });
+    const models = await (await handler(new Request("http://relay/v1/models"))).json();
+    expect(models.data.map((m: { id: string }) => m.id)).toEqual(["claude-opus-5-5"]);
+    for (const model of ["claude-opus-5-5", "claude-opus-5.5"]) {
+      const response = await handler(request("/v1/messages", { model, messages: [{ role: "user", content: "hi" }] }));
+      expect(response.status).toBe(200);
+      expect((await response.json()).model).toBe(model);
+    }
+    expect(seen).toEqual(["claude-opus-5.5", "claude-opus-5.5", "claude-opus-5.5", "claude-opus-5.5"]);
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
 test("轮换后保存失败保留新凭据并在文件恢复后共享重试保存", async () => {
   const f = await fixture();
   const backup = join(f.dir, "old.json");
