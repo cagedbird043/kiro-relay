@@ -137,6 +137,23 @@ test("不支持的停止序列在发送上游前明确拒绝", async () => {
   } finally { await rm(f.dir, { recursive: true, force: true }); }
 });
 
+test("Chat 入口拒绝 JSON 结构化输出且放行默认文本格式", async () => {
+  const f = await fixture();
+  let calls = 0;
+  try {
+    const handler = createHandler(f.config, { execute: async () => { calls++; return { response: upstream() }; }, refreshCredentials: async () => null });
+    const body = { model: "claude-opus-5", messages: [{ role: "user", content: "起个标题" }] };
+    for (const responseFormat of [{ type: "json_object" }, { type: "json_schema", json_schema: { name: "t", schema: { type: "object" } } }]) {
+      const rejected = await handler(request("/v1/chat/completions", { ...body, response_format: responseFormat }));
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ error: { type: "invalid_request_error", message: "Unsupported response_format on this relay" } });
+    }
+    expect(calls).toBe(0);
+    await handler(request("/v1/chat/completions", { ...body, response_format: { type: "text" } }));
+    expect(calls).toBe(1);
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
 test("三个入口都在发送上游前按名称拒绝超过 5 MB 的图片", async () => {
   const f = await fixture();
   let calls = 0;

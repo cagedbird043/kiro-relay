@@ -493,6 +493,13 @@ export function createHandler(
       // request the relay has to turn down.
       const stops = body.stop === undefined || body.stop === null ? [] : Array.isArray(body.stop) ? body.stop : [body.stop];
       if (stops.length > 0) return requestError("Unsupported stop on this relay");
+      // Kiro has no constrained decoding, so a JSON response_format cannot be guaranteed.
+      // Plain `{type: "text"}` is the default and asks for nothing.
+      const responseFormat = body.response_format;
+      const formatType = responseFormat && typeof responseFormat === "object" ? (responseFormat as Record<string, unknown>).type : undefined;
+      if (responseFormat !== undefined && responseFormat !== null && formatType !== "text") {
+        return requestError("Unsupported response_format on this relay");
+      }
       const oversizedImage = chatImageSizeError(body.messages);
       if (oversizedImage) return requestError(oversizedImage);
     }
