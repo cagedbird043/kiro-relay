@@ -234,5 +234,17 @@ describe("Anthropic request validation", () => {
       ],
     }).messages).toBeDefined();
   });
+  test("超过 5 MB 的图片按 Anthropic 原文拒绝，恰好 5 MB 照常放行", () => {
+    const limit = 5 * 1024 * 1024;
+    const image = (length: number) => ({ type: "image", source: { type: "base64", media_type: "image/jpeg", data: "A".repeat(length) } });
+    expect(() => anthropicToOpenAI({ messages: [{ role: "user", content: [image(limit)] }] })).not.toThrow();
+    expect(() => anthropicToOpenAI({ messages: [
+      { role: "user", content: "先看第一张" },
+      { role: "user", content: [{ type: "text", text: "再看这张" }, image(limit + 1)] },
+    ] })).toThrow(`messages.1.content.1.image.source.base64: image exceeds 5 MB maximum: ${limit + 1} bytes > ${limit} bytes`);
+    expect(() => anthropicToOpenAI({ messages: [{ role: "user", content: [
+      { type: "tool_result", tool_use_id: "shot", content: [{ type: "text", text: "截图" }, image(limit + 1)] },
+    ] }] })).toThrow("messages.0.content.0.content.1.image.source.base64: image exceeds 5 MB maximum");
+  });
 });
 

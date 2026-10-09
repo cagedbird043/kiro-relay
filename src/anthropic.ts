@@ -2,6 +2,9 @@
 import { readKiroEvents, type KiroEvent } from "./kiro/events.ts";
 type Json = Record<string, unknown>;
 
+/** Kiro enforces Anthropic's per-image cap on the base64 payload; larger images fail upstream with a bare 400. */
+const MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024;
+
 export function anthropicToOpenAI(body: Json): Json {
   const reject = (message: string): never => { throw new Error(message); };
   const outputConfig = body.output_config;
@@ -14,7 +17,14 @@ export function anthropicToOpenAI(body: Json): Json {
     if (!Array.isArray(body.stop_sequences) || body.stop_sequences.some(value => typeof value !== "string")) reject("stop_sequences must be an array of strings");
     if ((body.stop_sequences as unknown[]).length) reject("Unsupported stop_sequences on this relay");
   }
-  const validateBlock = (block: unknown, location: string) => {
+  // Mirrors Anthropic's own rejection wording so clients run their image-shrink recovery instead of
+  // treating Kiro's reasonless 400 as a fatal request error.
+  const checkImageSize = (data: unknown, path: string) => {
+    if (typeof data === "string" && data.length > MAX_IMAGE_BASE64_BYTES) {
+      reject(`${path}: image exceeds 5 MB maximum: ${data.length} bytes > ${MAX_IMAGE_BASE64_BYTES} bytes`);
+    }
+  };
+  const validateBlock = (block: unknown, location: string, path: string) => {
     if (!block || typeof block !== "object") return;
     const b = block as Json;
     if (b.type === "document") reject(`Unsupported ${location} document content`);
@@ -24,8 +34,12 @@ export function anthropicToOpenAI(body: Json): Json {
       (b.type === "image" && source?.type === "url") ||
       (b.type === "image_url" && typeof imageUrl?.url === "string" && !imageUrl.url.startsWith("data:"));
     if (remoteImage) reject(`Unsupported ${location} remote image URL`);
+    if (b.type === "image" && source?.type === "base64") checkImageSize(source.data, `${path}.image.source.base64`);
+    if (b.type === "image_url" && typeof imageUrl?.url === "string" && imageUrl.url.startsWith("data:")) {
+      checkImageSize(imageUrl.url.slice(imageUrl.url.indexOf(",") + 1), `${path}.image_url.url`);
+    }
     if (b.type === "tool_result" && Array.isArray(b.content)) {
-      for (const item of b.content) {
+      b.content.forEach((item: unknown, index: number) => {
         if (!item || typeof item !== "object" || Array.isArray(item)) {
           reject(`Unsupported ${location} structured tool_result content`);
         }
@@ -39,18 +53,21 @@ export function anthropicToOpenAI(body: Json): Json {
         if (!validText && !validBase64Image) {
           reject(`Unsupported ${location} structured tool_result content`);
         }
-      }
+        if (validBase64Image) checkImageSize(imageSource.data, `${path}.content.${index}.image.source.base64`);
+      });
     }
   };
   if (Array.isArray(body.messages)) {
-    for (const message of body.messages) {
-      if (!message || typeof message !== "object") continue;
+    body.messages.forEach((message: unknown, messageIndex: number) => {
+      if (!message || typeof message !== "object") return;
       const content = (message as Json).content;
-      if (Array.isArray(content)) content.forEach((block) => validateBlock(block, "message"));
-    }
+      if (Array.isArray(content)) {
+        content.forEach((block, blockIndex) => validateBlock(block, "message", `messages.${messageIndex}.content.${blockIndex}`));
+      }
+    });
   }
   if (Array.isArray(body.system)) {
-    for (const block of body.system) validateBlock(block, "system");
+    body.system.forEach((block, index) => validateBlock(block, "system", `system.${index}`));
   }
   const { system, ...out }: Json = body;
   if (Array.isArray(body.messages)) out.messages = body.messages.map((message) => {
