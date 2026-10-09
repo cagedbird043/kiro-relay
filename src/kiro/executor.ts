@@ -351,15 +351,11 @@ export class KiroExecutor extends BaseExecutor {
     // can split that inline reasoning into the OpenAI `delta.reasoning_content`
     // channel.
     const tb = transformedBody as Record<string, unknown>;
-    const userContent =
-      ((
-        (
-          (tb?.conversationState as Record<string, unknown>)?.currentMessage as Record<
-            string,
-            unknown
-          >
-        )?.userInputMessage as Record<string, unknown>
-      )?.content as string) || "";
+    const userInputMessage = (
+      (tb?.conversationState as Record<string, unknown>)?.currentMessage as Record<string, unknown>
+    )?.userInputMessage as Record<string, unknown>;
+    const userContent = (userInputMessage?.content as string) || "";
+    const declaredTools = (userInputMessage?.userInputMessageContext as Record<string, unknown>)?.tools;
     const thinkingExpected = userContent.includes("<thinking_mode>enabled</thinking_mode>");
     const rawToolNameMap =
       body && typeof body === "object" && "_toolNameMap" in body ? body._toolNameMap : undefined;
@@ -370,10 +366,17 @@ export class KiroExecutor extends BaseExecutor {
           )
         : []
     );
+    // A client tool that happens to be named `tool_call` (e.g. Hermes' deferred-tool
+    // dispatcher) owns its own schema; only an undeclared `tool_call` is Kiro's wrapper.
+    const clientDeclaresToolCall = Array.isArray(declaredTools) && declaredTools.some((tool) => {
+      const kiroName = (tool as Record<string, Record<string, unknown>>)?.toolSpecification?.name;
+      return typeof kiroName === "string" && (toolNameMap.get(kiroName) || kiroName) === KIRO_TOOL_CALL_WRAPPER;
+    });
     const transformedResponse = this.transformEventStreamToSSE(response, model, {
       thinkingExpected,
       toolNameMap,
       contextLength,
+      clientDeclaresToolCall,
     });
 
     return { response: transformedResponse, url, headers, transformedBody };
@@ -395,6 +398,8 @@ export class KiroExecutor extends BaseExecutor {
    * @param opts.contextLength  Context window from Kiro's live catalog, used to
    *   scale the synthesized usage estimate. Omitted -> the static
    *   MODEL_CONTEXT_LENGTHS table decides and fails closed on unknown ids.
+   * @param opts.clientDeclaresToolCall  The request declared its own `tool_call` tool, so
+   *   upstream calls to it are ordinary tool calls rather than Kiro's nested MCP wrapper.
    */
   transformEventStreamToSSE(
     response: Response,
@@ -403,6 +408,7 @@ export class KiroExecutor extends BaseExecutor {
       thinkingExpected?: boolean;
       toolNameMap?: Map<string, string>;
       contextLength?: number | null;
+      clientDeclaresToolCall?: boolean;
     } = {}
   ) {
     const thinkingExpected = !!opts.thinkingExpected;
@@ -774,7 +780,7 @@ export class KiroExecutor extends BaseExecutor {
                 const toolCallId = getToolCallId(singleToolUse);
                 const toolInput = singleToolUse.input;
 
-                if (toolName === KIRO_TOOL_CALL_WRAPPER) {
+                if (toolName === KIRO_TOOL_CALL_WRAPPER && !opts.clientDeclaresToolCall) {
                   let pending = state.pendingWrapperToolCalls.get(toolCallId);
                   if (!pending) {
                     if (state.seenToolIds.has(toolCallId)) {

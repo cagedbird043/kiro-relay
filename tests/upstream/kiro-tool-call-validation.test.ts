@@ -269,3 +269,31 @@ test("Kiro stream errors become Responses response.failed events", async () => {
   assert.match(text, /missing nested MCP tool name/);
   assert.doesNotMatch(text, /response\.output_item\.added/);
 });
+
+test("客户端自己声明的 tool_call 工具按普通工具透传，不套用 MCP 包装校验", async () => {
+  const original = globalThis.fetch;
+  const calls = { calls: [{ name: "image_generate", arguments: { prompt: "胡同里的橘猫" } }] };
+  globalThis.fetch = (async () => buildEventStreamResponse([
+    encodeEventFrame("toolUseEvent", { toolUseId: "call_1", name: "tool_call", input: calls }),
+    encodeEventFrame("messageStopEvent", {}),
+  ])) as unknown as typeof fetch;
+  try {
+    const result = await new KiroExecutor().execute({
+      model: "claude-opus-5",
+      body: { conversationState: { currentMessage: { userInputMessage: {
+        content: "画一张",
+        userInputMessageContext: { tools: [{ toolSpecification: { name: "tool_call", description: "Invoke deferred tools", inputSchema: { json: { type: "object" } } } }] },
+      } } } },
+      stream: true,
+      credentials: { accessToken: "fake" },
+    });
+    const text = await result.response.text();
+    assert.doesNotMatch(text, /invalid_kiro_tool_call/);
+    const deltas = toolDeltas(text);
+    assert.equal((deltas[0].function as Record<string, unknown>).name, "tool_call");
+    const args = deltas.map((delta) => (delta.function as Record<string, unknown>).arguments ?? "").join("");
+    assert.deepEqual(JSON.parse(args), calls);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
