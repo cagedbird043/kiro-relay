@@ -1,9 +1,7 @@
 /* Anthropic <-> Kiro wire adapters. */
+import { imageSizeViolation } from "./imageLimit.ts";
 import { readKiroEvents, type KiroEvent } from "./kiro/events.ts";
 type Json = Record<string, unknown>;
-
-/** Kiro enforces Anthropic's per-image cap on the base64 payload; larger images fail upstream with a bare 400. */
-const MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024;
 
 export function anthropicToOpenAI(body: Json): Json {
   const reject = (message: string): never => { throw new Error(message); };
@@ -20,9 +18,8 @@ export function anthropicToOpenAI(body: Json): Json {
   // Mirrors Anthropic's own rejection wording so clients run their image-shrink recovery instead of
   // treating Kiro's reasonless 400 as a fatal request error.
   const checkImageSize = (data: unknown, path: string) => {
-    if (typeof data === "string" && data.length > MAX_IMAGE_BASE64_BYTES) {
-      reject(`${path}: image exceeds 5 MB maximum: ${data.length} bytes > ${MAX_IMAGE_BASE64_BYTES} bytes`);
-    }
+    const violation = typeof data === "string" ? imageSizeViolation(data) : undefined;
+    if (violation) reject(`${path}: ${violation}`);
   };
   const validateBlock = (block: unknown, location: string, path: string) => {
     if (!block || typeof block !== "object") return;

@@ -7,6 +7,7 @@ import {
   collectAnthropicResponse,
   countAnthropicTokens,
 } from "./anthropic.ts";
+import { chatImageSizeError } from "./imageLimit.ts";
 import { buildKiroPayload } from "./kiro/request/openai-to-kiro.ts";
 import { kiroModelId, publicModelId } from "./kiro/request/adaptiveThinking.ts";
 import { KiroExecutor } from "./kiro/executor.ts";
@@ -492,6 +493,8 @@ export function createHandler(
       // request the relay has to turn down.
       const stops = body.stop === undefined || body.stop === null ? [] : Array.isArray(body.stop) ? body.stop : [body.stop];
       if (stops.length > 0) return requestError("Unsupported stop on this relay");
+      const oversizedImage = chatImageSizeError(body.messages);
+      if (oversizedImage) return requestError(oversizedImage);
     }
 
     let credentials: ProviderCredentials;

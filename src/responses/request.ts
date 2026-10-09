@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
 import type { ResponseCreateParamsBase } from "openai/resources/responses/responses";
+import { imageSizeViolation } from "../imageLimit.ts";
 import { remapKiroToolHistory, sanitizeKiroTools } from "../kiro/sanitizer.ts";
 import type { ProviderCredentials } from "../kiro/base.ts";
 import { getKiroModelCapabilities } from "../kiro/modelCapabilities.ts";
@@ -132,23 +133,25 @@ function reasoningHistoryItem(item: Obj, model: string): KiroReasoningContent | 
   return text ? { reasoningText: { text } } : undefined;
 }
 
-function imageOf(value: unknown): { format: string; bytes: string } {
+function imageOf(value: unknown, path: string): { format: string; bytes: string } {
   if (!isObj(value) || value.type !== "input_image" || typeof value.image_url !== "string") throw new Error("input_image requires image_url");
   const m = /^data:image\/(png|jpe?g|gif|webp);base64,([A-Za-z0-9+/]+={0,2})$/i.exec(value.image_url);
   if (!m) throw new Error("input_image requires a base64 data URL");
+  const violation = imageSizeViolation(m[2]);
+  if (violation) throw new Error(`Invalid '${path}.image_url': ${violation}`);
   return { format: m[1].toLowerCase() === "jpg" ? "jpeg" : m[1].toLowerCase(), bytes: m[2] };
 }
-function contentParts(value: unknown): { text: string; images: Array<{ format: string; bytes: string }> } {
+function contentParts(value: unknown, path: string): { text: string; images: Array<{ format: string; bytes: string }> } {
   if (typeof value === "string") return { text: value, images: [] };
   if (!Array.isArray(value)) throw new Error("message content must be a string or array");
   const text: string[] = []; const images: Array<{ format: string; bytes: string }> = [];
-  for (const part of value) {
+  for (const [index, part] of value.entries()) {
     if (!isObj(part)) throw new Error("message content parts must be objects");
     if (part.type === "input_text" || part.type === "output_text") {
       if (typeof part.text !== "string") throw new Error("Text content must be a string");
       text.push(part.text);
     }
-    else if (part.type === "input_image") images.push(imageOf(part));
+    else if (part.type === "input_image") images.push(imageOf(part, `${path}[${index}]`));
     else throw new Error(`Unsupported content part type: ${String(part.type)}`);
   }
   return { text: text.join(""), images };
@@ -325,7 +328,7 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
     }
     if (type !== "message") throw new Error(`Unsupported input item type: ${String(type)}`);
     if (item.role !== "user" && item.role !== "assistant" && item.role !== "system" && item.role !== "developer") throw new Error("message role is invalid");
-    const parts = contentParts(item.content);
+    const parts = contentParts(item.content, `input[${i}].content`);
     if (item.role === "system" || item.role === "developer") { instructionTexts.push(parts.text); continue; }
     if (item.role === "assistant") { appendAssistantHistory(history, parts.text); continue; }
     const previous = history.at(-1)?.userInputMessage;

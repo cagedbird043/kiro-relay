@@ -137,6 +137,32 @@ test("不支持的停止序列在发送上游前明确拒绝", async () => {
   } finally { await rm(f.dir, { recursive: true, force: true }); }
 });
 
+test("三个入口都在发送上游前按名称拒绝超过 5 MB 的图片", async () => {
+  const f = await fixture();
+  let calls = 0;
+  try {
+    const handler = createHandler(f.config, { execute: async () => { calls++; return { response: upstream() }; }, refreshCredentials: async () => null });
+    const limit = 5 * 1024 * 1024;
+    const bodies = (length: number) => {
+      const data = "A".repeat(length);
+      const url = `data:image/jpeg;base64,${data}`;
+      return [
+        ["/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/jpeg", data } }, { type: "text", text: "看图" }] }] }, "messages.0.content.0.image.source.base64: image exceeds 5 MB maximum"],
+        ["/v1/chat/completions", { model: "claude-opus-5", messages: [{ role: "user", content: [{ type: "text", text: "看图" }, { type: "image_url", image_url: { url } }] }] }, "Invalid 'messages[0].content[1].image_url': image exceeds 5 MB maximum"],
+        ["/v1/responses", { model: "gpt-5.6-sol", input: [{ role: "user", content: [{ type: "input_text", text: "看图" }, { type: "input_image", image_url: url }] }] }, "Invalid 'input[0].content[1].image_url': image exceeds 5 MB maximum"],
+      ] as const;
+    };
+    for (const [path, body, message] of bodies(limit + 4)) {
+      const rejected = await handler(request(path, body));
+      expect(rejected.status).toBe(400);
+      expect(await rejected.text()).toContain(message);
+    }
+    expect(calls).toBe(0);
+    for (const [path, body] of bodies(limit)) await handler(request(path, body));
+    expect(calls).toBe(3);
+  } finally { await rm(f.dir, { recursive: true, force: true }); }
+});
+
 describe("server routes", () => {
   test("health, models, and token count routes", async () => {
     const f = await fixture();
