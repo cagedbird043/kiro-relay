@@ -307,13 +307,25 @@ test("maps namespaced and custom forced tool choices", () => {
   assert.throws(() => buildKiroResponsesPayload(model, req({ tools, tool_choice: { type: "function", name: "missing" } }), false, {}), /undeclared tool/);
 });
 
-test("accepts structured text tool outputs and rejects media", () => {
+test("工具结果中的文本进 toolResult，图片随该批结果的用户回合原样送达", () => {
   const base = { type: "function_call_output", call_id: "call_1" };
   for (const output of ["ok", [{ type: "input_text", text: "o" }, { type: "input_text", text: "k" }]]) {
     const payload = buildKiroResponsesPayload(model, req({ input: [{ ...base, output }] }), false, {});
     assert.deepEqual(payload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults?.[0], { toolUseId: "call_1", status: "success", content: [{ text: "ok" }] });
   }
-  assert.throws(() => buildKiroResponsesPayload(model, req({ input: [{ ...base, output: [{ type: "input_image", image_url: "data:image/png;base64,AA==" }] }] }), false, {}), /text content parts/);
+  const withImages = buildKiroResponsesPayload(model, req({ input: [
+    { role: "user", content: "看图" },
+    { type: "function_call", call_id: "call_1", name: "read", arguments: '{"path":"a.webp"}' },
+    { type: "function_call", call_id: "call_2", name: "read", arguments: '{"path":"b.png"}' },
+    { ...base, output: [{ type: "input_text", text: "Read image a.webp" }, { type: "input_image", image_url: "data:image/webp;base64,UklGRg==", detail: "auto" }] },
+    { type: "function_call_output", call_id: "call_2", output: [{ type: "input_image", image_url: "data:image/png;base64,iVBORw==" }] },
+  ] }), false, {}).conversationState.currentMessage.userInputMessage;
+  assert.deepEqual(withImages.userInputMessageContext?.toolResults, [
+    { toolUseId: "call_1", status: "success", content: [{ text: "Read image a.webp\n[image: image/webp]" }] },
+    { toolUseId: "call_2", status: "success", content: [{ text: "[image: image/png]" }] },
+  ]);
+  assert.deepEqual(withImages.images, [{ format: "webp", source: { bytes: "UklGRg==" } }, { format: "png", source: { bytes: "iVBORw==" } }]);
+  assert.throws(() => buildKiroResponsesPayload(model, req({ input: [{ ...base, output: [{ type: "input_file", file_id: "f" }] }] }), false, {}), /input_text or input_image/);
 });
 
 test("carries include encrypted content as internal metadata", () => {

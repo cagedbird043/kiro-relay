@@ -162,19 +162,26 @@ function functionInput(value: unknown): Obj {
   if (!isObj(parsed)) throw new Error("function_call arguments must be a JSON object");
   return parsed;
 }
-function outputText(value: unknown): string {
-  if (typeof value === "string") return value;
+/**
+ * 工具结果的文本进 toolResult；图片与 Anthropic 入口一致，挂到承载这批
+ * toolResults 的 user 回合 images 上，并在文本中留下 `[image: …]` 占位。
+ */
+function toolOutput(value: unknown, path: string): InputParts {
+  if (typeof value === "string") return { text: value, images: [] };
   if (Array.isArray(value)) {
     const text: string[] = [];
-    for (const part of value) {
-      if (!isObj(part) || part.type !== "input_text" || typeof part.text !== "string") {
-        throw new Error("function_call_output output must contain text content parts");
-      }
-      text.push(part.text);
+    const images: InputParts["images"] = [];
+    for (const [index, part] of value.entries()) {
+      if (isObj(part) && part.type === "input_text" && typeof part.text === "string") text.push(part.text);
+      else if (isObj(part) && part.type === "input_image") {
+        const image = imageOf(part, `${path}[${index}]`);
+        images.push(image);
+        text.push(`${text.length ? "\n" : ""}[image: image/${image.format}]`);
+      } else throw new Error("function_call_output output must contain input_text or input_image parts");
     }
-    return text.join("");
+    return { text: text.join(""), images };
   }
-  if (isObj(value) && typeof value.text === "string") return value.text;
+  if (isObj(value) && typeof value.text === "string") return { text: value.text, images: [] };
   throw new Error("function_call_output output must be text or content parts");
 }
 
@@ -318,7 +325,9 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
         history.push(turn);
         user = turn.userInputMessage!;
       }
-      (user.userInputMessageContext ??= { toolResults: [] }).toolResults.push({ toolUseId: item.call_id, status: "success", content: [{ text: outputText(item.output) }] });
+      const output = toolOutput(item.output, `input[${i}].output`);
+      (user.userInputMessageContext ??= { toolResults: [] }).toolResults.push({ toolUseId: item.call_id, status: "success", content: [{ text: output.text }] });
+      if (output.images.length) (user.images ??= []).push(...output.images.map(image => ({ format: image.format, source: { bytes: image.bytes } })));
       continue;
     }
     if (type === "function_call" || type === "custom_tool_call") {
