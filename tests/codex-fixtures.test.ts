@@ -108,8 +108,10 @@ test("Codex custom tool output fixture becomes a Kiro tool result", async () => 
   const output = await fixture("custom-tool-output.json");
   const input = requestFixture.input;
   if (!Array.isArray(input)) throw new Error("Fixture input must be an array");
+  if (typeof requestFixture.model !== "string") throw new Error("Fixture model must be a string");
   const body = {
     ...requestFixture,
+    model: requestFixture.model,
     stream: false,
     input: [...input, call, output],
   } satisfies KiroResponsesRequest;

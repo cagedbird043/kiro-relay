@@ -7,8 +7,12 @@ import { getKiroModelCapabilities } from "../kiro/modelCapabilities.ts";
 import { decodeReasoning, mergeKiroReasoning, type KiroReasoningContent } from "../kiro/reasoning.ts";
 import { buildKiroThinkingEnvelope } from "../kiro/request/adaptiveThinking.ts";
 
-/** Responses request accepted by the native Kiro adapter. */
-export type KiroResponsesRequest = Partial<ResponseCreateParamsBase> & Record<string, unknown> & {
+/**
+ * Responses request accepted by the native Kiro adapter. `input` 由
+ * {@link buildKiroResponsesPayload} 逐项校验，客户端回放的输出项（无 id 的
+ * reasoning、output_text 消息等）比 SDK 的输入类型宽，因此不继承 SDK 的 input。
+ */
+export type KiroResponsesRequest = Omit<Partial<ResponseCreateParamsBase>, "input"> & Record<string, unknown> & {
   model: string;
   input?: unknown;
   instructions?: string | null;
@@ -20,7 +24,7 @@ export type KiroResponsesRequest = Partial<ResponseCreateParamsBase> & Record<st
 };
 
 export type KiroResponsesPayload = {
-  conversationState: { chatTriggerType: "MANUAL"; conversationId: string; currentMessage: { userInputMessage: { content: string; modelId: string; origin: "AI_EDITOR"; images?: Array<{ format: string; source: { bytes: string } }>; userInputMessageContext?: { tools?: unknown[]; toolResults?: unknown[]; toolChoice?: unknown } } }; history: KiroHistoryItem[] };
+  conversationState: { chatTriggerType: "MANUAL"; conversationId: string; currentMessage: { userInputMessage: { content: string; modelId: string; origin: "AI_EDITOR"; images?: Array<{ format: string; source: { bytes: string } }>; userInputMessageContext?: { tools?: unknown[]; toolResults?: KiroToolResult[]; toolChoice?: unknown } } }; history: KiroHistoryItem[] };
   profileArn?: string;
   inferenceConfig?: { maxTokens?: number };
   additionalModelRequestFields?: { reasoning: { effort: string; summary?: string } };
@@ -352,7 +356,7 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   if (lastUser) history.pop();
   const current: InputParts = { text: lastUser?.content ?? "", images: lastUser?.images?.map(image => ({ format: image.format, bytes: image.source.bytes })) ?? [] };
   const instruction = instructionTexts.length ? instructionTexts.map((text) => `<system-reminder>\n${text}\n</system-reminder>`).join("\n\n") + "\n\n" : "";
-  const context: { tools?: unknown[]; toolResults?: unknown[]; toolChoice?: unknown } = {};
+  const context: { tools?: unknown[]; toolResults?: KiroToolResult[]; toolChoice?: unknown } = {};
   if (lastUser?.userInputMessageContext) context.toolResults = lastUser.userInputMessageContext.toolResults;
   const declaredTools: unknown[] = [];
   if (body.tools !== undefined && body.tools !== null) {

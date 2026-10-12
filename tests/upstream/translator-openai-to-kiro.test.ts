@@ -1116,7 +1116,7 @@ test("buildKiroPayload uses native Max reasoning for Kiro GPT-5.6 models", () =>
     assert.equal(result.additionalModelRequestFields.reasoning.effort, "max");
     assert.equal(result.additionalModelRequestFields.output_config, undefined);
     assert.equal(result.additionalModelRequestFields.thinking, undefined);
-    assert.equal(result.additionalModelRequestFields.max_tokens, undefined);
+    assert.equal("max_tokens" in result.additionalModelRequestFields, false);
     assert.doesNotMatch(
       result.conversationState.currentMessage.userInputMessage.content,
       /<thinking_mode>/

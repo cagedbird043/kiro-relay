@@ -32,6 +32,7 @@ import {
   KIRO_EXTERNAL_IDP_TOKEN_TYPE_HEADER,
   KIRO_EXTERNAL_IDP_TOKEN_TYPE_VALUE,
 } from "./externalIdp.ts";
+import type { FetchFn } from "./base.ts";
 import { resolveKiroRuntimeRegion } from "./region.ts";
 import {
   deriveKiroThinkingMode,
@@ -253,7 +254,7 @@ export type FetchKiroModelsOptions = {
   /** Connection providerSpecificData (region, profileArn). */
   providerSpecificData?: unknown;
   /** Injectable fetch (defaults to global fetch). */
-  fetchImpl?: typeof fetch;
+  fetchImpl?: FetchFn;
   /** Static catalog to fall back to when live discovery is unavailable. */
   fallbackModels?: Array<{ id: string; name?: string }>;
 };
@@ -322,7 +323,7 @@ function cacheKey(accessToken: string, providerSpecificData: unknown): string {
 }
 
 async function tryFetchModels(
-  fetchImpl: typeof fetch,
+  fetchImpl: FetchFn,
   url: string,
   accessToken: string,
   providerSpecificData: unknown

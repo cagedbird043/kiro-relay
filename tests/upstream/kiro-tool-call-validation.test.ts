@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { KiroExecutor } from "../../src/kiro/executor.ts";
+import { withFetch } from "../fetch-stub.ts";
 
 function createKiroErrorTransform(): TransformStream<Uint8Array, Uint8Array> {
   let buffered = "";
@@ -271,13 +272,11 @@ test("Kiro stream errors become Responses response.failed events", async () => {
 });
 
 test("客户端自己声明的 tool_call 工具按普通工具透传，不套用 MCP 包装校验", async () => {
-  const original = globalThis.fetch;
   const calls = { calls: [{ name: "image_generate", arguments: { prompt: "胡同里的橘猫" } }] };
-  globalThis.fetch = (async () => buildEventStreamResponse([
+  await withFetch(async () => buildEventStreamResponse([
     encodeEventFrame("toolUseEvent", { toolUseId: "call_1", name: "tool_call", input: calls }),
     encodeEventFrame("messageStopEvent", {}),
-  ])) as unknown as typeof fetch;
-  try {
+  ]), async () => {
     const result = await new KiroExecutor().execute({
       model: "claude-opus-5",
       body: { conversationState: { currentMessage: { userInputMessage: {
@@ -293,7 +292,5 @@ test("客户端自己声明的 tool_call 工具按普通工具透传，不套用
     assert.equal((deltas[0].function as Record<string, unknown>).name, "tool_call");
     const args = deltas.map((delta) => (delta.function as Record<string, unknown>).arguments ?? "").join("");
     assert.deepEqual(JSON.parse(args), calls);
-  } finally {
-    globalThis.fetch = original;
-  }
+  });
 });

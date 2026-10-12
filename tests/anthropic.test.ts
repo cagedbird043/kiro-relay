@@ -21,7 +21,7 @@ test("长工具名在历史和本轮强制选择中匹配声明且保持结果�
   const context = payload.conversationState.currentMessage.userInputMessage.userInputMessageContext;
   const declared = context.tools[0].toolSpecification.name;
   expect(declared.length).toBeLessThanOrEqual(64);
-  expect(context.toolChoice.tool.name).toBe(declared);
+  expect(context.toolChoice).toEqual({ tool: { name: declared } });
   const call = payload.conversationState.history[1].assistantResponseMessage.toolUses[0];
   expect(call.name).toBe(declared);
   expect(context.toolResults[0].toolUseId).toBe(call.toolUseId);

@@ -1,4 +1,5 @@
 import test from "node:test";
+import { expect } from "bun:test";
 import assert from "node:assert/strict";
 import { buildKiroResponsesPayload } from "../src/responses/request.ts";
 import { encodeReasoning } from "../src/kiro/reasoning.ts";

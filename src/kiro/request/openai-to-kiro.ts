@@ -11,10 +11,37 @@ import {
 import {
   buildKiroThinkingEnvelope,
   resolveKiroModelAlias,
+  type KiroAdaptiveEnvelope,
+  type KiroNativeEnvelope,
+  type KiroThinkingMode,
 } from "./adaptiveThinking.ts";
+import type { ProviderCredentials } from "../base.ts";
 import { supportsKiroImages } from "../modelCapabilities.ts";
 import { remapKiroToolHistory, sanitizeKiroTools } from "../sanitizer.ts";
 import { mergeKiroReasoning, type KiroReasoningContent } from "../reasoning.ts";
+
+/** 用户回合附带的工具声明、工具结果与强制工具选择。 */
+export type KiroUserInputMessageContext = {
+  toolResults?: Array<{ toolUseId: string; status: string; content: Array<{ text: string }> }>;
+  tools?: Array<{ toolSpecification: { name: string; description: string; inputSchema: { json: unknown } } }>;
+  toolChoice?: { auto: object } | { any: object } | { none: object } | { tool: { name: string } };
+};
+
+/** 原生历史中的一项：用户回合或助手回合。 */
+export type KiroHistoryItem = {
+  userInputMessage?: {
+    content: string;
+    modelId: string;
+    origin: string;
+    images?: Array<{ format: string; source: { bytes: string } }>;
+    userInputMessageContext?: KiroUserInputMessageContext;
+  };
+  assistantResponseMessage?: {
+    content: string;
+    reasoningContent?: KiroReasoningContent;
+    toolUses?: Array<{ toolUseId: string; name: string; input: unknown }>;
+  };
+};
 
 /**
  * Anthropic's direct-provider `[1m]` context-1m beta suffix. Kiro is AWS
@@ -814,7 +841,14 @@ function effortFromBudget(budget: number): string {
  * Omitted -> the static table decides, which is what discovery-disabled
  * deployments and the offline fallback path get.
  */
-export function buildKiroPayload(model, body, stream, credentials, thinkingMode) {
+export function buildKiroPayload(
+  model: string,
+  // OpenAI Chat 形状的请求体，翻译器按字段动态读取，入口已校验结构。
+  body: Record<string, any>,
+  stream: boolean,
+  credentials: ProviderCredentials | null,
+  thinkingMode?: KiroThinkingMode,
+) {
   // Reject the Anthropic-only `[1m]` context beta before it reaches Bedrock —
   // Kiro cannot honor it and a forwarded `kr/*[1m]` id is malformed upstream.
   if (hasUnsupportedKiroContextSuffix(model)) {
@@ -886,7 +920,8 @@ export function buildKiroPayload(model, body, stream, credentials, thinkingMode)
     normalizedModel
   );
 
-  const profileArn = credentials?.providerSpecificData?.profileArn || "";
+  const rawProfileArn = credentials?.providerSpecificData?.profileArn;
+  const profileArn = typeof rawProfileArn === "string" ? rawProfileArn : "";
 
   let finalContent = currentMessage?.userInputMessage?.content || "";
 
@@ -908,10 +943,10 @@ export function buildKiroPayload(model, body, stream, credentials, thinkingMode)
           modelId: string;
           origin: string;
           images?: Array<{ format: string; source: { bytes: string } }>;
-          userInputMessageContext?: Record<string, unknown>;
+          userInputMessageContext?: KiroUserInputMessageContext;
         };
       };
-      history: unknown[];
+      history: KiroHistoryItem[];
     };
     profileArn?: string;
     inferenceConfig?: {
@@ -920,9 +955,9 @@ export function buildKiroPayload(model, body, stream, credentials, thinkingMode)
       topP?: number;
     };
     additionalModelRequestFields?: {
-      reasoning?: { effort: string };
-      thinking?: { type: string };
-      output_config?: { effort: string };
+      reasoning?: KiroNativeEnvelope["reasoning"];
+      thinking?: KiroAdaptiveEnvelope["thinking"];
+      output_config?: KiroAdaptiveEnvelope["output_config"];
     };
   } = {
     conversationState: {

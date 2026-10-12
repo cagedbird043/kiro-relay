@@ -28,6 +28,8 @@
  *     discovered ARN's region then drives every runtime call.
  */
 
+import type { FetchFn } from "./base.ts";
+
 // Canonical AWS region shape — kept local (identical to AWS_REGION_PATTERN in
 // src/lib/oauth/constants/oauth.ts) so this open-sse module has no cross-tree import just to
 // validate a string. Guards against SSRF via region injection (GHSA-6mwv-4mrm-5p3m): the value
@@ -121,7 +123,7 @@ export function buildKiroProfileDiscoveryRegions(storedRegion?: string | null): 
 async function listKiroProfileArnForRegion(
   accessToken: string,
   region: string,
-  fetchImpl: typeof fetch
+  fetchImpl: FetchFn
 ): Promise<string | undefined> {
   // Defensive: region comes from a hardcoded allowlist here, but validate before it is
   // interpolated into the runtime host (SSRF guard, GHSA-6mwv-4mrm-5p3m).
@@ -168,7 +170,7 @@ async function listKiroProfileArnForRegion(
 export async function discoverKiroProfileArnAcrossRegions(
   accessToken: string | null | undefined,
   storedRegion?: string | null,
-  fetchImpl?: typeof fetch
+  fetchImpl?: FetchFn
 ): Promise<string | undefined> {
   const token = typeof accessToken === "string" ? accessToken.trim() : "";
   if (!token) return undefined;

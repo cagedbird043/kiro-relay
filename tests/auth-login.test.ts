@@ -35,12 +35,12 @@ describe("Kiro 设备登录", () => {
       json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:222:profile/MINE" }] }),
     ];
     const dependencies: DeviceLoginDependencies = {
-      fetch: (async (input, init) => {
+      fetch: async (input, init) => {
         calls.push({ url: String(input), body: JSON.parse(String(init?.body)) as Record<string, unknown> });
         const response = responses.shift();
         if (!response) throw new Error("unexpected fetch");
         return response;
-      }) as typeof fetch,
+      },
       sleep: async (milliseconds) => {
         waits.push(milliseconds);
         now += milliseconds;
@@ -91,11 +91,11 @@ describe("Kiro 设备登录", () => {
       json({ __type: "AccessDeniedException" }, 400),
     ];
     const dependencies: DeviceLoginDependencies = {
-      fetch: (async () => {
+      fetch: async () => {
         const response = responses.shift();
         if (!response) throw new Error("unexpected fetch");
         return response;
-      }) as typeof fetch,
+      },
       sleep: async () => undefined,
       now: () => 1_000_000,
       output: () => undefined,
@@ -114,12 +114,12 @@ describe("Kiro 设备登录", () => {
       json({ deviceCode: "device", userCode: "CODE", verificationUri: "https://verify", expiresIn: 2, interval: 2 }),
     ];
     const dependencies: DeviceLoginDependencies = {
-      fetch: (async () => {
+      fetch: async () => {
         const response = responses.shift();
         if (response) return response;
         tokenPolls += 1;
         return json({ __type: "AuthorizationPendingException" }, 400);
-      }) as typeof fetch,
+      },
       sleep: async (milliseconds) => {
         now += milliseconds;
       },
@@ -152,14 +152,14 @@ describe("Kiro 设备登录", () => {
         json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:222:profile/MINE" }] }),
       ];
       const dependencies: DeviceLoginDependencies = {
-        fetch: (async (input, init) => {
+        fetch: async (input, init) => {
           if (String(input).endsWith("/client/register")) {
             issuers.push(JSON.parse(String(init?.body)).issuerUrl);
           }
           const response = responses.shift();
           if (!response) throw new Error("unexpected fetch");
           return response;
-        }) as typeof fetch,
+        },
         sleep: async () => undefined,
         now: () => 1_000_000,
         output: () => undefined,
@@ -179,13 +179,13 @@ describe("Kiro 设备登录", () => {
     ];
     const bodies: Array<Record<string, unknown>> = [];
     const dependencies: DeviceLoginDependencies = {
-      fetch: (async (input, init) => {
+      fetch: async (input, init) => {
         paths.push(new URL(String(input)).pathname);
         bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
         const response = responses.shift();
         if (!response) throw new Error("unexpected fetch");
         return response;
-      }) as typeof fetch,
+      },
       sleep: async () => undefined,
       now: () => 1_000_000,
       output: () => undefined,
@@ -211,9 +211,9 @@ describe("Kiro 设备登录", () => {
 
   test("clientId 与 clientSecret 必须成对提供", async () => {
     const dependencies: DeviceLoginDependencies = {
-      fetch: (async () => {
+      fetch: async () => {
         throw new Error("must not reach the network");
-      }) as typeof fetch,
+      },
       sleep: async () => undefined,
       now: () => 1_000_000,
       output: () => undefined,
@@ -240,12 +240,12 @@ describe("Kiro 设备登录", () => {
       json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:222:profile/MINE" }] }),
     ];
     const dependencies: DeviceLoginDependencies = {
-      fetch: (async (input, init) => {
+      fetch: async (input, init) => {
         calls.push({ url: String(input), body: JSON.parse(String(init?.body)) as Record<string, unknown> });
         const response = responses.shift();
         if (!response) throw new Error("unexpected fetch");
         return response;
-      }) as typeof fetch,
+      },
       sleep: async () => undefined,
       now: () => 1_000_000,
       output: () => undefined,
@@ -280,13 +280,13 @@ describe("Kiro 设备登录", () => {
       json({ profiles: [] }),
     ];
     const dependencies: DeviceLoginDependencies = {
-      fetch: (async (input) => {
+      fetch: async (input) => {
         const url = String(input);
         if (url.endsWith("amazonaws.com/")) probed.push(url);
         const response = responses.shift();
         if (!response) throw new Error("unexpected fetch");
         return response;
-      }) as typeof fetch,
+      },
       sleep: async () => undefined,
       now: () => 1_000_000,
       output: () => undefined,

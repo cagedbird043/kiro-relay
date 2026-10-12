@@ -8,15 +8,16 @@ function replayed(item: unknown, model: string): unknown {
 }
 
 const upstream = (chunks: unknown[]) => new Response(chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join(""));
-const itemId = (event: { item?: unknown }) => {
+type StreamEvent = { type: string; [key: string]: unknown };
+const itemId = (event: StreamEvent) => {
   if (!event.item || typeof event.item !== "object" || !("id" in event.item) || typeof event.item.id !== "string") throw new Error("missing item id");
   return event.item.id;
 };
-const itemFields = (event: { item?: unknown }): { id: string; call_id: string } => {
+const itemFields = (event: StreamEvent): { id: string; call_id: string } => {
   if (!event.item || typeof event.item !== "object" || !("id" in event.item) || !("call_id" in event.item) || typeof event.item.id !== "string" || typeof event.item.call_id !== "string") throw new Error("missing function item fields");
   return { id: event.item.id, call_id: event.item.call_id };
 };
-const events = async (r: Response) => (await r.text()).trim().split("\n\n").map((frame) => frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6)).filter((data): data is string => !!data && data !== "[DONE]").map((data) => JSON.parse(data) as { type: string; [key: string]: unknown });
+const events = async (r: Response) => (await r.text()).trim().split("\n\n").map((frame) => frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6)).filter((data): data is string => !!data && data !== "[DONE]").map((data) => JSON.parse(data) as StreamEvent);
 describe("Responses formatter", () => {
   test("collects fragmented text, reasoning, tools, and usage", async () => {
     const result = await collectResponses(upstream([

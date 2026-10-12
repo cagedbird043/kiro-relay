@@ -214,9 +214,9 @@ export class KiroExecutor extends BaseExecutor {
     super(providerId, KIRO_PROVIDER);
   }
 
-  buildHeaders(credentials: ProviderCredentials, stream = true) {
+  buildHeaders(credentials: ProviderCredentials, stream = true): Record<string, string> {
     void stream;
-    const headers = {
+    const headers: Record<string, string> = {
       ...this.config.headers,
       "Amz-Sdk-Request": "attempt=1; max=3",
       "Amz-Sdk-Invocation-Id": uuidv4(),
@@ -252,7 +252,7 @@ export class KiroExecutor extends BaseExecutor {
     return headers;
   }
 
-  transformRequest(model: string, body: unknown, stream: boolean, credentials: unknown): unknown {
+  transformRequest(model: string, body: unknown, stream: boolean, credentials: unknown): Record<string, unknown> {
     void stream;
     void credentials;
     const b = body as Record<string, unknown>;

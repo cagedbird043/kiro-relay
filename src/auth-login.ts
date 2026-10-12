@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import { saveCredentials } from "./credentials.ts";
-import type { ProviderCredentials } from "./kiro/base.ts";
+import type { FetchFn, ProviderCredentials } from "./kiro/base.ts";
 
 const DEFAULT_REGION = "us-east-1";
 const BUILDER_ID_START_URL = "https://view.awsapps.com/start";
@@ -55,7 +55,7 @@ export interface KiroOidcLoginOptions {
   clientSecret?: string;
 }
 export interface DeviceLoginDependencies {
-  fetch: typeof fetch;
+  fetch: FetchFn;
   sleep(milliseconds: number): Promise<void>;
   now(): number;
   output(message: string): void;

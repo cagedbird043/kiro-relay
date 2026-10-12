@@ -1,5 +1,8 @@
 export type JsonRecord = Record<string, unknown>;
 
+/** 可注入的 fetch：只需调用签名，不要求 Bun 全局 fetch 的 preconnect 等附加属性。 */
+export type FetchFn = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+
 export type ProviderCredentials = {
   accessToken?: string;
   refreshToken?: string;

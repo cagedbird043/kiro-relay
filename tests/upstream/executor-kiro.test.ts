@@ -6,6 +6,7 @@ import { anthropicToOpenAI, collectAnthropicResponse, openAIStreamToAnthropic } 
 import { buildKiroPayload } from "../../src/kiro/request/openai-to-kiro.ts";
 import { collectResponses, responsesStream } from "../../src/responses/response.ts";
 import { buildKiroResponsesPayload } from "../../src/responses/request.ts";
+import { withFetch } from "../fetch-stub.ts";
 
 function hasStreamReadinessSignal(text: string): boolean {
   const match = text.match(/data:\s*(\{.*\})/);
@@ -184,18 +185,16 @@ test("正文和工具之后到达的分片签名仍属于原推理且可续轮",
 });
 
 test("切换上游端点前取消被替换的失败响应体", async () => {
-  const original = globalThis.fetch;
   let calls = 0;
   let cancelled = false;
-  try {
-    globalThis.fetch = (async () => {
-      if (++calls === 1) return new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status: 403 });
-      assert.equal(cancelled, true);
-      return buildEventStreamResponse([buildEventFrame("assistantResponseEvent", { content: "ok" }), buildEventFrame("messageStopEvent", {})]);
-    }) as typeof fetch;
+  await withFetch(async () => {
+    if (++calls === 1) return new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status: 403 });
+    assert.equal(cancelled, true);
+    return buildEventStreamResponse([buildEventFrame("assistantResponseEvent", { content: "ok" }), buildEventFrame("messageStopEvent", {})]);
+  }, async () => {
     const result = await new KiroExecutor().execute({ model: "claude-opus-5", body: { conversationState: { currentMessage: { userInputMessage: { content: "hi" } } } }, stream: false, credentials: { accessToken: "fake" } });
     assert.equal((await (await collectAnthropicResponse(result.response)).json()).content[0].text, "ok");
-  } finally { globalThis.fetch = original; }
+  });
 });
 
 test("计量帧后分片到达的官方元数据保留真实用量和停止原因", async () => {
@@ -760,7 +759,6 @@ test("KiroExecutor.transformEventStreamToSSE deduplicates tool starts and handle
 
 test("KiroExecutor.execute returns upstream errors directly and transforms successful streams", async () => {
   const executor = new KiroExecutor();
-  const originalFetch = globalThis.fetch;
   const rawResponse = new Response("ok", { status: 200 });
   let transformed = null;
   executor.transformEventStreamToSSE = (response, model) => {
@@ -771,8 +769,7 @@ test("KiroExecutor.execute returns upstream errors directly and transforms succe
     });
   };
 
-  globalThis.fetch = async () => new Response("upstream error", { status: 429 });
-  try {
+  await withFetch(async () => new Response("upstream error", { status: 429 }), async () => {
     const errorResult = await executor.execute({
       model: "glm-5",
       body: { conversationState: {} },
@@ -780,12 +777,9 @@ test("KiroExecutor.execute returns upstream errors directly and transforms succe
       credentials: { accessToken: "kiro-token" },
     });
     assert.equal(errorResult.response.status, 429);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  });
 
-  globalThis.fetch = async () => rawResponse;
-  try {
+  await withFetch(async () => rawResponse, async () => {
     const successResult = await executor.execute({
       model: "glm-5",
       body: { conversationState: {} },
@@ -796,15 +790,12 @@ test("KiroExecutor.execute returns upstream errors directly and transforms succe
     assert.equal(successResult.response.status, 200);
     assert.equal(transformed.response, rawResponse);
     assert.equal(transformed.model, "glm-5");
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  });
 });
 
 test("KiroExecutor.refreshCredentials handles missing and AWS-style refresh tokens", async () => {
   const executor = new KiroExecutor();
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url) => {
+  await withFetch(async (url) => {
     assert.match(String(url), /oidc\.us-east-1\.amazonaws\.com\/token$/);
     return new Response(
       JSON.stringify({
@@ -814,9 +805,7 @@ test("KiroExecutor.refreshCredentials handles missing and AWS-style refresh toke
       }),
       { status: 200, headers: { "Content-Type": "application/json" } }
     );
-  };
-
-  try {
+  }, async () => {
     assert.equal(await executor.refreshCredentials({}, null), null);
     assert.equal(
       await executor.refreshCredentials(
@@ -837,19 +826,14 @@ test("KiroExecutor.refreshCredentials handles missing and AWS-style refresh toke
       refreshToken: "new-refresh-token",
       expiresIn: 3600,
     });
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  });
 });
 
 test("KiroExecutor.refreshCredentials returns null when the token refresh fails", async () => {
   const executor = new KiroExecutor();
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => {
+  await withFetch(async () => {
     throw new Error("refresh failed");
-  };
-
-  try {
+  }, async () => {
     const result = await executor.refreshCredentials(
       {
         refreshToken: "refresh",
@@ -858,9 +842,7 @@ test("KiroExecutor.refreshCredentials returns null when the token refresh fails"
       null
     );
     assert.equal(result, null);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  });
 });
 
 

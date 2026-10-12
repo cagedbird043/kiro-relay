@@ -288,7 +288,7 @@ describe("catalog-backed server routes", () => {
     const { directory, handler } = await servedByCatalog();
     try {
       const response = await handler(new Request("http://relay/v1/models"));
-      const body = (await response.json()) as { data: Array<{ id: string; context_length: number }> };
+      const body = (await response.json()) as { data: Array<{ id: string; object: string; created: number; owned_by: string; context_length: number }> };
 
       expect(body.data).toEqual([
         { id: "claude-opus-5", object: "model", created: 0, owned_by: "kiro", context_length: 1_000_000 },
