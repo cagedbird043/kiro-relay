@@ -8,7 +8,7 @@ const credentials = { providerSpecificData: { profileArn: "arn:aws:demo" } };
 const model = "gpt-5.6-sol";
 const req = (extra: Record<string, unknown> = {}) => ({ model, ...extra });
 
-test("多个无签名摘要完整合并而独立签名不会被静默覆盖", () => {
+test("多个无签名摘要完整合并而独立签名各占一条连续助手消息", () => {
   const first = { type: "reasoning", summary: [{ type: "summary_text", text: "第一段" }] };
   const second = { type: "reasoning", summary: [{ type: "summary_text", text: "第二段" }] };
   const input = [{ role: "user", content: "任务" }, first, { role: "assistant", content: "中间正文" }, second, { role: "user", content: "继续" }];
@@ -18,8 +18,14 @@ test("多个无签名摘要完整合并而独立签名不会被静默覆盖", ()
   const hidden = { type: "reasoning", summary: [], encrypted_content: encodeReasoning(model, { redactedContent: "UkVEQUNURUQ=" }) };
   const single = buildKiroResponsesPayload(model, req({ input: [{ role: "user", content: "任务" }, signed, { role: "user", content: "继续" }] }), false, credentials);
   assert.deepEqual(single.conversationState.history[1].assistantResponseMessage?.reasoningContent, { reasoningText: { text: "第一段", signature: "签名甲" } });
-  assert.throws(() => buildKiroResponsesPayload(model, req({ input: [{ role: "user", content: "任务" }, signed, second, { role: "user", content: "继续" }] }), false, credentials));
-  assert.throws(() => buildKiroResponsesPayload(model, req({ input: [{ role: "user", content: "任务" }, signed, hidden, { role: "user", content: "继续" }] }), false, credentials));
+  const assistantReasoning = (input: unknown[]) => buildKiroResponsesPayload(model, req({ input }), false, credentials)
+    .conversationState.history.slice(1).map(item => item.assistantResponseMessage?.reasoningContent);
+  assert.deepEqual(assistantReasoning([{ role: "user", content: "任务" }, signed, second, { role: "user", content: "继续" }]), [
+    { reasoningText: { text: "第一段", signature: "签名甲" } }, { reasoningText: { text: "第二段" } },
+  ]);
+  assert.deepEqual(assistantReasoning([{ role: "user", content: "任务" }, signed, hidden, { role: "user", content: "继续" }]), [
+    { reasoningText: { text: "第一段", signature: "签名甲" } }, { redactedContent: "UkVEQUNURUQ=" },
+  ]);
   const separate = buildKiroResponsesPayload(model, req({ input: [{ role: "user", content: "任务" }, signed, { role: "user", content: "下一轮" }, hidden, { role: "user", content: "继续" }] }), false, credentials);
   assert.deepEqual(separate.conversationState.history.filter(item => item.assistantResponseMessage).map(item => item.assistantResponseMessage?.reasoningContent), [
     { reasoningText: { text: "第一段", signature: "签名甲" } }, { redactedContent: "UkVEQUNURUQ=" },

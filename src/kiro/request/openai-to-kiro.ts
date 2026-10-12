@@ -421,73 +421,80 @@ function convertMessages(messages, tools, model) {
         pendingUserContent.push(msg.role === "system" ? wrapSystemReminder(content) : content);
       }
     } else if (role === "assistant") {
-      // Extract text content and tool uses
-      let textContent = "";
-      let toolUses = [];
+      // Kiro 每条助手消息只有一个推理槽。同一回合里无法并入的签名或隐藏块
+      // 另起连续助手消息，并带上各自之后的正文与工具调用，保持原有块顺序。
+      let toolUseIndex = 0;
+      let segmentTexts = [];
+      let segmentToolUses = [];
+      const NAMESPACE_KIRO_TOOLUSE = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+      const toKiroToolUse = (tc) => {
+        const idx = toolUseIndex++;
+        if (tc.function) {
+          const stableId =
+            tc.id || uuidv5(`${tc.function.name}:${idx}`, NAMESPACE_KIRO_TOOLUSE);
+          return {
+            toolUseId: stableId,
+            name: tc.function.name,
+            input: parseToolInput(tc.function.arguments),
+          };
+        }
+        const stableId = tc.id || uuidv5(`${tc.name}:${idx}`, NAMESPACE_KIRO_TOOLUSE);
+        return {
+          toolUseId: stableId,
+          name: tc.name,
+          input: parseToolInput(tc.input),
+        };
+      };
+      const pushSegmentText = () => {
+        const text = segmentTexts.join("\n").trim();
+        if (text) pendingAssistantContent.push(text);
+        segmentTexts = [];
+      };
+      // Flush to create an assistant message carrying these tool uses.
+      const flushWithToolUses = (toolUses) => {
+        pushSegmentText();
+        currentRole = "assistant";
+        flushPending();
+        const lastMsg = history[history.length - 1];
+        if (toolUses.length > 0 && lastMsg?.assistantResponseMessage) {
+          lastMsg.assistantResponseMessage.toolUses = toolUses.map(toKiroToolUse);
+        }
+      };
 
       if (Array.isArray(msg.content)) {
-        // 单个原生槽不能表达多个独立签名或隐藏块，不能静默覆盖。
         for (const block of msg.content) {
-          if (block?.type === "thinking" && typeof block.thinking === "string" &&
-              typeof block.signature === "string" && block.signature.length > 0) {
-            pendingReasoning = mergeKiroReasoning(pendingReasoning, { reasoningText: { text: block.thinking, signature: block.signature } });
-          } else if (block?.type === "redacted_thinking" && typeof block.data === "string" && block.data.length > 0) {
-            pendingReasoning = mergeKiroReasoning(pendingReasoning, { redactedContent: block.data });
+          const reasoning =
+            block?.type === "thinking" && typeof block.thinking === "string" &&
+              typeof block.signature === "string" && block.signature.length > 0
+              ? { reasoningText: { text: block.thinking, signature: block.signature } }
+              : block?.type === "redacted_thinking" && typeof block.data === "string" && block.data.length > 0
+                ? { redactedContent: block.data }
+                : undefined;
+          if (reasoning) {
+            const merged = segmentToolUses.length === 0 ? mergeKiroReasoning(pendingReasoning, reasoning) : undefined;
+            if (merged) {
+              pendingReasoning = merged;
+              continue;
+            }
+            flushWithToolUses(segmentToolUses);
+            segmentToolUses = [];
+            pendingReasoning = reasoning;
+          } else if (block?.type === "text") {
+            segmentTexts.push(block.text);
+          } else if (block?.type === "tool_use") {
+            segmentToolUses.push(block);
           }
         }
-        const textBlocks = msg.content.filter((c) => c.type === "text");
-        textContent = textBlocks
-          .map((b) => b.text)
-          .join("\n")
-          .trim();
-
-        const toolUseBlocks = msg.content.filter((c) => c.type === "tool_use");
-        toolUses = toolUseBlocks;
       } else if (typeof msg.content === "string") {
-        textContent = msg.content.trim();
+        segmentTexts.push(msg.content);
       }
 
-      if (msg.tool_calls && msg.tool_calls.length > 0) {
-        toolUses = msg.tool_calls;
-      }
-
-      if (textContent) {
-        pendingAssistantContent.push(textContent);
-      }
-
-      // Store tool uses in last assistant message
+      const toolUses = msg.tool_calls && msg.tool_calls.length > 0 ? msg.tool_calls : segmentToolUses;
       if (toolUses.length > 0) {
-        if (pendingAssistantContent.length === 0) {
-          // pendingAssistantContent.push("Call tools");
-        }
-
-        // Flush to create assistant message with toolUses
-        flushPending();
-
-        const lastMsg = history[history.length - 1];
-        if (lastMsg?.assistantResponseMessage) {
-          const NAMESPACE_KIRO_TOOLUSE = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
-          lastMsg.assistantResponseMessage.toolUses = toolUses.map((tc, idx) => {
-            if (tc.function) {
-              const stableId =
-                tc.id || uuidv5(`${tc.function.name}:${idx}`, NAMESPACE_KIRO_TOOLUSE);
-              return {
-                toolUseId: stableId,
-                name: tc.function.name,
-                input: parseToolInput(tc.function.arguments),
-              };
-            } else {
-              const stableId = tc.id || uuidv5(`${tc.name}:${idx}`, NAMESPACE_KIRO_TOOLUSE);
-              return {
-                toolUseId: stableId,
-                name: tc.name,
-                input: parseToolInput(tc.input),
-              };
-            }
-          });
-        }
-
+        flushWithToolUses(toolUses);
         currentRole = null;
+      } else {
+        pushSegmentText();
       }
     }
   }
@@ -609,15 +616,27 @@ function convertMessages(messages, tools, model) {
         previous.userInputMessage.userInputMessageContext = mergedContext;
       }
     } else if (item.assistantResponseMessage && previous?.assistantResponseMessage) {
-      // Kiro API also rejects consecutive assistant messages. Merge them.
+      const nextReasoning = item.assistantResponseMessage.reasoningContent;
+      const mergedReasoning = nextReasoning
+        ? previous.assistantResponseMessage.toolUses?.length
+          ? undefined
+          : mergeKiroReasoning(previous.assistantResponseMessage.reasoningContent, nextReasoning)
+        : previous.assistantResponseMessage.reasoningContent;
+      if (nextReasoning && !mergedReasoning) {
+        // 一个推理槽放不下的签名或隐藏块保持为连续助手消息；Kiro 会把它们
+        // 按顺序合并回同一回合（已实测两段签名分别在 content.0 / content.1 校验）。
+        mergedHistory.push(item);
+        continue;
+      }
+      // Otherwise merge consecutive assistant messages into one.
       const previousContent = previous.assistantResponseMessage.content || "";
       const currentContent = item.assistantResponseMessage.content || "";
       previous.assistantResponseMessage.content = previousContent
         ? `${previousContent}\n\n${currentContent}`
         : currentContent;
 
-      if (item.assistantResponseMessage.reasoningContent) {
-        previous.assistantResponseMessage.reasoningContent = mergeKiroReasoning(previous.assistantResponseMessage.reasoningContent, item.assistantResponseMessage.reasoningContent);
+      if (mergedReasoning) {
+        previous.assistantResponseMessage.reasoningContent = mergedReasoning;
       }
       if (item.assistantResponseMessage.toolUses) {
         const existingToolUses = previous.assistantResponseMessage.toolUses || [];

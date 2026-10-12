@@ -302,9 +302,11 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
     if (type === "reasoning") {
       const reasoningContent = reasoningHistoryItem(item, model);
       if (reasoningContent) {
-        appendAssistantHistory(history, "");
-        const assistant = history.at(-1)!.assistantResponseMessage!;
-        assistant.reasoningContent = mergeKiroReasoning(assistant.reasoningContent, reasoningContent);
+        const previous = history.at(-1)?.assistantResponseMessage;
+        const merged = previous && !previous.toolUses?.length ? mergeKiroReasoning(previous.reasoningContent, reasoningContent) : undefined;
+        // 一个推理槽放不下时另起连续助手消息；Kiro 会按顺序合并回同一回合。
+        if (previous && merged) previous.reasoningContent = merged;
+        else history.push({ assistantResponseMessage: { content: "", reasoningContent } });
       }
       continue;
     }

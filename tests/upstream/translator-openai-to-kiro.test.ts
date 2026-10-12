@@ -826,6 +826,40 @@ test("思考与工具调用保留空正文及完整续轮内容", () => {
   }]);
 });
 
+test("同一回合多段签名推理按原顺序拆成连续助手消息且各自携带正文与工具", () => {
+  const history = (assistantContent: unknown[]) => buildKiroPayload("claude-opus-5", {
+    messages: [
+      { role: "user", content: "任务" },
+      { role: "assistant", content: assistantContent },
+      { role: "user", content: [
+        { type: "tool_result", tool_use_id: "call_1", content: "一" },
+        { type: "tool_result", tool_use_id: "call_2", content: "二" },
+      ] },
+    ],
+  }, true, null).conversationState.history.slice(1).map((item) => item.assistantResponseMessage);
+  assert.deepEqual(history([
+    { type: "thinking", thinking: "先看状态", signature: "签名甲" },
+    { type: "thinking", thinking: "再决定读哪个", signature: "签名乙" },
+    { type: "tool_use", id: "call_1", name: "read", input: { path: "a" } },
+  ]), [
+    { content: "", reasoningContent: { reasoningText: { text: "先看状态", signature: "签名甲" } } },
+    { content: "", reasoningContent: { reasoningText: { text: "再决定读哪个", signature: "签名乙" } },
+      toolUses: [{ toolUseId: "call_1", name: "read", input: { path: "a" } }] },
+  ]);
+  assert.deepEqual(history([
+    { type: "thinking", thinking: "第一步", signature: "签名甲" },
+    { type: "text", text: "先读 a" },
+    { type: "tool_use", id: "call_1", name: "read", input: { path: "a" } },
+    { type: "redacted_thinking", data: "UkVEQUNURUQ=" },
+    { type: "tool_use", id: "call_2", name: "read", input: { path: "b" } },
+  ]), [
+    { content: "先读 a", reasoningContent: { reasoningText: { text: "第一步", signature: "签名甲" } },
+      toolUses: [{ toolUseId: "call_1", name: "read", input: { path: "a" } }] },
+    { content: "", reasoningContent: { redactedContent: "UkVEQUNURUQ=" },
+      toolUses: [{ toolUseId: "call_2", name: "read", input: { path: "b" } }] },
+  ]);
+});
+
 test("真实消息中的占位字样按原文保留", () => {
   const result = buildKiroPayload("claude-opus-5", {
     messages: [
