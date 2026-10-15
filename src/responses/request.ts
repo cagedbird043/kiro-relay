@@ -359,7 +359,17 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   }
   const lastUser = history.at(-1)?.userInputMessage;
   if (lastUser) history.pop();
-  const current: InputParts = { text: lastUser?.content ?? "", images: lastUser?.images?.map(image => ({ format: image.format, bytes: image.source.bytes })) ?? [] };
+  // Kiro 拒收正文为空且不带工具结果或图片的用户回合（REQUEST_BODY_INVALID），填中性占位。
+  for (const item of history) {
+    const user = item.userInputMessage;
+    if (user && !user.content.trim() && !user.images?.length && !user.userInputMessageContext?.toolResults?.length) user.content = "...";
+  }
+  const currentText = lastUser?.content ?? "";
+  const currentImages = lastUser?.images?.map(image => ({ format: image.format, bytes: image.source.bytes })) ?? [];
+  const current: InputParts = {
+    text: currentText.trim() || currentImages.length || lastUser?.userInputMessageContext?.toolResults?.length ? currentText : "...",
+    images: currentImages,
+  };
   const instruction = instructionTexts.length ? instructionTexts.map((text) => `<system-reminder>\n${text}\n</system-reminder>`).join("\n\n") + "\n\n" : "";
   const context: { tools?: unknown[]; toolResults?: KiroToolResult[]; toolChoice?: unknown } = {};
   if (lastUser?.userInputMessageContext) context.toolResults = lastUser.userInputMessageContext.toolResults;

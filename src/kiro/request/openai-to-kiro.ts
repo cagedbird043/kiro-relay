@@ -782,6 +782,15 @@ function convertMessages(messages, tools, model) {
     alternatingHistory.push(item);
   }
 
+  // Kiro 拒收正文为空且不带工具结果或图片的用户回合（REQUEST_BODY_INVALID，已实测：
+  // 以助手开头时补的空用户回合、只含空白的用户消息都会触发）。沿用上面的中性占位。
+  for (const item of [...alternatingHistory, currentMessage]) {
+    const user = item?.userInputMessage;
+    if (user && !user.content?.trim() && !user.images?.length && !user.userInputMessageContext?.toolResults?.length) {
+      user.content = "...";
+    }
+  }
+
   return { history: alternatingHistory, currentMessage, toolsAttached, toolDocs };
 }
 
