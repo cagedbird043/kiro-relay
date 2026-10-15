@@ -826,7 +826,7 @@ test("思考与工具调用保留空正文及完整续轮内容", () => {
   }]);
 });
 
-test("同一回合多段签名推理按原顺序拆成连续助手消息且各自携带正文与工具", () => {
+test("同一回合多段签名推理按原顺序拆成连续助手消息且工具调用只挂在最后一段", () => {
   const history = (assistantContent: unknown[]) => buildKiroPayload("claude-opus-5", {
     messages: [
       { role: "user", content: "任务" },
@@ -853,10 +853,23 @@ test("同一回合多段签名推理按原顺序拆成连续助手消息且各�
     { type: "redacted_thinking", data: "UkVEQUNURUQ=" },
     { type: "tool_use", id: "call_2", name: "read", input: { path: "b" } },
   ]), [
-    { content: "先读 a", reasoningContent: { reasoningText: { text: "第一步", signature: "签名甲" } },
-      toolUses: [{ toolUseId: "call_1", name: "read", input: { path: "a" } }] },
+    { content: "先读 a", reasoningContent: { reasoningText: { text: "第一步", signature: "签名甲" } } },
     { content: "", reasoningContent: { redactedContent: "UkVEQUNURUQ=" },
-      toolUses: [{ toolUseId: "call_2", name: "read", input: { path: "b" } }] },
+      toolUses: [
+        { toolUseId: "call_1", name: "read", input: { path: "a" } },
+        { toolUseId: "call_2", name: "read", input: { path: "b" } },
+      ] },
+  ]);
+  // 工具调用之后还有签名推理（Claude 交错思考的常见形状）：
+  // 前段不能单独带 toolUses，否则 Kiro 返回 REQUEST_BODY_INVALID。
+  assert.deepEqual(history([
+    { type: "thinking", thinking: "", signature: "签名甲" },
+    { type: "tool_use", id: "call_1", name: "read", input: { path: "a" } },
+    { type: "thinking", thinking: "", signature: "签名乙" },
+  ]), [
+    { content: "", reasoningContent: { reasoningText: { text: "", signature: "签名甲" } } },
+    { content: "", reasoningContent: { reasoningText: { text: "", signature: "签名乙" } },
+      toolUses: [{ toolUseId: "call_1", name: "read", input: { path: "a" } }] },
   ]);
 });
 

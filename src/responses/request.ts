@@ -316,8 +316,13 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
         const previous = history.at(-1)?.assistantResponseMessage;
         const merged = previous && !previous.toolUses?.length ? mergeKiroReasoning(previous.reasoningContent, reasoningContent) : undefined;
         // 一个推理槽放不下时另起连续助手消息；Kiro 会按顺序合并回同一回合。
+        // Kiro 只接受连续助手消息的最后一条带 toolUses，前一段的工具调用随之移到新消息。
         if (previous && merged) previous.reasoningContent = merged;
-        else history.push({ assistantResponseMessage: { content: "", reasoningContent } });
+        else {
+          const carriedToolUses = previous?.toolUses;
+          if (previous && carriedToolUses?.length) delete previous.toolUses;
+          history.push({ assistantResponseMessage: { content: "", reasoningContent, ...(carriedToolUses?.length ? { toolUses: carriedToolUses } : {}) } });
+        }
       }
       continue;
     }

@@ -33,6 +33,23 @@ test("多个无签名摘要完整合并而独立签名各占一条连续助手�
   ]);
 });
 
+test("工具调用之后的独立签名推理让工具调用移到最后一条连续助手消息", () => {
+  const signed = (text: string, signature: string) => ({ type: "reasoning", summary: [], encrypted_content: encodeReasoning(model, { reasoningText: { text, signature } }) });
+  const payload = buildKiroResponsesPayload(model, req({ input: [
+    { role: "user", content: "任务" },
+    signed("", "签名甲"),
+    { type: "function_call", call_id: "a", name: "read", arguments: "{}" },
+    signed("", "签名乙"),
+    { type: "function_call_output", call_id: "a", output: "完成" },
+  ] }), false, credentials);
+  const assistants = payload.conversationState.history.filter(item => item.assistantResponseMessage).map(item => item.assistantResponseMessage);
+  assert.equal(assistants.length, 2);
+  assert.equal(assistants[0]?.toolUses, undefined);
+  assert.deepEqual(assistants[0]?.reasoningContent, { reasoningText: { text: "", signature: "签名甲" } });
+  assert.deepEqual(assistants[1]?.reasoningContent, { reasoningText: { text: "", signature: "签名乙" } });
+  assert.deepEqual(assistants[1]?.toolUses?.map(use => use.toolUseId), ["a"]);
+});
+
 test("命名空间合成超长工具的声明选择和历史使用同一个上游名称", () => {
   const namespace = "repo_namespace_".repeat(3);
   const name = "read_source_file_for_analysis";

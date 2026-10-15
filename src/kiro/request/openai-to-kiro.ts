@@ -652,6 +652,13 @@ function convertMessages(messages, tools, model) {
       if (nextReasoning && !mergedReasoning) {
         // 一个推理槽放不下的签名或隐藏块保持为连续助手消息；Kiro 会把它们
         // 按顺序合并回同一回合（已实测两段签名分别在 content.0 / content.1 校验）。
+        // Kiro 只接受连续助手消息的最后一条带 toolUses，否则 REQUEST_BODY_INVALID，
+        // 所以前一段的工具调用移到这一段，排在它自己的工具调用之前。
+        const carriedToolUses = previous.assistantResponseMessage.toolUses;
+        if (carriedToolUses?.length) {
+          delete previous.assistantResponseMessage.toolUses;
+          item.assistantResponseMessage.toolUses = [...carriedToolUses, ...(item.assistantResponseMessage.toolUses ?? [])];
+        }
         mergedHistory.push(item);
         continue;
       }
