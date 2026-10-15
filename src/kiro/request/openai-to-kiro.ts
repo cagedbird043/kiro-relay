@@ -488,6 +488,9 @@ function convertMessages(messages, tools, model) {
         }
       };
 
+      // Anthropic 入口会把 tool_use 同时写进 content 和 tool_calls。按块分段时以 content
+      // 为准，已随前一段刷出的工具调用不能再由 tool_calls 重复挂到最后一段。
+      let segmented = false;
       if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
           const reasoning =
@@ -506,6 +509,7 @@ function convertMessages(messages, tools, model) {
             flushWithToolUses(segmentToolUses);
             segmentToolUses = [];
             pendingReasoning = reasoning;
+            segmented = true;
           } else if (block?.type === "text") {
             segmentTexts.push(block.text);
           } else if (block?.type === "tool_use") {
@@ -516,7 +520,7 @@ function convertMessages(messages, tools, model) {
         segmentTexts.push(msg.content);
       }
 
-      const toolUses = msg.tool_calls && msg.tool_calls.length > 0 ? msg.tool_calls : segmentToolUses;
+      const toolUses = !segmented && msg.tool_calls && msg.tool_calls.length > 0 ? msg.tool_calls : segmentToolUses;
       if (toolUses.length > 0) {
         flushWithToolUses(toolUses);
         currentRole = null;

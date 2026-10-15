@@ -12,6 +12,27 @@ test("相同长系统提示和开场文本不会复用会话身份", () => {
   expect(first.conversationState.history).toEqual(second.conversationState.history);
 });
 
+test("工具调用之后再有签名思考时每个工具调用只在最后一条连续助手消息出现一次", () => {
+  const payload = buildKiroPayload("claude-opus-5", anthropicToOpenAI({
+    messages: [
+      { role: "user", content: "任务" },
+      { role: "assistant", content: [
+        { type: "thinking", thinking: "", signature: "签名甲" },
+        { type: "tool_use", id: "call_1", name: "read", input: { path: "a" } },
+        { type: "thinking", thinking: "", signature: "签名乙" },
+      ] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "内容" }] },
+    ],
+  }), true, {});
+  const assistants = payload.conversationState.history.filter((item) => item.assistantResponseMessage)
+    .map((item) => item.assistantResponseMessage);
+  expect(assistants.map((item) => item?.reasoningContent)).toEqual([
+    { reasoningText: { text: "", signature: "签名甲" } },
+    { reasoningText: { text: "", signature: "签名乙" } },
+  ]);
+  expect(assistants.map((item) => item?.toolUses?.map((use) => use.toolUseId))).toEqual([undefined, ["call_1"]]);
+});
+
 test("长工具名在历史和本轮强制选择中匹配声明且保持结果关联", () => {
   const name = "tool_" + "long_name_".repeat(8);
   const payload = buildKiroPayload("claude-opus-5", anthropicToOpenAI({
