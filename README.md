@@ -121,9 +121,21 @@ bun dist/server.js
 
 ```sh
 bun test            # 单元测试与协议黄金样例
-bun run typecheck   # 类型检查（含 tests）
+bun run typecheck   # 类型检查（含 tests、scripts）
 bun run dev         # 监听文件变化自动重启
 ```
+
+`tests/kiro-history-shapes.test.ts` 会枚举助手回合里思考、正文、工具调用的各种排列，以及历史结构的边界情况，并检查生成的 Kiro 请求是否满足 `tests/kiro-history-rules.ts` 中整理的上游结构规则。
+
+改动请求转换的大重构前后，再用真实 Kiro 跑一遍安全门。它会消耗少量额度，不在 CI 中运行：
+
+```sh
+bun run start &                                   # 用工作区代码启动本地 relay
+KIRO_RELAY_KEY=<auth.keys 中的一项> bun run live-check
+# 或检查已部署的实例：KIRO_RELAY_URL=https://relay.example KIRO_RELAY_KEY=... bun run live-check
+```
+
+脚本先向 relay 取得 Kiro 真签发的思考签名，再把各类历史形状逐个发出，全部返回 200 才算通过（退出码 0）。输出只有用例名和状态码。
 
 ## 免责声明
 

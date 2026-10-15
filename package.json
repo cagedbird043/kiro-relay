@@ -9,7 +9,8 @@
     "auth:login": "bun src/auth-login.ts",
     "test": "bun test",
     "typecheck": "bunx tsc --noEmit",
-    "build": "bun build src/server.ts --outdir dist --target bun"
+    "build": "bun build src/server.ts --outdir dist --target bun",
+    "live-check": "bun scripts/kiro-live-check.ts"
   },
   "dependencies": {
     "openai": "^7.9.0",
