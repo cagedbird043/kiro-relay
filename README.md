@@ -107,6 +107,7 @@ const reply = await client.chat.completions.create({
 - 图片只接受 base64 内联，单张 base64 不超过 5 MB；不支持远程图片 URL 和 `document` 内容块。超限时的报错措辞与 Anthropic 官方一致，客户端可以据此自动压缩后重试。
 - Responses 接口仅支持 GPT-5.6 系列这类原生推理模型；`store` 必须为 `false`，不支持 `previous_response_id`、`conversation`、`background`、`prompt`、`truncation`。
 - 当前只使用 `accounts` 中的第一个账号。
+- Anthropic / Chat 的工具说明超过 Kiro 单项长度限制时，全文保留在带 `<system-reminder>` 标记的初始上下文中；后续用户消息和工具结果续接不再追加文档。相同工具集与初始输入保持该段字节稳定；实际缓存命中仍取决于上游，不能据此保证命中率。
 
 ## 部署
 

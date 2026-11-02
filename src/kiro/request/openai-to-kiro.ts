@@ -89,18 +89,10 @@ type KiroToolInput = {
  * Build Kiro `toolSpecification` entries, relocating any oversized description
  * out of the schema and returning it separately.
  *
- * Kiro answers a raw upstream 400 for a description over
- * {@link KIRO_TOOL_DESC_MAX}, so the schema keeps a pointer and the full text is
- * handed back to be prepended to the current turn's content — the same
- * relocation kiro-gateway performs in
- * `converters_core.py::process_tools_with_long_descriptions`.
- *
- * The docs are *returned* rather than stashed on the message object, because the
- * tool-bearing user turn is moved into `history` on every multi-turn request
- * (see the currentMessage promotion below). Carrying them on the message lost
- * them there — the model then saw only the pointer and no documentation — and
- * also leaked an unknown `_toolDocs` field into the upstream payload, which Kiro
- * rejects.
+ * Kiro rejects oversized descriptions, so schemas retain a pointer while the
+ * complete text is carried by the initial instruction context. The docs are
+ * returned separately so history promotion cannot drop them or leak an
+ * unsupported field into the upstream payload.
  */
 function buildKiroToolSpecs(tools: KiroToolInput[]): {
   specs: Array<Record<string, unknown>>;
@@ -117,7 +109,7 @@ function buildKiroToolSpecs(tools: KiroToolInput[]): {
 
     if (description.length > KIRO_TOOL_DESC_MAX) {
       docs.push(`## Tool: ${name}\n\n${description}`);
-      description = `[Full documentation in system prompt under '## Tool: ${name}']`;
+      description = `[Full documentation in initial context under '## Tool: ${name}']`;
     }
 
     return {
@@ -943,15 +935,18 @@ export function buildKiroPayload(
   const rawProfileArn = credentials?.providerSpecificData?.profileArn;
   const profileArn = typeof rawProfileArn === "string" ? rawProfileArn : "";
 
-  let finalContent = currentMessage?.userInputMessage?.content || "";
-
-  // Prepend documentation for tools whose description was relocated out of
-  // `toolSpecification` (see buildKiroToolSpecs). Driven by convertMessages'
-  // return value, not the message object, so the docs survive the tool-bearing
-  // turn being moved into `history` on a multi-turn request.
+  // Kiro has no system role. Use the same instruction wrapper as system
+  // prompts, anchored to the first user carrier so it stays at the same
+  // history position across requests. A tool-result continuation must keep
+  // its current content for observations, not newly injected documentation.
   if (toolDocs) {
-    finalContent = `# Tool Documentation\n\n${toolDocs}\n\n---\n\n${finalContent}`;
+    const firstUser = history.find(item => item.userInputMessage)?.userInputMessage
+      ?? currentMessage.userInputMessage;
+    const docs = wrapSystemReminder(`# Tool Documentation\n\n${toolDocs}`);
+    firstUser.content = `${docs}\n\n${firstUser.content}`;
   }
+
+  const finalContent = currentMessage?.userInputMessage?.content || "";
 
   const payload: {
     conversationState: {
