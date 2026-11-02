@@ -23,9 +23,6 @@ test("清洗 Schema 时保留关键字同名属性和字面数据", () => {
   assert.deepEqual(schema.enum, [literal]);
   assert.equal(Object.hasOwn(schema, "not"), false);
 });
-const { convertKiroToOpenAI } = await import(
-  "../../src/kiro/response/kiro-to-openai.ts"
-);
 
 // #1375 — Kiro returns 400 "Improperly formed request" when a tool schema
 // carries unsupported JSON-Schema keywords or a tool name longer than 64 chars.
@@ -155,33 +152,3 @@ test("sanitizeKiroTools: non-array input is returned untouched", () => {
   assert.equal(nameMap.size, 0);
 });
 
-test("kiro-to-openai: streamed tool name is reverse-mapped via state.toolNameMap (#1375)", () => {
-  const longName = "b".repeat(80);
-  // Build the truncated name exactly as sanitizeKiroTools would, then verify
-  // the response translator maps the streamed (truncated) name back.
-  const { tools: out, nameMap } = sanitizeKiroTools([
-    {
-      toolSpecification: {
-        name: longName,
-        inputSchema: { json: { type: "object", properties: {} } },
-      },
-    },
-  ]);
-  const truncated = out[0].toolSpecification.name;
-
-  const result = convertKiroToOpenAI(
-    { _eventType: "toolUseEvent", toolUseId: "call_9", name: truncated, input: {} },
-    { toolNameMap: nameMap }
-  );
-
-  assert.equal(result.choices[0].delta.tool_calls[0].function.name, longName);
-});
-
-test("kiro-to-openai: unmapped tool name passes through unchanged", () => {
-  const result = convertKiroToOpenAI(
-    { _eventType: "toolUseEvent", toolUseId: "call_10", name: "read_file", input: {} },
-    { toolNameMap: new Map() }
-  );
-
-  assert.equal(result.choices[0].delta.tool_calls[0].function.name, "read_file");
-});

@@ -7,7 +7,7 @@ import {
 } from "./base.ts";
 import { KIRO_PROVIDER, contextLengthForModel } from "./config.ts";
 import { v4 as uuidv4 } from "uuid";
-import { refreshKiroToken } from "./refresh.ts";
+import { refreshKiroToken, type KiroRefreshResult } from "./refresh.ts";
 import {
   isExternalIdpAuthMethod,
   KIRO_EXTERNAL_IDP_TOKEN_TYPE_HEADER,
@@ -18,7 +18,7 @@ import {
   flushPendingThinking,
   type KiroThinkingState,
 } from "./thinking.ts";
-import { KiroStreamProtocolError } from "./events.ts";
+import { KiroStreamProtocolError, type KiroEvent } from "./events.ts";
 import { ByteQueue, parseEventFrame, TEXT_ENCODER } from "./eventstream.ts";
 import { kiroRuntimeHost, resolveKiroRuntimeRegion } from "./region.ts";
 import {
@@ -50,18 +50,15 @@ type KiroStreamState = {
   finishEmitted: boolean;
   startEmitted: boolean;
   stopSeen: boolean;
-  stopReason?: string;
+  stopReason?: unknown;
   stopDetails?: JsonRecord;
   hasToolCalls: boolean;
   toolCallIndex: number;
-  seenToolIds: Map<string, number>;
-  toolArgsEmitted: Map<string, string>;
-  toolArgsBuffered: Map<string, { toolIndex: number; canonical: string }>;
+  toolCalls: Map<string, PendingKiroWrapperToolCall & { wrapper: boolean; toolIndex?: number; published?: boolean }>;
   generatedToolIdCounter: number;
-  pendingWrapperToolCalls: Map<string, PendingKiroWrapperToolCall>;
   toolNameMap: Map<string, string>;
   invalidToolCall?: boolean;
-  totalContentLength?: number;
+  estimatedOutputChars: number;
   contextUsagePercentage?: number;
   hasContextUsage?: boolean;
   hasMeteringEvent?: boolean;
@@ -72,54 +69,16 @@ type KiroStreamState = {
   thinking?: KiroThinkingState;
 };
 
-/**
- * Flush buffered tool arguments at finish boundaries.
- *
- * Kiro/CodeWhisperer streams toolUseEvent.input as PARTIAL OBJECTS that grow over time
- * (e.g. {command:"cat /home"} then {command:"cat /home/wxsys"}). Re-stringifying each one
- * and emitting it as an OpenAI argument delta produces overlapping prefixes that
- * concatenate into unparseable garbage downstream ("Unterminated string").
- *
- * Fix: defer object-form payloads into state.toolArgsBuffered keyed by toolCallId, keep
- * only the latest canonical, and emit ONCE here as the complete arguments string (the
- * final object is the source of truth — intermediate states are noise). String-form
- * payloads are already concatenable deltas and are emitted incrementally.
- */
-export function flushBufferedToolArgs(
-  state: Pick<KiroStreamState, "toolArgsBuffered" | "toolArgsEmitted">,
-  controller: { enqueue: (chunk: Uint8Array) => void },
-  ctx: { responseId: string; created: number; model: string }
-): void {
-  if (!state.toolArgsBuffered || state.toolArgsBuffered.size === 0) return;
-  const { responseId, created, model } = ctx;
-  for (const [toolCallId, info] of state.toolArgsBuffered) {
-    const alreadyEmitted = state.toolArgsEmitted.get(toolCallId) || "";
-    if (info.canonical && info.canonical !== alreadyEmitted) {
-      const argsChunk: JsonRecord = {
-        id: responseId,
-        object: "chat.completion.chunk",
-        created,
-        model,
-        choices: [
-          {
-            index: 0,
-            delta: {
-              tool_calls: [
-                {
-                  index: info.toolIndex,
-                  function: { arguments: info.canonical },
-                },
-              ],
-            },
-            finish_reason: null,
-          },
-        ],
-      };
-      controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(argsChunk)}\n\n`));
-      state.toolArgsEmitted.set(toolCallId, info.canonical);
-    }
+function normalizeKiroStopReason(raw: unknown, hasToolCalls: boolean): Extract<KiroEvent, { type: "stop" }>["reason"] {
+  switch (typeof raw === "string" ? raw.toLowerCase() : raw) {
+    case undefined: case "stop": case "end_turn": return hasToolCalls ? "tool_use" : "end_turn";
+    case "tool_calls": case "tool_use": return "tool_use";
+    case "length": case "max_tokens": case "max_output_tokens": return "max_tokens";
+    case "stop_sequence": return "stop_sequence";
+    case "refusal": case "content_filter": case "guardrail_intervened": return "refusal";
+    case "pause_turn": return "pause_turn";
+    default: throw new KiroStreamProtocolError("Unsupported Kiro stop reason", "missing_terminal");
   }
-  state.toolArgsBuffered.clear();
 }
 
 function buildKiroFinishChunk(
@@ -138,7 +97,7 @@ function buildKiroFinishChunk(
       {
         index: 0,
         delta: {},
-        finish_reason: state.stopReason ?? (state.hasToolCalls ? "tool_calls" : "stop"),
+        finish_reason: normalizeKiroStopReason(state.stopReason, state.hasToolCalls),
         ...(state.stopDetails ? { kiro_stop_details: state.stopDetails } : {}),
       },
     ],
@@ -165,7 +124,7 @@ function buildKiroFinishChunk(
 function ensureKiroUsage(state: KiroStreamState, model: string, contextLength?: number | null) {
   const usage = state.usage ?? {};
   const estimated = usage.prompt_tokens === undefined || usage.completion_tokens === undefined;
-  const completionTokens = usage.completion_tokens ?? (state.totalContentLength ? Math.max(1, Math.floor(state.totalContentLength / 4)) : 0);
+  const completionTokens = usage.completion_tokens ?? (state.estimatedOutputChars ? Math.max(1, Math.floor(state.estimatedOutputChars / 4)) : 0);
   const promptTokens = usage.prompt_tokens ?? (state.contextUsagePercentage
     ? Math.round(state.contextUsagePercentage / 100 *
         (typeof contextLength === "number" && contextLength > 0 ? contextLength : contextLengthForModel(model)))
@@ -423,11 +382,9 @@ export class KiroExecutor extends BaseExecutor {
       stopSeen: false,
       hasToolCalls: false,
       toolCallIndex: 0,
-      seenToolIds: new Map(),
-      toolArgsEmitted: new Map(),
-      toolArgsBuffered: new Map(),
+      toolCalls: new Map(),
+      estimatedOutputChars: 0,
       generatedToolIdCounter: 0,
-      pendingWrapperToolCalls: new Map(),
       toolNameMap: opts.toolNameMap || new Map(),
       hasReasoningContent: false,
       reasoningChunkCount: 0,
@@ -514,26 +471,27 @@ export class KiroExecutor extends BaseExecutor {
       controller.terminate();
     };
 
-    const flushPendingWrapperToolCalls = (
-      controller: TransformStreamDefaultController
-    ): boolean => {
-      for (const toolCall of state.pendingWrapperToolCalls.values()) {
+    const flushToolCalls = (controller: TransformStreamDefaultController): boolean => {
+      for (const toolCall of state.toolCalls.values()) {
+        if (toolCall.published) continue;
         const toolInput = getBufferedKiroToolInput(toolCall);
-        try {
-          validateKiroToolCallWrapperInput(toolInput);
-        } catch (error) {
-          failInvalidToolCall(controller, error instanceof Error ? error.message : String(error));
-          return false;
+        if (toolCall.wrapper) {
+          try {
+            validateKiroToolCallWrapperInput(toolInput);
+          } catch (error) {
+            failInvalidToolCall(controller, error instanceof Error ? error.message : String(error));
+            return false;
+          }
+          toolCall.toolIndex = state.toolCallIndex++;
+          emitToolCallStart(controller, toolCall.toolCallId, toolCall.toolName, toolCall.toolIndex);
         }
-
-        const toolIndex = state.toolCallIndex++;
-        state.seenToolIds.set(toolCall.toolCallId, toolIndex);
-        emitToolCallStart(controller, toolCall.toolCallId, toolCall.toolName, toolIndex);
-        const argumentsStr =
-          typeof toolInput === "string" ? toolInput : JSON.stringify(toolInput ?? {});
-        if (argumentsStr) emitToolCallArguments(controller, toolIndex, argumentsStr);
+        if (toolCall.wrapper || toolCall.inputKind === "object") {
+          const args = typeof toolInput === "string" ? toolInput : JSON.stringify(toolInput ?? {});
+          state.estimatedOutputChars += args.length;
+          emitToolCallArguments(controller, toolCall.toolIndex!, args);
+        }
+        toolCall.published = true;
       }
-      state.pendingWrapperToolCalls.clear();
       return true;
     };
 
@@ -543,10 +501,7 @@ export class KiroExecutor extends BaseExecutor {
           buffer.push(chunk);
 
           // Parse events from buffer
-          let iterations = 0;
-          const maxIterations = 1000;
-          while (buffer.length >= 16 && iterations < maxIterations) {
-            iterations++;
+          while (buffer.length >= 16) {
             const totalLength = buffer.peekUint32BE(0);
 
             if (!totalLength || totalLength < 16 || totalLength > buffer.length) break;
@@ -597,8 +552,7 @@ export class KiroExecutor extends BaseExecutor {
               throw new Error(`Kiro upstream stream failed (${code})`);
             }
 
-            // Track total content length for token estimation
-            if (!state.totalContentLength) state.totalContentLength = 0;
+            // Output estimates count only emitted text and final tool snapshots.
             if (!state.contextUsagePercentage) state.contextUsagePercentage = 0;
 
             // Native reasoning frames. Verified against the live CodeWhisperer
@@ -635,6 +589,7 @@ export class KiroExecutor extends BaseExecutor {
                 const redacted = typeof rp?.redactedContent === "string" ? rp.redactedContent : undefined;
                 if (visibleNativeReasoning || signature || redacted) {
                   if (visibleNativeReasoning) state.hasReasoningContent = true;
+                  state.estimatedOutputChars += visibleNativeReasoning.length;
                   const reasoningDelta: JsonRecord = {
                     ...(visibleNativeReasoning
                       ? { reasoning_content: visibleNativeReasoning }
@@ -671,7 +626,7 @@ export class KiroExecutor extends BaseExecutor {
               if (!content) {
                 continue;
               }
-              state.totalContentLength += content.length;
+              if (!thinkingExpected) state.estimatedOutputChars += content.length;
 
               if (thinkingExpected && state.thinking) {
                 // Claude on Kiro emits reasoning inline as `<thinking>…</thinking>`
@@ -681,6 +636,7 @@ export class KiroExecutor extends BaseExecutor {
                 const thinkingState = state.thinking;
                 const onContent = (text: string) => {
                   if (!text) return;
+                  state.estimatedOutputChars += text.length;
                   const chunk: JsonRecord = {
                     id: responseId,
                     object: "chat.completion.chunk",
@@ -702,6 +658,7 @@ export class KiroExecutor extends BaseExecutor {
                 };
                 const onReasoning = (reasoning: string) => {
                   if (!reasoning) return;
+                  state.estimatedOutputChars += reasoning.length;
                   state.hasReasoningContent = true;
                   const reasoningDelta: JsonRecord =
                     (state.reasoningChunkCount ?? 0) === 0 && chunkIndex === 0
@@ -739,7 +696,8 @@ export class KiroExecutor extends BaseExecutor {
             }
 
             // Handle codeEvent
-            if (eventType === "codeEvent" && event.payload?.content) {
+            if (eventType === "codeEvent" && typeof event.payload?.content === "string" && event.payload.content) {
+              state.estimatedOutputChars += event.payload.content.length;
               const chunk: JsonRecord = {
                 id: responseId,
                 object: "chat.completion.chunk",
@@ -780,103 +738,38 @@ export class KiroExecutor extends BaseExecutor {
                 const toolCallId = getToolCallId(singleToolUse);
                 const toolInput = singleToolUse.input;
 
-                if (toolName === KIRO_TOOL_CALL_WRAPPER && !opts.clientDeclaresToolCall) {
-                  let pending = state.pendingWrapperToolCalls.get(toolCallId);
-                  if (!pending) {
-                    if (state.seenToolIds.has(toolCallId)) {
-                      failInvalidToolCall(
-                        controller,
-                        "Invalid Kiro tool_call payload: duplicate toolUseId reused by wrapper"
-                      );
-                      return;
-                    }
-                    pending = { toolCallId, toolName };
-                    state.pendingWrapperToolCalls.set(toolCallId, pending);
-                  }
-                  try {
-                    appendBufferedKiroToolInput(pending, toolInput);
-                  } catch (error) {
-                    failInvalidToolCall(
-                      controller,
-                      error instanceof Error ? error.message : String(error)
-                    );
-                    return;
-                  }
-                  continue;
-                }
-
-                if (state.pendingWrapperToolCalls.has(toolCallId)) {
-                  failInvalidToolCall(
-                    controller,
-                    "Invalid Kiro tool_call payload: mixed wrapper and direct tool fragments"
-                  );
+                const wrapper = toolName === KIRO_TOOL_CALL_WRAPPER && !opts.clientDeclaresToolCall;
+                let toolCall = state.toolCalls.get(toolCallId);
+                if (toolCall && (toolCall.wrapper !== wrapper || toolCall.toolName !== toolName || toolCall.published)) {
+                  failInvalidToolCall(controller, "Invalid Kiro tool_call payload: inconsistent tool fragments");
                   return;
                 }
-
-                let toolIndex;
-                const isNewTool = !state.seenToolIds.has(toolCallId);
-
-                if (isNewTool) {
-                  toolIndex = state.toolCallIndex++;
-                  state.seenToolIds.set(toolCallId, toolIndex);
-                  emitToolCallStart(controller, toolCallId, toolName, toolIndex);
-                } else {
-                  toolIndex = state.seenToolIds.get(toolCallId) as number;
-                }
-
-                if (toolInput !== undefined) {
-                  if (typeof toolInput === "string") {
-                    // String-form payloads are already concatenable incremental deltas —
-                    // emit immediately and track what we've sent.
-                    state.toolArgsEmitted.set(
-                      toolCallId,
-                      (state.toolArgsEmitted.get(toolCallId) || "") + toolInput
-                    );
-
-                    const argsChunk = {
-                      id: responseId,
-                      object: "chat.completion.chunk",
-                      created,
-                      model,
-                      choices: [
-                        {
-                          index: 0,
-                          delta: {
-                            tool_calls: [
-                              {
-                                index: toolIndex,
-                                function: {
-                                  arguments: toolInput,
-                                },
-                              },
-                            ],
-                          },
-                          finish_reason: null,
-                        },
-                      ],
-                    };
-                    chunkIndex++;
-                    controller.enqueue(
-                      TEXT_ENCODER.encode(`data: ${JSON.stringify(argsChunk)}\n\n`)
-                    );
-                  } else if (typeof toolInput === "object" && toolInput !== null) {
-                    // Object-form payloads are PARTIAL OBJECTS that grow over time. Buffer
-                    // the latest canonical and flush once at a finish boundary, otherwise the
-                    // overlapping JSON prefixes concatenate into unparseable garbage.
-                    state.toolArgsBuffered.set(toolCallId, {
-                      toolIndex,
-                      canonical: JSON.stringify(toolInput),
-                    });
+                if (!toolCall) {
+                  toolCall = { toolCallId, toolName, wrapper };
+                  state.toolCalls.set(toolCallId, toolCall);
+                  if (!wrapper) {
+                    toolCall.toolIndex = state.toolCallIndex++;
+                    emitToolCallStart(controller, toolCallId, toolName, toolCall.toolIndex);
                   }
+                }
+                try {
+                  appendBufferedKiroToolInput(toolCall, toolInput);
+                } catch (error) {
+                  failInvalidToolCall(controller, error instanceof Error ? error.message : String(error));
+                  return;
+                }
+                if (!wrapper && typeof toolInput === "string") {
+                  state.estimatedOutputChars += toolInput.length;
+                  emitToolCallArguments(controller, toolCall.toolIndex!, toolInput);
                 }
               }
             }
 
             // Handle messageStopEvent
             if (eventType === "messageStopEvent") {
-              if (!flushPendingWrapperToolCalls(controller)) return;
-              flushBufferedToolArgs(state, controller, { responseId, created, model });
+              if (!flushToolCalls(controller)) return;
               state.stopSeen = true;
+              if (event.payload && Object.hasOwn(event.payload, "stopReason")) state.stopReason = event.payload.stopReason;
             }
 
             // Handle contextUsageEvent to extract contextUsagePercentage
@@ -918,7 +811,7 @@ export class KiroExecutor extends BaseExecutor {
                   };
                 }
               }
-              if (typeof metadata.stopReason === "string" && metadata.stopReason) {
+              if (Object.hasOwn(metadata, "stopReason")) {
                 state.stopSeen = true;
                 state.stopReason = metadata.stopReason;
                 if (metadata.stopDetails && typeof metadata.stopDetails === "object") {
@@ -933,9 +826,6 @@ export class KiroExecutor extends BaseExecutor {
 
           }
 
-          if (iterations >= maxIterations) {
-            console.warn("[Kiro] Max iterations reached in event parsing");
-          }
         },
 
         flush(controller) {
@@ -943,10 +833,8 @@ export class KiroExecutor extends BaseExecutor {
           if (buffer.length > 0 || (!state.stopSeen && !state.hasMeteringEvent && !state.finishEmitted)) {
             throw new KiroStreamProtocolError();
           }
-          if (!flushPendingWrapperToolCalls(controller)) return;
+          if (!flushToolCalls(controller)) return;
           if (state.invalidToolCall) return;
-          // idempotent against toolArgsEmitted if messageStopEvent already flushed them.
-          flushBufferedToolArgs(state, controller, { responseId, created, model });
 
           // Drain any pending inline-thinking tag fragment so we don't drop
           // trailing characters when the stream ends mid-tag (e.g. `<thi`).
@@ -956,6 +844,7 @@ export class KiroExecutor extends BaseExecutor {
               thinkingState,
               (text) => {
                 if (!text) return;
+                state.estimatedOutputChars += text.length;
                 const chunk: JsonRecord = {
                   id: responseId,
                   object: "chat.completion.chunk",
@@ -968,6 +857,7 @@ export class KiroExecutor extends BaseExecutor {
               },
               (reasoning) => {
                 if (!reasoning) return;
+                state.estimatedOutputChars += reasoning.length;
                 const chunk: JsonRecord = {
                   id: responseId,
                   object: "chat.completion.chunk",
@@ -1021,43 +911,8 @@ export class KiroExecutor extends BaseExecutor {
     });
   }
 
-  async refreshCredentials(credentials: ProviderCredentials, log?: ExecutorLog | null) {
-    if (credentials.providerSpecificData?.authMethod === "api_key") return null;
-    if (!credentials.refreshToken) return null;
-
-    try {
-      // Use centralized refreshKiroToken function (handles both AWS SSO OIDC and Social Auth)
-      const result = await refreshKiroToken(
-        credentials.refreshToken,
-        credentials.providerSpecificData,
-        log
-      );
-
-      if (!result || result.error) return result;
-
-      // If client was re-registered (expired/invalid clientId/clientSecret after DB import,
-      // TTL expiry, or browser conflict), update providerSpecificData with new credentials (#2524).
-      if (result._newClientId) {
-        const updatedPsd = {
-          ...(credentials.providerSpecificData || {}),
-          clientId: result._newClientId,
-          clientSecret: result._newClientSecret,
-          clientSecretExpiresAt: result._newClientSecretExpiresAt,
-        };
-        return {
-          accessToken: result.accessToken,
-          refreshToken: result.refreshToken,
-          expiresIn: result.expiresIn,
-          providerSpecificData: updatedPsd,
-        };
-      }
-
-      return result;
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      log?.error?.("TOKEN", `Kiro refresh error: ${err.message}`);
-      return null;
-    }
+  async refreshCredentials(credentials: ProviderCredentials, log?: ExecutorLog | null): Promise<KiroRefreshResult> {
+    return refreshKiroToken(credentials.refreshToken, credentials.providerSpecificData, log);
   }
 }
 

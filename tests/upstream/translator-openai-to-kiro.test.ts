@@ -969,9 +969,7 @@ test("OpenAI -> Kiro serializes non-string role:tool content to non-empty text (
   assert.match(text, /entry A/, "serialized content preserves the structured text blocks");
 });
 
-// Only Claude models support images in Kiro. Non-Claude Kiro models
-// (deepseek-3.2, minimax-m2.5, glm-5, qwen3-coder-next) must NOT
-// receive image attachments — attaching them is wrong for those models.
+// Offline text-only models omit image bytes and retain a positional notice.
 const PNG_DATA_URL = "data:image/png;base64,aGVsbG8=";
 
 function buildImageRequest(model: string) {
@@ -1323,8 +1321,8 @@ test("sanitizes long forced tool names consistently and rejects invalid choices"
   const loweredName = lowered && typeof lowered === "object" && "tool" in lowered && lowered.tool && typeof lowered.tool === "object" && "name" in lowered.tool ? lowered.tool.name : undefined;
   assert.equal(loweredName, sanitized);
   assert.throws(() => choicePayload({ type: "tool", name: "missing" }), /undeclared/);
-  assert.throws(() => choicePayload("required"), /tool_choice/);
-  assert.throws(() => choicePayload({ type: "any", disable_parallel_tool_use: true }), /disable_parallel_tool_use/);
+  assert.deepEqual(choicePayload("required").conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolChoice, { any: {} });
+  assert.deepEqual(choicePayload({ type: "any", disable_parallel_tool_use: true }).conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolChoice, { any: {} });
 });
 
 // Kiro's adaptive schema marks `thinking.type` as required. Sending only

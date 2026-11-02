@@ -1,24 +1,9 @@
-/**
- * OpenAI Chat Completions surface.
- *
- * The executor already emits OpenAI `chat.completion.chunk` SSE, so a streaming
- * request is served by forwarding that stream untouched — `/v1/messages` is the
- * endpoint doing extra work, translating those chunks into Anthropic events.
- *
- * A non-streaming request still has a stream to fold up, which is what this
- * module does, over the same protocol-neutral event reader the Anthropic
- * collector uses.
- */
+/** OpenAI Chat Completions encoding over the executor's internal event stream. */
 
-import { readKiroEvents, type KiroEvent } from "./kiro/events.ts";
+import { KiroStreamProtocolError, readKiroEvents, type KiroEvent } from "./kiro/events.ts";
 
 type ToolCall = { id: string; name: string; arguments: string };
 
-/**
- * The event reader normalizes stop reasons to Anthropic's vocabulary; map back
- * to the four values the Chat Completions schema defines. `pause_turn` has no
- * OpenAI equivalent and is reported as a normal stop.
- */
 const OPENAI_FINISH_REASONS: Record<string, string> = {
   end_turn: "stop",
   stop_sequence: "stop",
@@ -27,6 +12,56 @@ const OPENAI_FINISH_REASONS: Record<string, string> = {
   max_tokens: "length",
   refusal: "content_filter",
 };
+
+type StreamOptions = { onStreamFailure?: (code: string) => void };
+
+function chatUsage(event: Extract<KiroEvent, { type: "usage" }>) {
+  const prompt = event.inputTokens + (event.cacheReadInputTokens ?? 0) + (event.cacheCreationInputTokens ?? 0);
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: event.outputTokens,
+    total_tokens: prompt + event.outputTokens,
+    ...(event.cacheReadInputTokens === undefined ? {} : { prompt_tokens_details: { cached_tokens: event.cacheReadInputTokens } }),
+  };
+}
+
+export function chatCompletionStream(response: Response, model: string, options: StreamOptions = {}): Response {
+  const encoder = new TextEncoder();
+  const abort = new AbortController();
+  let responseId = `chatcmpl-${Date.now()}`;
+  const created = Math.floor(Date.now() / 1000);
+  const stream = new ReadableStream<Uint8Array>({ async start(controller) {
+    const send = (data: unknown) => controller.enqueue(encoder.encode(`data: ${typeof data === "string" ? data : JSON.stringify(data)}\n\n`));
+    const chunk = (delta: Record<string, unknown>, finish_reason: string | null = null) => send({ id: responseId, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, logprobs: null, finish_reason }] });
+    let usage: Extract<KiroEvent, { type: "usage" }> | undefined;
+    try {
+      for await (const event of readKiroEvents(response, model, abort.signal)) {
+        if (abort.signal.aborted) return;
+        switch (event.type) {
+          case "start": if (event.responseId) responseId = event.responseId; chunk({ role: "assistant", content: "" }); break;
+          case "text_delta": chunk({ content: event.text }); break;
+          case "thinking_delta": chunk({ reasoning_content: event.thinking }); break;
+          case "tool_start": chunk({ tool_calls: [{ index: event.index, id: event.id, type: "function", function: { name: event.name, arguments: "" } }] }); break;
+          case "tool_input_delta": chunk({ tool_calls: [{ index: event.index, function: { arguments: event.delta } }] }); break;
+          case "usage": usage = event; break;
+          case "stop":
+            chunk({}, OPENAI_FINISH_REASONS[event.reason]);
+            if (usage) send({ id: responseId, object: "chat.completion.chunk", created, model, choices: [], usage: chatUsage(usage) });
+            break;
+        }
+      }
+      if (abort.signal.aborted) return;
+      send("[DONE]");
+      controller.close();
+    } catch (error) {
+      if (abort.signal.aborted) return;
+      options.onStreamFailure?.(error instanceof KiroStreamProtocolError ? error.code : "stream_error");
+      send({ error: { type: "api_error", code: "stream_error", message: "Upstream stream failed" } });
+      controller.close();
+    }
+  }, cancel(reason) { abort.abort(reason); } });
+  return new Response(stream, { headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" } });
+}
 
 export async function collectChatCompletion(response: Response, model: string): Promise<Response> {
   let responseId = `chatcmpl-${Date.now()}`;
@@ -83,15 +118,7 @@ export async function collectChatCompletion(response: Response, model: string): 
       : {}),
   };
 
-  const chatUsage = usage && {
-    prompt_tokens: usage.inputTokens,
-    completion_tokens: usage.outputTokens,
-    total_tokens: usage.inputTokens + usage.outputTokens,
-    ...(usage.cacheReadInputTokens === undefined
-      ? {}
-      : { prompt_tokens_details: { cached_tokens: usage.cacheReadInputTokens } }),
-    ...(usage.estimated ? { estimated: true } : {}),
-  };
+  const usageValue = usage && chatUsage(usage);
 
   return Response.json({
     id: responseId,
@@ -106,6 +133,6 @@ export async function collectChatCompletion(response: Response, model: string): 
         finish_reason: OPENAI_FINISH_REASONS[stop.reason] ?? "stop",
       },
     ],
-    ...(chatUsage ? { usage: chatUsage } : {}),
+    ...(usageValue ? { usage: usageValue } : {}),
   });
 }

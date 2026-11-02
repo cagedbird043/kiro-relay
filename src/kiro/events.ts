@@ -32,18 +32,14 @@ const str = (v: unknown): string | undefined => typeof v === "string" ? v : unde
 const num = (v: unknown): number | undefined => typeof v === "number" && Number.isFinite(v) ? v : undefined;
 
 function stopReason(reason: unknown): StopReason {
-  switch (typeof reason === "string" ? reason.toLowerCase() : reason) {
-    case "stop": case "end_turn": return "end_turn";
-    case "tool_calls": case "tool_use": return "tool_use";
-    case "length": case "max_tokens": case "max_output_tokens": return "max_tokens";
-    case "stop_sequence": return "stop_sequence";
-    case "refusal": case "content_filter": case "guardrail_intervened": return "refusal";
-    case "pause_turn": return "pause_turn";
+  switch (reason) {
+    case "end_turn": case "tool_use": case "max_tokens":
+    case "stop_sequence": case "refusal": case "pause_turn": return reason;
     default: throw new KiroStreamProtocolError("Unsupported Kiro stop reason", "missing_terminal");
   }
 }
 
-/** Parse the executor's OpenAI-compatible SSE, tolerating fragmented and multiline data frames. */
+/** Parse the executor's internal SSE, tolerating fragmented and multiline data frames. */
 export async function* readKiroEvents(response: Response, model: string, signal?: AbortSignal): AsyncGenerator<KiroEvent> {
   const isJSON = response.headers.get("content-type")?.includes("application/json");
   const reader = response.body?.getReader();

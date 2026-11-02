@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHandler, type ExecutorLike } from "../src/server.ts";
+import { chatCompletionStream, collectChatCompletion } from "../src/chat.ts";
 
 /** Mirrors what the executor emits: a full chat.completion.chunk envelope per frame. */
 function sse(...chunks: Array<Record<string, unknown>>): Response {
@@ -17,7 +18,7 @@ function sse(...chunks: Array<Record<string, unknown>>): Response {
 
 const TEXT_TURN = [
   { choices: [{ delta: { role: "assistant", content: "hello" } }] },
-  { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 4, completion_tokens: 2 } },
+  { choices: [{ delta: {}, finish_reason: "end_turn" }], usage: { prompt_tokens: 4, completion_tokens: 2 } },
 ];
 
 async function fixture(auth?: { keys: string[] }) {
@@ -30,7 +31,7 @@ async function fixture(auth?: { keys: string[] }) {
   const handler = createHandler(
     {
       listen: "127.0.0.1:0",
-      models: { "glm-5": { contextLength: 200_000 } },
+      models: { "glm-5": { contextLength: 200_000 }, "gpt-5.6-sol": { contextLength: 1_000_000 } },
       accounts: [{ credentialFile }],
       ...(auth ? { auth } : {}),
     },
@@ -39,7 +40,7 @@ async function fixture(auth?: { keys: string[] }) {
         seen.push(input);
         return { response: upstream() };
       },
-      refreshCredentials: async () => null,
+      refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
     }
   );
   return {
@@ -86,7 +87,7 @@ describe("chat completions", () => {
       sse(
         { choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "lookup", arguments: '{"q":' } }] } }] },
         { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] } }] },
-        { choices: [{ delta: {}, finish_reason: "tool_calls" }] }
+        { choices: [{ delta: {}, finish_reason: "tool_use" }] }
       )
     );
     try {
@@ -104,7 +105,7 @@ describe("chat completions", () => {
 
   test("maps a truncated turn to the OpenAI length reason", async () => {
     const f = await fixture();
-    f.reply(() => sse({ choices: [{ delta: { content: "partial" } }] }, { choices: [{ delta: {}, finish_reason: "length" }] }));
+    f.reply(() => sse({ choices: [{ delta: { content: "partial" } }] }, { choices: [{ delta: {}, finish_reason: "max_tokens" }] }));
     try {
       const body = await (await f.handler(post(TEXT_REQUEST))).json();
 
@@ -114,7 +115,7 @@ describe("chat completions", () => {
     }
   });
 
-  test("forwards a streaming turn as chat.completion.chunk frames", async () => {
+  test("reencodes a streaming turn as public chat.completion.chunk frames", async () => {
     const f = await fixture();
     try {
       const response = await f.handler(post({ ...TEXT_REQUEST, stream: true }));
@@ -232,4 +233,98 @@ describe("browser access", () => {
       await rm(f.directory, { recursive: true, force: true });
     }
   });
+});
+
+test("Chat streaming and collected usage include cache reads and writes without internal fields", async () => {
+  const source = () => sse(
+    { choices: [{ delta: { reasoning_content: "why", reasoning_signature: "private-signature", reasoning_redacted: "private-hidden" } }] },
+    { choices: [{ delta: { content: "ok" }, finish_reason: "max_tokens", kiro_stop_details: { private: true } }], usage: { prompt_tokens: 3, completion_tokens: 5, cache_read_input_tokens: 7, cache_creation_input_tokens: 11, estimated: true } },
+  );
+  const collected = await (await collectChatCompletion(source(), "glm-5")).json();
+  const text = await chatCompletionStream(source(), "glm-5").text();
+  const chunks = text.split("\n\n").filter(frame => frame.startsWith("data: {")).map(frame => JSON.parse(frame.slice(6)));
+  expect(chunks[0].choices[0].delta.role).toBe("assistant");
+  expect(chunks.find(chunk => chunk.choices[0]?.finish_reason)?.choices[0].finish_reason).toBe("length");
+  expect(collected.usage).toEqual({ prompt_tokens: 21, completion_tokens: 5, total_tokens: 26, prompt_tokens_details: { cached_tokens: 7 } });
+  expect(chunks.find(chunk => chunk.usage)?.usage).toEqual(collected.usage);
+  expect(text).toContain('"reasoning_content":"why"');
+  for (const privateField of ["private-signature", "private-hidden", "kiro_stop_details", "estimated", "cache_creation_input_tokens", "max_tokens"]) expect(text).not.toContain(privateField);
+});
+
+test("Chat emits content before upstream termination", async () => {
+  let input!: ReadableStreamDefaultController<Uint8Array>;
+  const source = new Response(new ReadableStream<Uint8Array>({ start(controller) { input = controller; } }));
+  const reader = chatCompletionStream(source, "glm-5").body!.getReader();
+  input.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"first"}}]}\n\n'));
+  expect(new TextDecoder().decode((await reader.read()).value)).toContain('"role":"assistant"');
+  expect(new TextDecoder().decode((await reader.read()).value)).toContain('"content":"first"');
+  await reader.cancel();
+});
+
+test("server logs one metadata-only failure for all streaming protocols and pause_turn", async () => {
+  const f = await fixture();
+  const previous = console.info;
+  const logs: unknown[][] = [];
+  console.info = (...args: unknown[]) => { logs.push(args); };
+  try {
+    for (const [path, failure] of [
+      ["/v1/chat/completions", "eof"], ["/v1/messages", "eof"], ["/v1/responses", "eof"], ["/v1/responses", "pause"],
+      ["/v1/chat/completions", "throw"], ["/v1/messages", "throw"], ["/v1/responses", "throw"],
+    ] as const) {
+      logs.length = 0;
+      f.reply(() => failure === "throw"
+        ? new Response(new ReadableStream({ start(controller) { controller.error(new Error("private-error-message")); } }))
+        : new Response(`data: ${JSON.stringify({ choices: [{ delta: { content: "private-body" }, ...(failure === "pause" ? { finish_reason: "pause_turn" } : {}) }] })}\n\n`));
+      const body = path === "/v1/responses" ? { model: "gpt-5.6-sol", input: "hello", stream: true } : { ...TEXT_REQUEST, stream: true, max_tokens: 16 };
+      const response = await f.handler(new Request(`http://relay${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
+      const output = await response.text();
+      expect(output).toContain(path === "/v1/responses" ? "response.failed" : '"error"');
+      const failures = logs.filter(args => JSON.stringify(args).includes("stream_failed"));
+      expect(failures).toHaveLength(1);
+      expect(failures[0]?.[1]).toMatchObject({ requestId: response.headers.get("request-id"), code: failure === "pause" ? "pause_turn" : failure === "throw" ? "stream_error" : "unexpected_eof" });
+      expect(JSON.stringify(logs)).not.toContain("private-body");
+      expect(JSON.stringify(logs)).not.toContain("private-error-message");
+    }
+  } finally { console.info = previous; await rm(f.directory, { recursive: true, force: true }); }
+});
+
+test("protocol parameter rejections return 400 before execute", async () => {
+  const f = await fixture();
+  try {
+    for (const [path, body, message] of [
+      ["/v1/messages", { ...TEXT_REQUEST, top_k: null, max_tokens: 16 }, "Unsupported top_k on this relay"],
+      ["/v1/responses", { model: "gpt-5.6-sol", input: "hello", text: { format: { type: "json_object" } } }, "Unsupported text.format on this relay"],
+    ] as const) {
+      const response = await f.handler(new Request(`http://relay${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
+      expect(response.status).toBe(400);
+      expect((await response.json()).error.message).toBe(message);
+    }
+    expect(f.seen).toHaveLength(0);
+  } finally { await rm(f.directory, { recursive: true, force: true }); }
+});
+
+test("real HTTP smoke reencodes executor events and cache-inclusive usage", async () => {
+  const f = await fixture();
+  f.reply(() => sse(
+    { choices: [{ delta: { reasoning_content: "reason", reasoning_signature: "hidden-signature" } }] },
+    { choices: [{ delta: { tool_calls: [{ index: 0, id: "call", function: { name: "read", arguments: "{}" } }] }, finish_reason: "tool_use" }], usage: { prompt_tokens: 2, completion_tokens: 3, cache_read_input_tokens: 10, cache_creation_input_tokens: 4, estimated: true } },
+  ));
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: f.handler });
+  try {
+    for (const stream of [false, true]) {
+      const response = await fetch(`http://127.0.0.1:${server.port}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...TEXT_REQUEST, stream }) });
+      expect(response.status).toBe(200);
+      if (stream) {
+        const text = await response.text();
+        expect(text).toContain('"finish_reason":"tool_calls"');
+        expect(text).toContain('"prompt_tokens":16');
+        expect(text).not.toContain("hidden-signature");
+        expect(text).not.toContain("estimated");
+      } else {
+        const body = await response.json();
+        expect(body.choices[0].finish_reason).toBe("tool_calls");
+        expect(body.usage).toEqual({ prompt_tokens: 16, completion_tokens: 3, total_tokens: 19, prompt_tokens_details: { cached_tokens: 10 } });
+      }
+    }
+  } finally { await server.stop(true); await rm(f.directory, { recursive: true, force: true }); }
 });

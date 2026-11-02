@@ -39,7 +39,7 @@ function upstreamToolCall(): Response {
         },
       ],
     },
-    { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+    { choices: [{ delta: {}, finish_reason: "tool_use" }] },
   ];
   return new Response(chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join(""));
 }
@@ -73,7 +73,7 @@ test("Codex Responses Lite fixture produces a custom tool call", async () => {
       seen.push(input);
       return { response: upstreamToolCall() };
     },
-    refreshCredentials: async () => null,
+    refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
   };
   const handler = createHandler(config, executor);
   const body = {
@@ -122,11 +122,11 @@ test("Codex custom tool output fixture becomes a Kiro tool result", async () => 
       seenBody = request.body;
       return {
         response: new Response(
-          `data: ${JSON.stringify({ choices: [{ delta: { content: "done" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`
+          `data: ${JSON.stringify({ choices: [{ delta: { content: "done" }, finish_reason: "end_turn" }] })}\n\ndata: [DONE]\n\n`
         ),
       };
     },
-    refreshCredentials: async () => null,
+    refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
   };
   const response = await createHandler(config, executor)(
     new Request("http://relay/v1/responses", {

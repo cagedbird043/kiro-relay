@@ -5,7 +5,6 @@
 import { v4 as uuidv4, v5 as uuidv5 } from "uuid";
 import {
   parseToolInput,
-  normalizeKiroToolSchema,
   serializeToolResultContent,
 } from "./messageHelpers.ts";
 import {
@@ -19,6 +18,8 @@ import type { ProviderCredentials } from "../base.ts";
 import { supportsKiroImages } from "../modelCapabilities.ts";
 import { remapKiroToolHistory, sanitizeKiroTools } from "../sanitizer.ts";
 import { mergeKiroReasoning, type KiroReasoningContent } from "../reasoning.ts";
+import { normalizeKiroConversation, synthesizeHistoryToolSpecs, lowerKiroToolChoice, type KiroCurrentMessage } from "./history.ts";
+import { parseInlineImage, imageSizeViolation, REMOTE_IMAGE, UNSUPPORTED_MODEL_IMAGE } from "../../imageLimit.ts";
 
 /** 用户回合附带的工具声明、工具结果与强制工具选择。 */
 export type KiroUserInputMessageContext = {
@@ -95,12 +96,12 @@ type KiroToolInput = {
  * unsupported field into the upstream payload.
  */
 function buildKiroToolSpecs(tools: KiroToolInput[]): {
-  specs: Array<Record<string, unknown>>;
+  specs: NonNullable<KiroUserInputMessageContext["tools"]>;
   docs: string;
 } {
   const docs: string[] = [];
   const specs = tools.map((t) => {
-    const name = t.function?.name || t.name;
+    const name = t.function?.name || t.name || "";
     let description = t.function?.description || t.description || "";
 
     if (!description.trim()) {
@@ -111,15 +112,14 @@ function buildKiroToolSpecs(tools: KiroToolInput[]): {
       docs.push(`## Tool: ${name}\n\n${description}`);
       description = `[Full documentation in initial context under '## Tool: ${name}']`;
     }
+    const schema = t.function?.parameters ?? t.parameters ?? t.input_schema;
 
     return {
       toolSpecification: {
         name,
         description,
         inputSchema: {
-          json: normalizeKiroToolSchema(
-            t.function?.parameters || t.parameters || t.input_schema || {}
-          ),
+          json: schema && typeof schema === "object" && !Array.isArray(schema) ? schema : { type: "object", properties: {} },
         },
       },
     };
@@ -132,7 +132,7 @@ function buildKiroToolSpecs(tools: KiroToolInput[]): {
  * Does this message carry Anthropic-style `tool_result` content blocks? Such a
  * user message is part of an open tool-result batch rather than new user input.
  */
-function carriesToolResults(msg): boolean {
+function carriesToolResults(msg: RequestMessage): boolean {
   return Array.isArray(msg?.content) && msg.content.some((c) => c.type === "tool_result");
 }
 
@@ -149,7 +149,7 @@ function carriesToolResults(msg): boolean {
  * Returning false for the ordinary `tool -> assistant(final reply)` shape is
  * what keeps that reply on the normal flush path instead of being deferred.
  */
-function hasFollowingToolResult(messages, index: number): boolean {
+function hasFollowingToolResult(messages: RequestMessage[], index: number): boolean {
   for (let j = index + 1; j < messages.length; j++) {
     const next = messages[j];
     if (next.role === "tool") return true;
@@ -186,604 +186,121 @@ function hasFollowingToolResult(messages, index: number): boolean {
  * Convert OpenAI messages to Kiro format
  * Rules: system/tool/user -> user role, merge consecutive same roles
  */
-function convertMessages(messages, tools, model) {
-  let history = [];
-  let currentMessage = null;
+type ToolCall = { id?: string; name?: string; input?: unknown; function?: { name: string; arguments?: unknown } };
+type ContentBlock = ToolCall & { type?: string; text?: string; thinking?: string; signature?: string; data?: string; tool_use_id?: string; is_error?: boolean; content?: unknown };
+type RequestMessage = { role?: string; content?: string | ContentBlock[]; tool_calls?: ToolCall[]; tool_call_id?: string };
 
-  let pendingUserContent = [];
-  let pendingAssistantContent = [];
-  let pendingReasoning: KiroReasoningContent | undefined;
-  let pendingToolResults = [];
-  // Text-only assistant turns that arrived in the middle of an open tool-result
-  // batch. They are held back so the batch stays contiguous, then emitted as
-  // their own assistant turn right after the batch flushes — see
-  // `interruptsOpenToolBatch` below (issue #8903).
-  let deferredAssistantContent: string[] = [];
-  let pendingImages: Array<{ format: string; source: { bytes: string } }> = [];
-  let currentRole = null;
-  let toolsAttached = false;
-  let toolDocs = "";
-
-  // Attachments are accepted only for explicitly listed Kiro models. Unknown
-  // and known text-only models remain image-disabled by default.
-  const supportsImages = typeof model === "string" && supportsKiroImages(model);
-
-  const flushPending = () => {
-    if (currentRole === "user") {
-      const content = pendingUserContent.join("\n\n").trim();
-      const userMsg: {
-        userInputMessage: {
-          content: string;
-          modelId: string;
-          images?: Array<{ format: string; source: { bytes: string } }>;
-          origin: string;
-          userInputMessageContext?: {
-            toolResults?: Array<Record<string, unknown>>;
-            tools?: Array<Record<string, unknown>>;
-          };
-        };
-      } = {
-        userInputMessage: {
-          content: content,
-          modelId: "",
-          origin: "AI_EDITOR",
-        },
-      };
-
-      if (pendingToolResults.length > 0) {
-        userMsg.userInputMessage.userInputMessageContext = {
-          toolResults: pendingToolResults,
-        };
-      }
-
-      // Attach images to userInputMessage (NOT userInputMessageContext)
-      if (pendingImages.length > 0) {
-        userMsg.userInputMessage.images = pendingImages;
-      }
-
-      // Add tools to the first emitted user turn. We track a flag instead of
-      // relying on `history.length === 0` because the first few messages may
-      // be assistant turns (e.g. when role=undefined collapses to a prior
-      // assistant turn), in which case the first user flush would already see
-      // a non-empty history and lose the tools schema.
-      if (tools && tools.length > 0 && !toolsAttached) {
-        if (!userMsg.userInputMessage.userInputMessageContext) {
-          userMsg.userInputMessage.userInputMessageContext = {};
-        }
-        const built = buildKiroToolSpecs(tools);
-        userMsg.userInputMessage.userInputMessageContext.tools = built.specs;
-        if (built.docs) toolDocs = built.docs;
-        toolsAttached = true;
-      }
-
-      history.push(userMsg);
-      currentMessage = userMsg;
-      pendingUserContent = [];
-      pendingToolResults = [];
-      pendingImages = [];
-
-      // The tool batch is now closed, so any assistant text that was held back
-      // to keep it contiguous can be emitted as its own turn (issue #8903).
-      // Without this the deferred text would sit in a queue nothing drains and
-      // be silently dropped from the transcript.
-      if (deferredAssistantContent.length > 0) {
-        history.push({
-          assistantResponseMessage: {
-            content: deferredAssistantContent.join("\n\n").trim(),
-          },
-        });
-        deferredAssistantContent = [];
-      }
-    } else if (currentRole === "assistant") {
-      const content = pendingAssistantContent.join("\n\n").trim();
-      const assistantMsg = {
-        assistantResponseMessage: {
-          content: content,
-          ...(pendingReasoning ? { reasoningContent: pendingReasoning } : {}),
-        },
-      };
-      history.push(assistantMsg);
-      pendingAssistantContent = [];
-      pendingReasoning = undefined;
-    }
-  };
-
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i];
-    let role = msg.role;
-
-    // Normalize: system/tool -> user
-    if (role === "system" || role === "tool") {
-      role = "user";
-    }
-
-    // If role changes, flush pending
-    //
-    // Exception: a text-only assistant message must not split a batch of tool
-    // results that answers a single assistant turn. `tool` is normalized to
-    // `user` above, so `tool -> assistant -> tool` looks like two role changes
-    // and the interleaved flush would emit the first tool result and drop the
-    // rest, leaving advertised `toolUses` without matching `toolResults`.
-    // Bedrock rejects that transcript with 400 "Expected toolResult blocks"
-    // (issue #8903). Defer the assistant text instead so the tool batch stays
-    // contiguous; the text is re-emitted as its own assistant turn as soon as
-    // the batch flushes.
-    //
-    // The lookahead matters: without it, an ordinary trailing assistant reply
-    // (`tool -> assistant`, with no further tool message) would also be
-    // deferred and its text lost. Only a genuine sandwich qualifies.
-    const isTextOnlyAssistant =
-      msg.role === "assistant" &&
-      (!msg.tool_calls || msg.tool_calls.length === 0) &&
-      !(Array.isArray(msg.content) && msg.content.some((c) => c.type === "tool_use"));
-    const interruptsOpenToolBatch =
-      isTextOnlyAssistant &&
-      currentRole === "user" &&
-      pendingToolResults.length > 0 &&
-      hasFollowingToolResult(messages, i);
-
-    if (interruptsOpenToolBatch) {
-      const deferredText =
-        typeof msg.content === "string"
-          ? msg.content.trim()
-          : Array.isArray(msg.content)
-            ? msg.content
-                .filter((c) => c.type === "text" || c.text)
-                .map((c) => c.text || "")
-                .join("\n")
-                .trim()
-            : "";
-      if (deferredText) deferredAssistantContent.push(deferredText);
+/** Keep entire assistant messages, including opaque reasoning, outside an open result batch. */
+function reorderInterleavedAssistant(messages: RequestMessage[]): RequestMessage[] {
+  const ordered: RequestMessage[] = [];
+  const deferred: RequestMessage[] = [];
+  let inBatch = false;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    const toolResult = message.role === "tool" || carriesToolResults(message);
+    const assistantOnly = message.role === "assistant" && !message.tool_calls?.length &&
+      !(Array.isArray(message.content) && message.content.some(block => block.type === "tool_use"));
+    if (inBatch && assistantOnly && hasFollowingToolResult(messages, index)) {
+      deferred.push(message);
       continue;
     }
-
-    // Once assistant text has been deferred, the tool batch is logically over
-    // as soon as a message arrives that is not itself a tool result. Flush now
-    // so the pending batch + deferred assistant turn are emitted before the new
-    // user text, instead of that text merging into the tool-result turn and
-    // leaving the deferred reply stranded after it (issue #8903).
-    if (
-      deferredAssistantContent.length > 0 &&
-      currentRole === "user" &&
-      msg.role !== "tool" &&
-      !carriesToolResults(msg)
-    ) {
-      flushPending();
-      currentRole = null;
-    }
-
-    if (role !== currentRole && currentRole !== null) {
-      flushPending();
-    }
-    currentRole = role;
-    if (role === "user") {
-      // Extract content
-      let content = "";
-      if (typeof msg.content === "string") {
-        content = msg.content;
-      } else if (Array.isArray(msg.content)) {
-        const textParts = msg.content
-          .filter((c) => c.type === "text" || c.text)
-          .map((c) => c.text || "");
-        content = textParts.join("\n");
-
-        // Extract images (OpenAI image_url and Anthropic image formats).
-        // Skip entirely for models that do not support images — see supportsImages.
-        for (const block of msg.content) {
-          if (supportsImages && block.type === "image_url") {
-            const url: string = block.image_url?.url || "";
-            if (url.startsWith("data:")) {
-              // data:image/jpeg;base64,<data>
-              const [header, bytes] = url.split(",", 2);
-              const mediaType = header.split(";")[0].replace("data:", ""); // e.g. "image/jpeg"
-              const format = mediaType.split("/")[1] || "jpeg";
-              if (bytes) pendingImages.push({ format, source: { bytes } });
-            }
-          } else if (supportsImages && block.type === "image" && block.source?.type === "base64") {
-            const format = (block.source.media_type || "image/jpeg").split("/")[1] || "jpeg";
-            if (block.source.data)
-              pendingImages.push({ format, source: { bytes: block.source.data } });
-          } else if (supportsImages && block.type === "image" && typeof block.image === "string") {
-            // AI SDK-style image part: { type: "image", image: "data:...;base64,..." } (#1330)
-            const url = block.image;
-            if (url.startsWith("data:")) {
-              const [header, bytes] = url.split(",", 2);
-              const mediaType = header.split(";")[0].replace("data:", "");
-              const format = mediaType.split("/")[1] || "jpeg";
-              if (bytes) pendingImages.push({ format, source: { bytes } });
-            }
-          }
-        }
-
-        // Check for tool_result blocks. Kiro keeps tool observations in
-        // userInputMessageContext, while image bytes belong on the surrounding
-        // userInputMessage. Preserve both parts of an Anthropic Read result.
-        const toolResultBlocks = msg.content.filter((c) => c.type === "tool_result");
-        if (toolResultBlocks.length > 0) {
-          toolResultBlocks.forEach((block) => {
-            const text = serializeToolResultContent(block.content);
-            pendingToolResults.push({
-              toolUseId: block.tool_use_id,
-              status: block.is_error ? "error" : "success",
-              content: [{ text: text }],
-            });
-            if (supportsImages && Array.isArray(block.content)) {
-              for (const item of block.content) {
-                if (item?.type !== "image" || item.source?.type !== "base64") continue;
-                const format = (item.source.media_type || "image/jpeg").split("/")[1] || "jpeg";
-                if (item.source.data) {
-                  pendingImages.push({ format, source: { bytes: item.source.data } });
-                }
-              }
-            }
-          });
-        }
-      }
-
-      // Handle tool role (from normalized)
-      if (msg.role === "tool") {
-        // Reuse the shared serializer so non-string content (arrays, structured/JSON
-        // blocks, images) is never collapsed to an empty string. CodeWhisperer rejects a
-        // toolResult whose content is [{ text: "" }] with 400 "Improperly formed request"
-        // — the same failure mode that hit the Anthropic tool_result path (issue #2446).
-        const toolContent = serializeToolResultContent(msg.content);
-        pendingToolResults.push({
-          toolUseId: msg.tool_call_id,
-          status: "success",
-          content: [{ text: toolContent }],
-        });
-      } else if (content) {
-        // #2306: Kiro/CodeWhisperer has no `system` role, so system messages are
-        // normalized to `user`. Wrap their content in <system-reminder> tags so
-        // the model can tell the system prompt apart from real user input instead
-        // of treating the full Claude Code prompt as something the user typed.
-        pendingUserContent.push(msg.role === "system" ? wrapSystemReminder(content) : content);
-      }
-    } else if (role === "assistant") {
-      // Kiro 每条助手消息只有一个推理槽。同一回合里无法并入的签名或隐藏块
-      // 另起连续助手消息，并带上各自之后的正文与工具调用，保持原有块顺序。
-      let toolUseIndex = 0;
-      let segmentTexts = [];
-      let segmentToolUses = [];
-      const NAMESPACE_KIRO_TOOLUSE = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
-      const toKiroToolUse = (tc) => {
-        const idx = toolUseIndex++;
-        if (tc.function) {
-          const stableId =
-            tc.id || uuidv5(`${tc.function.name}:${idx}`, NAMESPACE_KIRO_TOOLUSE);
-          return {
-            toolUseId: stableId,
-            name: tc.function.name,
-            input: parseToolInput(tc.function.arguments),
-          };
-        }
-        const stableId = tc.id || uuidv5(`${tc.name}:${idx}`, NAMESPACE_KIRO_TOOLUSE);
-        return {
-          toolUseId: stableId,
-          name: tc.name,
-          input: parseToolInput(tc.input),
-        };
-      };
-      const pushSegmentText = () => {
-        const text = segmentTexts.join("\n").trim();
-        if (text) pendingAssistantContent.push(text);
-        segmentTexts = [];
-      };
-      // Flush to create an assistant message carrying these tool uses.
-      const flushWithToolUses = (toolUses) => {
-        pushSegmentText();
-        currentRole = "assistant";
-        flushPending();
-        const lastMsg = history[history.length - 1];
-        if (toolUses.length > 0 && lastMsg?.assistantResponseMessage) {
-          lastMsg.assistantResponseMessage.toolUses = toolUses.map(toKiroToolUse);
-        }
-      };
-
-      // Anthropic 入口会把 tool_use 同时写进 content 和 tool_calls。按块分段时以 content
-      // 为准，已随前一段刷出的工具调用不能再由 tool_calls 重复挂到最后一段。
-      let segmented = false;
-      if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          const reasoning =
-            block?.type === "thinking" && typeof block.thinking === "string" &&
-              typeof block.signature === "string" && block.signature.length > 0
-              ? { reasoningText: { text: block.thinking, signature: block.signature } }
-              : block?.type === "redacted_thinking" && typeof block.data === "string" && block.data.length > 0
-                ? { redactedContent: block.data }
-                : undefined;
-          if (reasoning) {
-            const merged = segmentToolUses.length === 0 ? mergeKiroReasoning(pendingReasoning, reasoning) : undefined;
-            if (merged) {
-              pendingReasoning = merged;
-              continue;
-            }
-            flushWithToolUses(segmentToolUses);
-            segmentToolUses = [];
-            pendingReasoning = reasoning;
-            segmented = true;
-          } else if (block?.type === "text") {
-            segmentTexts.push(block.text);
-          } else if (block?.type === "tool_use") {
-            segmentToolUses.push(block);
-          }
-        }
-      } else if (typeof msg.content === "string") {
-        segmentTexts.push(msg.content);
-      }
-
-      const toolUses = !segmented && msg.tool_calls && msg.tool_calls.length > 0 ? msg.tool_calls : segmentToolUses;
-      if (toolUses.length > 0) {
-        flushWithToolUses(toolUses);
-        currentRole = null;
-      } else {
-        pushSegmentText();
-      }
-    }
+    if (!toolResult && deferred.length) ordered.push(...deferred.splice(0));
+    ordered.push(message);
+    inBatch = toolResult;
   }
+  ordered.push(...deferred);
+  return ordered;
+}
 
-  // Flush remaining
-  if (currentRole !== null) {
-    flushPending();
-  }
-
-  // Kiro requires currentMessage to be a user turn. If the request ends with a
-  // user turn, move that final turn into currentMessage. If it ends with an
-  // assistant/tool turn, synthesize a neutral filler ("...") instead of the
-  // literal "Continue", which Kiro can read as a real instruction (#5231).
-  if (history.length > 0 && history[history.length - 1].userInputMessage) {
-    currentMessage = history.pop();
-  } else {
-    currentMessage = {
-      userInputMessage: {
-        content: "...",
-        modelId: model,
-      },
+function convertMessages(messages: RequestMessage[], tools: KiroToolInput[], model: string, supportsImages: boolean) {
+  const history: KiroHistoryItem[] = [];
+  const ordered = reorderInterleavedAssistant(messages);
+  for (let i = 0; i < ordered.length; i++) {
+    const message = ordered[i];
+    if (message.role === "assistant") {
+      const blocks: ContentBlock[] = [];
+      do {
+        const assistant = ordered[i];
+        const content = typeof assistant.content === "string" ? [{ type: "text", text: assistant.content }] : assistant.content ?? [];
+        if (blocks.length && content.length) blocks.push({ type: "text", text: "" });
+        blocks.push(...content);
+        if (!content.some(block => block.type === "tool_use")) {
+          blocks.push(...(assistant.tool_calls ?? []).map(call => ({ ...call, type: "tool_use" })));
+        }
+        i++;
+      } while (i < ordered.length && ordered[i].role === "assistant");
+      i--;
+      let texts: string[] = [];
+      let reasoning: KiroReasoningContent | undefined;
+      let uses: NonNullable<NonNullable<KiroHistoryItem["assistantResponseMessage"]>["toolUses"]> = [];
+      let toolIndex = 0;
+      const flush = () => {
+        history.push({ assistantResponseMessage: { content: texts.join("\n").trim(), ...(reasoning ? { reasoningContent: reasoning } : {}), ...(uses.length ? { toolUses: uses } : {}) } });
+        texts = []; reasoning = undefined; uses = [];
+      };
+      for (const block of blocks) {
+        const nextReasoning: KiroReasoningContent | undefined = block.type === "thinking" && typeof block.thinking === "string" && block.signature
+          ? { reasoningText: { text: block.thinking, signature: block.signature } }
+          : block.type === "redacted_thinking" && block.data ? { redactedContent: block.data } : undefined;
+        if (nextReasoning) {
+          const merged = uses.length ? undefined : mergeKiroReasoning(reasoning, nextReasoning);
+          if (merged) reasoning = merged;
+          else {
+            if (reasoning || texts.length || uses.length) flush();
+            reasoning = nextReasoning;
+          }
+        } else if (block.type === "text") texts.push(block.text ?? "");
+        else if (block.type === "tool_use") {
+          const name = block.function?.name ?? block.name ?? "";
+          uses.push({ toolUseId: block.id || uuidv5(`${name}:${toolIndex}`, "a1b2c3d4-e5f6-7890-abcd-ef1234567890"), name, input: parseToolInput(block.function ? block.function.arguments : block.input) });
+          toolIndex++;
+        }
+      }
+      flush();
+      continue;
+    }
+    if (!["system", "developer", "user", "tool"].includes(message.role ?? "")) continue;
+    const user: KiroCurrentMessage = { userInputMessage: { content: "", modelId: model, origin: "AI_EDITOR" } };
+    const images: NonNullable<typeof user.userInputMessage.images> = [];
+    const lowerContent = (content: unknown, toolResult = false): string => {
+      if (!Array.isArray(content)) return toolResult ? serializeToolResultContent(content) : typeof content === "string" ? content : "";
+      const text: string[] = [];
+      for (const block of content as ContentBlock[]) {
+        if (block.type === "image" || block.type === "image_url") {
+          const image = parseInlineImage(block);
+          const violation = image && imageSizeViolation(image.bytes);
+          if (violation) throw new Error(violation);
+          if (!image) text.push(REMOTE_IMAGE);
+          else if (!supportsImages) text.push(UNSUPPORTED_MODEL_IMAGE);
+          else {
+            images.push({ format: image.format, source: { bytes: image.bytes } });
+            if (toolResult) text.push(`[image: image/${image.format}]`);
+          }
+        } else if (block.type === "tool_result") {
+          const result = lowerContent(block.content, true);
+          ((user.userInputMessage.userInputMessageContext ??= {}).toolResults ??= []).push({ toolUseId: block.tool_use_id ?? "", status: block.is_error ? "error" : "success", content: [{ text: result }] });
+        } else if (typeof block.text === "string") text.push(block.text);
+        else if (toolResult) text.push(serializeToolResultContent([block]));
+      }
+      return text.join("\n");
     };
-  }
-
-  // Promote the tools schema to currentMessage. Tools may have been attached
-  // to any user turn in history (e.g. when the first message was assistant or
-  // had an undefined role, the first user flush lands further down). Scan the
-  // whole history so we never lose the schema.
-  if (!currentMessage?.userInputMessage?.userInputMessageContext?.tools) {
-    const carrier = history.find((item) => item?.userInputMessage?.userInputMessageContext?.tools);
-    if (carrier?.userInputMessage?.userInputMessageContext?.tools) {
-      if (!currentMessage.userInputMessage.userInputMessageContext) {
-        currentMessage.userInputMessage.userInputMessageContext = {};
-      }
-      currentMessage.userInputMessage.userInputMessageContext.tools =
-        carrier.userInputMessage.userInputMessageContext.tools;
-    }
-  }
-
-  // Fallback: if the schema was never attached to any user turn (e.g. the
-  // input contained no user messages and currentMessage is a synthesized
-  // neutral-filler turn), attach the provided tools directly to currentMessage so
-  // Kiro still sees the schema it needs to validate assistant.toolUses in
-  // history.
-  if (
-    !toolsAttached &&
-    tools &&
-    tools.length > 0 &&
-    !currentMessage?.userInputMessage?.userInputMessageContext?.tools
-  ) {
-    if (!currentMessage.userInputMessage.userInputMessageContext) {
-      currentMessage.userInputMessage.userInputMessageContext = {};
-    }
-    const built = buildKiroToolSpecs(tools);
-    currentMessage.userInputMessage.userInputMessageContext.tools = built.specs;
-    if (built.docs) toolDocs = built.docs;
-    toolsAttached = true;
-  }
-
-  // Clean up history for Kiro API compatibility
-  history.forEach((item) => {
-    if (item.userInputMessage?.userInputMessageContext?.tools) {
-      delete item.userInputMessage.userInputMessageContext.tools;
-    }
-
-    if (
-      item.userInputMessage?.userInputMessageContext &&
-      Object.keys(item.userInputMessage.userInputMessageContext).length === 0
-    ) {
-      delete item.userInputMessage.userInputMessageContext;
-    }
-
-    if (item.userInputMessage && !item.userInputMessage.modelId) {
-      item.userInputMessage.modelId = model;
-    }
-
-    // Kiro API requires `origin` on every userInputMessage
-    if (item.userInputMessage && !item.userInputMessage.origin) {
-      item.userInputMessage.origin = "AI_EDITOR";
-    }
-  });
-
-  // Kiro expects history to alternate between user and assistant turns. After
-  // normalizing `system`/`tool` roles into `userInputMessage`, the history can
-  // contain adjacent user turns, which Kiro can reject. Merge consecutive
-  // `userInputMessage` entries by concatenating their content and preserving
-  // any attached `userInputMessageContext` (e.g. accumulated toolResults).
-  //
-  // Why this is not redundant with the `flushPending` grouping in the main
-  // loop: the assistant branch resets `currentRole = null` after emitting
-  // `toolUses`. Any following `tool` role (normalized to user) and a
-  // subsequent `user` role therefore each open their own flush, producing
-  // two adjacent `userInputMessage` entries in history. This pass collapses
-  // those.
-  const mergedHistory: typeof history = [];
-  for (const item of history) {
-    const previous = mergedHistory[mergedHistory.length - 1];
-    if (item.userInputMessage && previous?.userInputMessage) {
-      const previousContent = previous.userInputMessage.content || "";
-      const currentContent = item.userInputMessage.content || "";
-      previous.userInputMessage.content = previousContent
-        ? `${previousContent}\n\n${currentContent}`
-        : currentContent;
-
-      if (item.userInputMessage.userInputMessageContext) {
-        const previousContext = previous.userInputMessage.userInputMessageContext || {};
-        const nextContext = item.userInputMessage.userInputMessageContext;
-        const mergedContext: Record<string, unknown> = { ...previousContext };
-
-        for (const [key, value] of Object.entries(nextContext)) {
-          const existing = (previousContext as Record<string, unknown>)[key];
-          if (Array.isArray(existing) && Array.isArray(value)) {
-            mergedContext[key] = [...existing, ...value];
-          } else {
-            mergedContext[key] = value;
-          }
-        }
-
-        previous.userInputMessage.userInputMessageContext = mergedContext;
-      }
-    } else if (item.assistantResponseMessage && previous?.assistantResponseMessage) {
-      const nextReasoning = item.assistantResponseMessage.reasoningContent;
-      const mergedReasoning = nextReasoning
-        ? previous.assistantResponseMessage.toolUses?.length
-          ? undefined
-          : mergeKiroReasoning(previous.assistantResponseMessage.reasoningContent, nextReasoning)
-        : previous.assistantResponseMessage.reasoningContent;
-      if (nextReasoning && !mergedReasoning) {
-        // 一个推理槽放不下的签名或隐藏块保持为连续助手消息；Kiro 会把它们
-        // 按顺序合并回同一回合（已实测两段签名分别在 content.0 / content.1 校验）。
-        // Kiro 只接受连续助手消息的最后一条带 toolUses，否则 REQUEST_BODY_INVALID，
-        // 所以前一段的工具调用移到这一段，排在它自己的工具调用之前。
-        const carriedToolUses = previous.assistantResponseMessage.toolUses;
-        if (carriedToolUses?.length) {
-          delete previous.assistantResponseMessage.toolUses;
-          item.assistantResponseMessage.toolUses = [...carriedToolUses, ...(item.assistantResponseMessage.toolUses ?? [])];
-        }
-        mergedHistory.push(item);
-        continue;
-      }
-      // Otherwise merge consecutive assistant messages into one.
-      const previousContent = previous.assistantResponseMessage.content || "";
-      const currentContent = item.assistantResponseMessage.content || "";
-      previous.assistantResponseMessage.content = previousContent
-        ? `${previousContent}\n\n${currentContent}`
-        : currentContent;
-
-      if (mergedReasoning) {
-        previous.assistantResponseMessage.reasoningContent = mergedReasoning;
-      }
-      if (item.assistantResponseMessage.toolUses) {
-        const existingToolUses = previous.assistantResponseMessage.toolUses || [];
-        previous.assistantResponseMessage.toolUses = [
-          ...existingToolUses,
-          ...item.assistantResponseMessage.toolUses,
-        ];
-      }
+    if (message.role === "tool") {
+      user.userInputMessage.userInputMessageContext = { toolResults: [{ toolUseId: message.tool_call_id ?? "", status: "success", content: [{ text: lowerContent(message.content, true) }] }] };
     } else {
-      mergedHistory.push(item);
+      const text = lowerContent(message.content);
+      user.userInputMessage.content = (message.role === "system" || message.role === "developer") && text ? wrapSystemReminder(text) : text;
     }
+    if (images.length) user.userInputMessage.images = images;
+    history.push(user);
   }
-
-  // Ensure first message is user. Kiro API requires conversations to start
-  // with a user message (fixes "Improperly formed request" for assistant-first).
-  if (mergedHistory.length > 0 && mergedHistory[0].assistantResponseMessage) {
-    const syntheticUserTurn = {
-      userInputMessage: {
-        content: "",
-        modelId: model,
-        origin: "AI_EDITOR",
-      },
-    };
-    mergedHistory.unshift(syntheticUserTurn);
-  }
-
-  // Ensure assistant exists before toolResults. Kiro API validates that every
-  // toolResults array has a preceding assistantResponseMessage with toolUses.
-  // When the assistant message is missing (truncated conversation), we strip
-  // the orphaned toolResults and convert them to text to preserve context.
-  for (let i = 0; i < mergedHistory.length; i++) {
-    const item = mergedHistory[i];
-    if (!item.userInputMessage?.userInputMessageContext?.toolResults) continue;
-
-    const prev = mergedHistory[i - 1];
-    const hasPrecedingAssistant =
-      prev?.assistantResponseMessage?.toolUses && prev.assistantResponseMessage.toolUses.length > 0;
-
-    if (!hasPrecedingAssistant) {
-      const toolResults = item.userInputMessage.userInputMessageContext.toolResults as Array<{
-        toolUseId?: string;
-        content?: Array<{ text?: string }>;
-      }>;
-      const toolResultTexts = toolResults
-        .map((tr) => {
-          const id = tr.toolUseId || "";
-          const text = tr.content?.map((c) => c.text || "").join("\n") || "";
-          return id ? `[Tool Result (${id})]\n${text}` : `[Tool Result]\n${text}`;
-        })
-        .join("\n\n");
-
-      const originalContent = item.userInputMessage.content || "";
-      item.userInputMessage.content = originalContent
-        ? `${originalContent}\n\n${toolResultTexts}`
-        : toolResultTexts;
-      delete item.userInputMessage.userInputMessageContext.toolResults;
-
-      if (Object.keys(item.userInputMessage.userInputMessageContext).length === 0) {
-        delete item.userInputMessage.userInputMessageContext;
-      }
-    }
-  }
-
-  // Also check currentMessage for orphaned toolResults (not in history)
-  if (currentMessage?.userInputMessage?.userInputMessageContext?.toolResults) {
-    const lastHistory = mergedHistory[mergedHistory.length - 1];
-    const hasPrecedingAssistant =
-      lastHistory?.assistantResponseMessage?.toolUses &&
-      lastHistory.assistantResponseMessage.toolUses.length > 0;
-
-    if (!hasPrecedingAssistant) {
-      const toolResults = currentMessage.userInputMessage.userInputMessageContext
-        .toolResults as Array<{ toolUseId?: string; content?: Array<{ text?: string }> }>;
-      const toolResultTexts = toolResults
-        .map((tr) => {
-          const id = tr.toolUseId || "";
-          const text = tr.content?.map((c) => c.text || "").join("\n") || "";
-          return id ? `[Tool Result (${id})]\n${text}` : `[Tool Result]\n${text}`;
-        })
-        .join("\n\n");
-
-      const originalContent = currentMessage.userInputMessage.content || "";
-      currentMessage.userInputMessage.content = originalContent
-        ? `${originalContent}\n\n${toolResultTexts}`
-        : toolResultTexts;
-      delete currentMessage.userInputMessage.userInputMessageContext.toolResults;
-
-      if (Object.keys(currentMessage.userInputMessage.userInputMessageContext).length === 0) {
-        delete currentMessage.userInputMessage.userInputMessageContext;
-      }
-    }
-  }
-
-  // Ensure alternating roles by inserting synthetic assistant messages
-  // between consecutive user turns that couldn't be merged.
-  const alternatingHistory: typeof mergedHistory = [];
-  for (const item of mergedHistory) {
-    const last = alternatingHistory[alternatingHistory.length - 1];
-    if (item.userInputMessage && last?.userInputMessage) {
-      const syntheticAssistantTurn = {
-        assistantResponseMessage: { content: "" },
-      };
-      alternatingHistory.push(syntheticAssistantTurn);
-    }
-    alternatingHistory.push(item);
-  }
-
-  // Kiro 拒收正文为空且不带工具结果或图片的用户回合（REQUEST_BODY_INVALID，已实测：
-  // 以助手开头时补的空用户回合、只含空白的用户消息都会触发）。沿用上面的中性占位。
-  for (const item of [...alternatingHistory, currentMessage]) {
-    const user = item?.userInputMessage;
-    if (user && !user.content?.trim() && !user.images?.length && !user.userInputMessageContext?.toolResults?.length) {
-      user.content = "...";
-    }
-  }
-
-  return { history: alternatingHistory, currentMessage, toolsAttached, toolDocs };
+  const last = history.at(-1);
+  const currentMessage: KiroCurrentMessage = last?.userInputMessage
+    ? { userInputMessage: history.pop()!.userInputMessage! }
+    : { userInputMessage: { content: "...", modelId: model, origin: "AI_EDITOR" } };
+  const built = buildKiroToolSpecs(tools);
+  const specs = built.specs.length ? built.specs : synthesizeHistoryToolSpecs(history);
+  if (specs.length) (currentMessage.userInputMessage.userInputMessageContext ??= {}).tools = specs;
+  return { ...normalizeKiroConversation(history, currentMessage, model), toolDocs: built.docs };
 }
 
 /**
@@ -860,6 +377,7 @@ export function buildKiroPayload(
   stream: boolean,
   credentials: ProviderCredentials | null,
   thinkingMode?: KiroThinkingMode,
+  supportsImages?: boolean,
 ) {
   // Reject the Anthropic-only `[1m]` context beta before it reaches Bedrock —
   // Kiro cannot honor it and a forwarded `kr/*[1m]` id is malformed upstream.
@@ -877,60 +395,12 @@ export function buildKiroPayload(
   const { upstream: normalizedModel, thinking: modelRequestsThinking } =
     resolveKiroModelAlias(model);
   const messages = body.messages || [];
-  let tools = body.tools || [];
+  const tools = body.tools || [];
   const maxTokens = body.max_tokens ?? body.max_completion_tokens ?? 32000;
   const temperature = body.temperature;
   const topP = body.top_p;
 
-  // Kiro rejects history that references toolUses/toolResults without a tools
-  // schema in userInputMessageContext. When callers omit body.tools but the
-  // message history still contains assistant.tool_calls / role=tool turns,
-  // synthesize a minimal tool schema from the tool names present in history
-  // so Kiro accepts the request instead of returning `Improperly formed
-  // request`. This preserves tool-call history and is a no-op when body.tools
-  // is already populated.
-  if (tools.length === 0) {
-    const seen = new Set<string>();
-    const synthesized: Array<Record<string, unknown>> = [];
-    const pushName = (name: unknown) => {
-      if (typeof name === "string" && name && !seen.has(name)) {
-        seen.add(name);
-        synthesized.push({
-          type: "function",
-          function: {
-            name,
-            description: `Tool: ${name}`,
-            parameters: { type: "object", properties: {}, required: [] },
-          },
-        });
-      }
-    };
-    for (const msg of messages) {
-      if (msg?.role !== "assistant") continue;
-      if (Array.isArray(msg.tool_calls)) {
-        for (const tc of msg.tool_calls) {
-          pushName(tc?.function?.name || tc?.name);
-        }
-      }
-      // Anthropic-style assistant blocks: content:[{type:"tool_use", name, ...}]
-      if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (block?.type === "tool_use") {
-            pushName(block.name);
-          }
-        }
-      }
-    }
-    if (synthesized.length > 0) {
-      tools = synthesized;
-    }
-  }
-
-  const { history, currentMessage, toolsAttached, toolDocs } = convertMessages(
-    messages,
-    tools,
-    normalizedModel
-  );
+  const { history, currentMessage, toolDocs } = convertMessages(messages, tools, normalizedModel, supportsImages ?? supportsKiroImages(normalizedModel));
 
   const rawProfileArn = credentials?.providerSpecificData?.profileArn;
   const profileArn = typeof rawProfileArn === "string" ? rawProfileArn : "";
@@ -1044,53 +514,18 @@ export function buildKiroPayload(
     }
   }
 
-  const context = payload.conversationState.currentMessage.userInputMessage.userInputMessageContext;
-  if (Array.isArray(context?.tools)) {
-    const { tools: sanitizedTools, nameMap } = sanitizeKiroTools(context.tools);
-    context.tools = sanitizedTools;
-    remapKiroToolHistory(payload.conversationState.history ?? [], nameMap);
-    if (nameMap.size > 0) {
-      (payload as typeof payload & { _toolNameMap: Record<string, string> })._toolNameMap =
-        Object.fromEntries(nameMap);
-    }
-
-    // Lower Anthropic tool_choice only after sanitization, so forced long names
-    // use the exact name declared in Kiro's tool schema.
-    if (body.tool_choice !== undefined) {
-      const choice = body.tool_choice;
-      const choiceObject = choice && typeof choice === "object" && !Array.isArray(choice)
-        ? choice as Record<string, unknown> : undefined;
-      if (choiceObject?.disable_parallel_tool_use === true) {
-        throw new Error("Unsupported tool_choice.disable_parallel_tool_use");
-      }
-      const choiceType = typeof choice === "string" ? choice : choiceObject?.type;
-      if (choiceType === "auto") context.toolChoice = { auto: {} };
-      else if (choiceType === "any") context.toolChoice = { any: {} };
-      else if (choiceType === "none") context.toolChoice = { none: {} };
-      else if (choiceType === "tool" && typeof choiceObject?.name === "string" && choiceObject.name) {
-        const originalName = choiceObject.name;
-        const sanitizedName = [...nameMap.entries()].find(([, original]) => original === originalName)?.[0] ?? originalName;
-        const declared = (sanitizedTools as Array<Record<string, unknown>>).some((tool) =>
-          (tool.toolSpecification as Record<string, unknown> | undefined)?.name === sanitizedName
-        );
-        if (!declared) throw new Error(`tool_choice references undeclared tool: ${originalName}`);
-        context.toolChoice = { tool: { name: sanitizedName } };
-      } else {
-        throw new Error("Invalid tool_choice");
-      }
-    }
-  } else if (body.tool_choice !== undefined) {
-    const choice = body.tool_choice;
-    const choiceObject = choice && typeof choice === "object" && !Array.isArray(choice)
-      ? choice as Record<string, unknown> : undefined;
-    if (choiceObject?.disable_parallel_tool_use === true) {
-      throw new Error("Unsupported tool_choice.disable_parallel_tool_use");
-    }
-    const choiceType = typeof choice === "string" ? choice : choiceObject?.type;
-    const target = payload.conversationState.currentMessage.userInputMessage;
-    if (choiceType === "auto") (target.userInputMessageContext ??= {}).toolChoice = { auto: {} };
-    else if (choiceType === "none") (target.userInputMessageContext ??= {}).toolChoice = { none: {} };
-    else throw new Error("tool_choice requires declared tools");
+  const target = payload.conversationState.currentMessage.userInputMessage;
+  const context = target.userInputMessageContext;
+  const sanitized = sanitizeKiroTools(context?.tools ?? []);
+  if (context?.tools) context.tools = sanitized.tools;
+  remapKiroToolHistory(payload.conversationState.history, sanitized.nameMap);
+  if (sanitized.nameMap.size) {
+    (payload as typeof payload & { _toolNameMap: Record<string, string> })._toolNameMap = Object.fromEntries(sanitized.nameMap);
+  }
+  if (body.tool_choice !== undefined) {
+    (target.userInputMessageContext ??= {}).toolChoice = lowerKiroToolChoice(body.tool_choice, {
+      sanitizedNames: new Set(sanitized.tools.map(tool => tool.toolSpecification.name)), nameMap: sanitized.nameMap,
+    });
   }
 
   return payload;

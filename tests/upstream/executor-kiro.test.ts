@@ -7,6 +7,9 @@ import { buildKiroPayload } from "../../src/kiro/request/openai-to-kiro.ts";
 import { collectResponses, responsesStream } from "../../src/responses/response.ts";
 import { buildKiroResponsesPayload } from "../../src/responses/request.ts";
 import { withFetch } from "../fetch-stub.ts";
+import { parseEventFrame } from "../../src/kiro/eventstream.ts";
+import { chatCompletionStream, collectChatCompletion } from "../../src/chat.ts";
+import { sanitizeKiroTools } from "../../src/kiro/sanitizer.ts";
 
 function hasStreamReadinessSignal(text: string): boolean {
   const match = text.match(/data:\s*(\{.*\})/);
@@ -113,6 +116,36 @@ function parseSSEJsonChunks(text) {
     .filter((payload) => payload && payload !== "[DONE]")
     .map((payload) => JSON.parse(payload));
 }
+
+test("单个网络 chunk 内的 1200 个完整帧全部转换并正常结束", async () => {
+  const frames = Array.from({ length: 1200 }, () => buildEventFrame("assistantResponseEvent", { content: "x" }));
+  frames.push(buildEventFrame("messageStopEvent", {}));
+  const raw = new KiroExecutor().transformEventStreamToSSE(buildEventStreamResponseFromChunks([concatArrays(...frames)]), "glm-5");
+  const text = await raw.text();
+  const chunks = parseSSEJsonChunks(text);
+  assert.equal(chunks.map((chunk) => chunk.choices?.[0]?.delta?.content ?? "").join(""), "x".repeat(1200));
+  assert.equal(chunks.filter((chunk) => chunk.choices?.[0]?.finish_reason).length, 1);
+  assert.ok(text.endsWith("data: [DONE]\n\n"));
+});
+
+test("损坏帧和非法 JSON 的诊断不暴露上游正文", () => {
+  const original = console.warn;
+  const warnings: unknown[][] = [];
+  console.warn = (...args) => { warnings.push(args); };
+  try {
+    const secret = "private-prompt-not-json";
+    const malformed = buildEventFrame("assistantResponseEvent", secret);
+    assert.deepEqual(parseEventFrame(malformed)?.payload, { raw: secret });
+    assert.equal(parseEventFrame(new Uint8Array(2)), null);
+    assert.deepEqual(warnings, [
+      [`[Kiro] payload_parse_failed bytes=${textEncoder.encode(secret).length}`],
+      ["[Kiro] frame_parse_failed"],
+    ]);
+    assert.ok(!JSON.stringify(warnings).includes(secret));
+  } finally {
+    console.warn = original;
+  }
+});
 
 test("并行对象参数和交错参数在两种 Anthropic 输出中保持完整且块不重开", async () => {
   const cases = [
@@ -399,7 +432,7 @@ test("KiroExecutor.transformEventStreamToSSE converts text, tool calls, usage an
   assert.match(text, /"arguments":"\{\\"path\\":\\"\/tmp\/a\\"\}"/);
   assert.match(text, /"prompt_tokens":4/);
   assert.match(text, /"completion_tokens":6/);
-  assert.match(text, /"finish_reason":"tool_calls"/);
+  assert.match(text, /"finish_reason":"tool_use"/);
   assert.match(text, /\[DONE\]/);
 });
 
@@ -722,7 +755,7 @@ test("KiroExecutor.transformEventStreamToSSE parses fragmented frames and waits 
 
   assert.match(text, /"content":"Hello fragmented"/);
   assert.equal(finishChunks.length, 1);
-  assert.equal(finishChunks[0].choices[0].finish_reason, "stop");
+  assert.equal(finishChunks[0].choices[0].finish_reason, "end_turn");
   assert.deepEqual(finishChunks[0].usage, {
     prompt_tokens: 11,
     completion_tokens: 13,
@@ -731,7 +764,7 @@ test("KiroExecutor.transformEventStreamToSSE parses fragmented frames and waits 
   assert.match(text, /\[DONE\]/);
 });
 
-test("KiroExecutor.transformEventStreamToSSE deduplicates tool starts and handles malformed payload JSON", async () => {
+test("KiroExecutor rejects mixed object and string tool fragments", async () => {
   const executor = new KiroExecutor();
   const response = buildEventStreamResponse([
     buildEventFrame("toolUseEvent", {
@@ -753,7 +786,7 @@ test("KiroExecutor.transformEventStreamToSSE deduplicates tool starts and handle
   const startMatches = text.match(/"id":"tool_1"/g) || [];
 
   assert.equal(startMatches.length, 1);
-  assert.match(text, /"finish_reason":"tool_calls"/);
+  assert.match(text, /"code":"invalid_kiro_tool_call"/);
   assert.match(text, /\[DONE\]/);
 });
 
@@ -806,13 +839,13 @@ test("KiroExecutor.refreshCredentials handles missing and AWS-style refresh toke
       { status: 200, headers: { "Content-Type": "application/json" } }
     );
   }, async () => {
-    assert.equal(await executor.refreshCredentials({}, null), null);
-    assert.equal(
+    assert.deepEqual(await executor.refreshCredentials({}, null), { ok: false, kind: "invalid_config", code: "missing_refresh_token" });
+    assert.deepEqual(
       await executor.refreshCredentials(
         { refreshToken: "ignored", providerSpecificData: { authMethod: "api_key" } },
         null
       ),
-      null
+      { ok: false, kind: "invalid_config", code: "unsupported_auth_method" }
     );
     const result = await executor.refreshCredentials(
       {
@@ -822,6 +855,7 @@ test("KiroExecutor.refreshCredentials handles missing and AWS-style refresh toke
       null
     );
     assert.deepEqual(result, {
+      ok: true,
       accessToken: "new-access-token",
       refreshToken: "new-refresh-token",
       expiresIn: 3600,
@@ -829,7 +863,7 @@ test("KiroExecutor.refreshCredentials handles missing and AWS-style refresh toke
   });
 });
 
-test("KiroExecutor.refreshCredentials returns null when the token refresh fails", async () => {
+test("KiroExecutor.refreshCredentials returns a transient failure for network errors", async () => {
   const executor = new KiroExecutor();
   await withFetch(async () => {
     throw new Error("refresh failed");
@@ -841,7 +875,7 @@ test("KiroExecutor.refreshCredentials returns null when the token refresh fails"
       },
       null
     );
-    assert.equal(result, null);
+    assert.deepEqual(result, { ok: false, kind: "transient", code: "refresh_network_error" });
   });
 });
 
@@ -855,4 +889,59 @@ test("KiroExecutor propagates physical EOF before messageStopEvent", async () =>
     () => executor.transformEventStreamToSSE(response, "claude-opus-5").text(),
     /Kiro stream ended before terminal event/
   );
+});
+
+test("END_TURN with tools maps to protocol tool stops and length remains incomplete", async () => {
+  for (const [rawReason, anthropicReason, chatReason] of [["END_TURN", "tool_use", "tool_calls"], ["max_tokens", "max_tokens", "length"]]) {
+    const source = () => new KiroExecutor().transformEventStreamToSSE(buildEventStreamResponse([
+      buildEventFrame("toolUseEvent", { toolUseId: "call", name: "read", input: "{}" }),
+      buildEventFrame("metadataEvent", { stopReason: rawReason }),
+    ]), "glm-5");
+    assert.equal((await (await collectAnthropicResponse(source())).json()).stop_reason, anthropicReason);
+    assert.equal((await (await collectChatCompletion(source(), "glm-5")).json()).choices[0].finish_reason, chatReason);
+    assert.match(await chatCompletionStream(source(), "glm-5").text(), new RegExp(`"finish_reason":"${chatReason}"`));
+  }
+});
+
+test("final tool object snapshot is emitted once and names are restored", async () => {
+  const originalName = "read_".repeat(20);
+  const { tools, nameMap } = sanitizeKiroTools([{ toolSpecification: { name: originalName } }]);
+  const source = new KiroExecutor().transformEventStreamToSSE(buildEventStreamResponse([
+    buildEventFrame("toolUseEvent", { toolUseId: "call", name: tools[0].toolSpecification.name, input: { path: "a" } }),
+    buildEventFrame("toolUseEvent", { toolUseId: "call", name: tools[0].toolSpecification.name, input: { path: "abcdef" } }),
+    buildEventFrame("messageStopEvent", {}),
+  ]), "glm-5", { toolNameMap: nameMap });
+  const result = await (await collectChatCompletion(source, "glm-5")).json();
+  assert.equal(result.choices[0].message.tool_calls[0].function.name, originalName);
+  assert.deepEqual(JSON.parse(result.choices[0].message.tool_calls[0].function.arguments), { path: "abcdef" });
+  assert.equal(result.usage.completion_tokens, Math.floor(JSON.stringify({ path: "abcdef" }).length / 4));
+});
+
+test("estimated output usage counts native reasoning, code, inline reasoning and tool deltas", async () => {
+  const cases = [
+    { frames: [buildEventFrame("reasoningContentEvent", { text: "abcdefgh" })], options: {}, chars: 8 },
+    { frames: [buildEventFrame("codeEvent", { content: "abcdefgh" })], options: {}, chars: 8 },
+    { frames: [buildEventFrame("assistantResponseEvent", { content: "<thinking>abcdefgh</thinking>ijklmnop" })], options: { thinkingExpected: true }, chars: 16 },
+    { frames: [buildEventFrame("toolUseEvent", { toolUseId: "call", name: "read", input: "abcd" }), buildEventFrame("toolUseEvent", { toolUseId: "call", name: "read", input: "efgh" })], options: {}, chars: 8 },
+    { frames: [buildEventFrame("toolUseEvent", { toolUseId: "call", name: "tool_call", input: { name: "read", arguments: {} } })], options: {}, chars: JSON.stringify({ name: "read", arguments: {} }).length },
+  ];
+  for (const { frames, options, chars } of cases) {
+    const source = new KiroExecutor().transformEventStreamToSSE(buildEventStreamResponse([...frames, buildEventFrame("messageStopEvent", {})]), "glm-5", options);
+    const result = await (await collectChatCompletion(source, "glm-5")).json();
+    assert.equal(result.usage.completion_tokens, Math.floor(chars / 4));
+  }
+  const explicit = new KiroExecutor().transformEventStreamToSSE(buildEventStreamResponse([
+    buildEventFrame("reasoningContentEvent", { text: "abcdefgh" }), buildEventFrame("metricsEvent", { outputTokens: 99 }), buildEventFrame("messageStopEvent", {}),
+  ]), "glm-5");
+  assert.equal((await (await collectChatCompletion(explicit, "glm-5")).json()).usage.completion_tokens, 99);
+});
+
+test("explicit raw stop values are normalized and unknown values fail closed", async () => {
+  const source = (event: string, stopReason: unknown) => new KiroExecutor().transformEventStreamToSSE(buildEventStreamResponse([
+    buildEventFrame(event, { stopReason }),
+  ]), "glm-5");
+  assert.equal((await (await collectChatCompletion(source("messageStopEvent", "MAX_TOKENS"), "glm-5")).json()).choices[0].finish_reason, "length");
+  for (const stopReason of ["", "UNKNOWN", null, 42]) {
+    for (const event of ["messageStopEvent", "metadataEvent"]) await assert.rejects(() => source(event, stopReason).text(), /Unsupported Kiro stop reason/);
+  }
 });

@@ -30,11 +30,9 @@
 
 import type { FetchFn } from "./base.ts";
 
-// Canonical AWS region shape — kept local (identical to AWS_REGION_PATTERN in
-// src/lib/oauth/constants/oauth.ts) so this open-sse module has no cross-tree import just to
-// validate a string. Guards against SSRF via region injection (GHSA-6mwv-4mrm-5p3m): the value
-// is interpolated into upstream URLs.
-export const AWS_REGION_PATTERN = /^[a-z]{2}-[a-z]+-\d{1,2}$/;
+// Canonical AWS region shape, shared by login, refresh and profile discovery.
+// Regions are interpolated into upstream hosts, so reject URL/hostname injection.
+export const AWS_REGION_PATTERN = /^[a-z]{2}(?:-gov)?-[a-z]+-\d{1,2}$/;
 
 /**
  * Regions where the Amazon Q Developer *profile* is currently hosted (AWS docs: "Supported

@@ -109,7 +109,7 @@ test("无可见摘要的分片签名在流式和非流式响应中完整保留",
   const lines = [
     JSON.stringify({ choices: [{ delta: { reasoning_signature: "签名甲" } }] }),
     JSON.stringify({ choices: [{ delta: { reasoning_signature: "签名乙" } }] }),
-    JSON.stringify({ choices: [{ delta: { content: "结果" }, finish_reason: "stop" }] }),
+    JSON.stringify({ choices: [{ delta: { content: "结果" }, finish_reason: "end_turn" }] }),
   ];
   const streamed = events(await openAIStreamToAnthropic(upstream(lines)).text());
   expect(streamed.find(e => e.event === "content_block_start")?.data.content_block).toMatchObject({ type: "thinking", thinking: "" });
@@ -133,7 +133,7 @@ describe("Anthropic adapter", () => {
         start(controller) {
           controller.enqueue(
             new TextEncoder().encode(
-              'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+              'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"end_turn"}]}\n\ndata: [DONE]\n\n'
             )
           );
         },
@@ -149,7 +149,7 @@ describe("Anthropic adapter", () => {
       JSON.stringify({ choices: [{ delta: { reasoning_content: "think " } }] }),
       JSON.stringify({ choices: [{ delta: { reasoning_content: "more", content: "hello" } }] }),
       JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "tu", function: { name: "lookup", arguments: '{"q":' } }] } }] }),
-      JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] }, finish_reason: "tool_calls" }], usage: { prompt_tokens: 4, completion_tokens: 3, cache_read_input_tokens: 0 } }),
+      JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] }, finish_reason: "tool_use" }], usage: { prompt_tokens: 4, completion_tokens: 3, cache_read_input_tokens: 0 } }),
       "[DONE]",
     ])).text();
     const es = events(out);
@@ -161,7 +161,7 @@ describe("Anthropic adapter", () => {
     expect(finalUsage.cache_read_input_tokens).toBe(0);
     expect(finalUsage).not.toHaveProperty("cache_creation_input_tokens");
     const collected = await collectAnthropicResponse(upstream([
-      JSON.stringify({ choices: [{ message: { role: "assistant", content: "hello", tool_calls: [{ index: 0, id: "tu", function: { name: "lookup", arguments: '{"q":"x"}' } }] }, finish_reason: "tool_calls" }], usage: { prompt_tokens: 4, completion_tokens: 3 } }),
+      JSON.stringify({ choices: [{ message: { role: "assistant", content: "hello", tool_calls: [{ index: 0, id: "tu", function: { name: "lookup", arguments: '{"q":"x"}' } }] }, finish_reason: "tool_use" }], usage: { prompt_tokens: 4, completion_tokens: 3 } }),
     ])).then((r) => r.json()) as { content: unknown[] };
     const collectedTools = collected.content.filter((block): block is { type: "tool_use"; id: string; name: string; input: unknown } => {
       if (!block || typeof block !== "object") return false;
@@ -229,7 +229,6 @@ describe("Anthropic request validation", () => {
       [{ output_config: { task_budget: 10 } }, "output_config.task_budget"],
       [{ speed: "fast" }, "speed"],
       [{ messages: [{ role: "user", content: [{ type: "document", source: {} }] }] }, "document"],
-      [{ messages: [{ role: "user", content: [{ type: "image", source: { type: "url", url: "https://example.com/a.png" } }] }] }, "remote image"],
       [{ messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: [{ type: "image", source: { type: "base64", data: "AA==" } }] }] }] }, "structured tool_result"],
       [{ messages: [{ role: "user", content: [{ type: "tool_result", content: ["raw"] }] }] }, "structured tool_result"],
       [{ messages: [{ role: "user", content: [{ type: "tool_result", content: [{ type: "text" }] }] }] }, "structured tool_result"],
@@ -269,3 +268,14 @@ describe("Anthropic request validation", () => {
   });
 });
 
+
+test("rejects top_k whenever present", () => {
+  for (const top_k of [0, 1, null]) expect(() => anthropicToOpenAI({ messages: [], top_k })).toThrow("Unsupported top_k on this relay");
+});
+
+test("Anthropic stream failure callback reports one safe protocol code", async () => {
+  const codes: string[] = [];
+  const output = await openAIStreamToAnthropic(upstream([JSON.stringify({ choices: [{ delta: { content: "partial" } }] })]), "test", { onStreamFailure: code => codes.push(code) }).text();
+  expect(events(output).at(-1)?.event).toBe("error");
+  expect(codes).toEqual(["unexpected_eof"]);
+});

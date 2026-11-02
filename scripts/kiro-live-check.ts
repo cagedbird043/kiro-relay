@@ -4,6 +4,8 @@
  *
  *   KIRO_RELAY_KEY=... bun run live-check            # 默认 http://127.0.0.1:4000
  *   KIRO_RELAY_URL=https://relay.example KIRO_RELAY_KEY=... bun run live-check
+ *   bun run live-check --quick                    # 四条变更路径，无签名采集
+ *   bun run live-check --quick --summary-only     # 额外 summary-only 探测
  *
  * 被测的是 relay 运行的那份代码，所以验证重构时先用工作区代码启动本地 relay。
  * 签名推理必须是 Kiro 真签发的，脚本先向 relay 请求几次真实回答来取得签名。
@@ -17,28 +19,47 @@ const BASE = (process.env.KIRO_RELAY_URL ?? "http://127.0.0.1:4000").replace(/\/
 const KEY = process.env.KIRO_RELAY_KEY ?? "";
 const CLAUDE = process.env.KIRO_LIVE_CLAUDE_MODEL ?? "claude-opus-5-5";
 const GPT = process.env.KIRO_LIVE_GPT_MODEL ?? "gpt-5.6-sol";
+const QUICK = process.argv.includes("--quick");
+const SUMMARY_ONLY = process.argv.includes("--summary-only");
+type Check = "tool" | "developer" | "responses" | "image";
+type LiveCase = [string, string, Json, Check?];
 const CONCURRENCY = 4;
 
 type Json = Record<string, unknown>;
 const headers = { "content-type": "application/json", "anthropic-version": "2023-06-01", ...(KEY ? { "x-api-key": KEY } : {}) };
 
 /** 流式请求，返回 "200" 或失败原因；流内 error 事件也算失败。 */
-async function send(path: string, body: Json): Promise<string> {
+async function send(path: string, body: Json, check?: Check): Promise<string> {
   try {
     const response = await fetch(`${BASE}${path}`, { method: "POST", headers, body: JSON.stringify({ ...body, stream: true }), signal: AbortSignal.timeout(180_000) });
+    if (!response.ok) { await response.body?.cancel(); return `HTTP ${response.status}`; }
     const text = await response.text();
-    if (!response.ok) return `${response.status} ${text.slice(0, 160)}`;
-    const errorAt = text.search(/event: error|"type":"response\.failed"/);
-    return errorAt < 0 ? "200" : `stream error ${text.slice(errorAt, errorAt + 160)}`;
-  } catch (error) {
-    return `request failed: ${error instanceof Error ? error.message : String(error)}`;
+    const chunks: Json[] = [];
+    for (const frame of text.split(/\r?\n\r?\n/)) {
+      const data = frame.split(/\r?\n/).find(line => line.startsWith("data:"))?.slice(5).trim();
+      if (data && data !== "[DONE]") { try { chunks.push(JSON.parse(data) as Json); } catch { return "invalid SSE JSON"; } }
+    }
+    if (chunks.some(chunk => chunk.error || chunk.type === "error" || chunk.type === "response.failed")) return "stream failed";
+    if (check === "responses") return chunks.some(chunk => chunk.type === "response.completed") ? "200" : "missing completed response";
+    if (check) {
+      const choices = chunks.flatMap(chunk => Array.isArray(chunk.choices) ? chunk.choices as Json[] : []);
+      const deltas = choices.flatMap(choice => choice.delta && typeof choice.delta === "object" ? [choice.delta as Json] : []);
+      const content = deltas.map(delta => typeof delta.content === "string" ? delta.content : "").join("");
+      if (check === "tool") return deltas.some(delta => Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) && choices.some(choice => choice.finish_reason === "tool_calls") ? "200" : "missing required tool call";
+      if (!choices.some(choice => choice.finish_reason)) return "missing finish reason";
+      if (check === "developer" && !content.includes("DEVELOPER_OK")) return "developer instruction not followed";
+      if (check === "image" && !content.trim()) return "missing image omission reply";
+    }
+    return "200";
+  } catch {
+    return "request failed";
   }
 }
 
 async function post(path: string, body: Json): Promise<Json> {
   const response = await fetch(`${BASE}${path}`, { method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(180_000) });
-  if (!response.ok) throw new Error(`${path} ${response.status}: ${(await response.text()).slice(0, 200)}`);
-  return await response.json() as Json;
+  if (!response.ok) { await response.body?.cancel(); throw new Error(`${path}: HTTP ${response.status}`); }
+  try { return await response.json() as Json; } catch { throw new Error(`${path}: invalid JSON response`); }
 }
 
 async function pool<T>(jobs: Array<() => Promise<T>>): Promise<T[]> {
@@ -164,17 +185,27 @@ function responsesCases(reasoning: Json[]): Array<[string, string, Json]> {
   ];
 }
 
-console.log(`relay: ${BASE}  models: ${CLAUDE} / ${GPT}`);
-const [signatures, reasoning] = await Promise.all([claudeSignatures(4), gptReasoning(2)]);
-console.log(`取得 ${signatures.length} 个 Claude 签名、${reasoning.length} 段 GPT 推理`);
-
-const cases: Array<[string, string, Json]> = [
-  ...distinctSequences().map((kinds): [string, string, Json] => [`块排列 ${kinds.join("")}`, "/v1/messages", sequenceBody(kinds, signatures)]),
-  ...edgeCases(signatures),
-  ...responsesCases(reasoning),
+const quickCases: LiveCase[] = [
+  ["Chat：developer 消息", "/v1/chat/completions", { model: CLAUDE, max_tokens: 32, messages: [{ role: "developer", content: "Reply with DEVELOPER_OK only." }, { role: "user", content: "Go." }] }, "developer"],
+  ["Chat：required 工具选择", "/v1/chat/completions", { model: CLAUDE, max_tokens: 128, tools: [{ type: "function", function: { name: "read", parameters: readTool.input_schema } }], tool_choice: "required", messages: [{ role: "user", content: "Read a.txt using read." }] }, "tool"],
+  ["Responses：以助手开头", "/v1/responses", { model: GPT, max_output_tokens: 64, store: false, reasoning: { effort: "none" }, input: [{ role: "assistant", content: "Ready." }, { role: "user", content: "Reply OK only." }] }, "responses"],
+  ["Chat：glm-5 图片占位", "/v1/chat/completions", { model: "glm-5", max_tokens: 64, messages: [{ role: "user", content: [{ type: "text", text: "Can you see this image? Be brief." }, { type: "image_url", image_url: { url: `data:image/png;base64,${pixel}` } }] }] }, "image"],
 ];
+console.log(`relay: ${BASE}  models: ${CLAUDE} / ${GPT}  mode: ${QUICK ? "quick" : "full"}`);
+let cases: LiveCase[];
+if (QUICK) cases = quickCases;
+else {
+  const [signatures, reasoning] = await Promise.all([claudeSignatures(4), gptReasoning(2)]);
+  console.log(`取得 ${signatures.length} 个 Claude 签名、${reasoning.length} 段 GPT 推理`);
+  cases = [
+    ...distinctSequences().map((kinds): LiveCase => [`块排列 ${kinds.join("")}`, "/v1/messages", sequenceBody(kinds, signatures)]),
+    ...edgeCases(signatures), ...responsesCases(reasoning),
+    ...quickCases.filter(([, , , check]) => check !== "responses"),
+  ];
+}
+if (SUMMARY_ONLY) cases.push(["Responses：仅 summary 探测", "/v1/responses", { model: GPT, max_output_tokens: 64, store: false, reasoning: { summary: "auto" }, input: "Reply OK only." }]);
 const started = Date.now();
-const results = await pool(cases.map(([, path, body]) => () => send(path, body)));
+const results = await pool(cases.map(([, path, body, check]) => () => send(path, body, check)));
 const failures = cases.flatMap(([name], index) => (results[index] === "200" ? [] : [`${name}: ${results[index]}`]));
 console.log(`${cases.length - failures.length}/${cases.length} 通过，用时 ${Math.round((Date.now() - started) / 1000)}s`);
 for (const failure of failures) console.log(`FAIL ${failure}`);

@@ -13,21 +13,42 @@ export function imageSizeViolation(base64: string): string | undefined {
     : undefined;
 }
 
-/** First oversized data-URL image in Chat Completions `messages`, as an OpenAI-style error message. */
-export function chatImageSizeError(messages: unknown[]): string | undefined {
-  for (const [messageIndex, message] of messages.entries()) {
-    const content = message && typeof message === "object" ? (message as Record<string, unknown>).content : undefined;
-    if (!Array.isArray(content)) continue;
-    for (const [partIndex, part] of content.entries()) {
-      if (!part || typeof part !== "object") continue;
-      const imageUrl = (part as Record<string, unknown>).image_url;
-      const url = typeof imageUrl === "string"
-        ? imageUrl
-        : imageUrl && typeof imageUrl === "object" ? (imageUrl as Record<string, unknown>).url : undefined;
-      if (typeof url !== "string" || !url.startsWith("data:")) continue;
-      const violation = imageSizeViolation(url.slice(url.indexOf(",") + 1));
-      if (violation) return `Invalid 'messages[${messageIndex}].content[${partIndex}].image_url': ${violation}`;
-    }
+export const UNSUPPORTED_MODEL_IMAGE = "[image omitted: this model does not support image input]";
+export const REMOTE_IMAGE = "[image omitted: remote image URLs are not supported, send base64 inline]";
+
+/** All inline image forms accepted by the request translators. */
+export function parseInlineImage(value: unknown): { format: string; bytes: string } | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const block = value as Record<string, unknown>;
+  const source = block.source && typeof block.source === "object" ? block.source as Record<string, unknown> : undefined;
+  if (block.type === "image" && source?.type === "base64" && typeof source.data === "string" && source.data) {
+    const mediaType = typeof source.media_type === "string" ? source.media_type : "image/jpeg";
+    return { format: (mediaType.split("/")[1] || "jpeg").toLowerCase().replace(/^jpg$/, "jpeg"), bytes: source.data };
   }
-  return undefined;
+  const imageUrl = block.image_url && typeof block.image_url === "object" ? block.image_url as Record<string, unknown> : undefined;
+  const url = block.type === "image" ? block.image : typeof block.image_url === "string" ? block.image_url : imageUrl?.url;
+  if (typeof url !== "string") return undefined;
+  const match = /^data:image\/([^;,]+);base64,([A-Za-z0-9+/]+={0,2})$/i.exec(url);
+  if (!match) return undefined;
+  return { format: match[1].toLowerCase().replace(/^jpg$/, "jpeg"), bytes: match[2] };
+}
+
+/** Size checks traverse embedded tool observations as well as ordinary content. */
+export function chatImageSizeError(messages: unknown[]): string | undefined {
+  const inspect = (content: unknown, path: string): string | undefined => {
+    if (!Array.isArray(content)) return undefined;
+    for (const [index, part] of content.entries()) {
+      const image = parseInlineImage(part);
+      const violation = image && imageSizeViolation(image.bytes);
+      if (violation) return `Invalid '${path}[${index}]${part?.type === "image_url" ? ".image_url" : ""}': ${violation}`;
+      if (part?.type === "tool_result") {
+        const nested = inspect(part.content, `${path}[${index}].content`);
+        if (nested) return nested;
+      }
+    }
+  };
+  for (const [index, message] of messages.entries()) {
+    const error = inspect(message && typeof message === "object" ? (message as Record<string, unknown>).content : undefined, `messages[${index}].content`);
+    if (error) return error;
+  }
 }

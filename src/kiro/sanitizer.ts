@@ -10,8 +10,7 @@
  * This pure helper strips the unsupported keys recursively, ensures a
  * top-level `required: []` is present, and hash-truncates over-long names —
  * returning a `nameMap` (truncated → original) so the streamed tool-call name
- * can be mapped back for the client. See chatCore.ts (request wiring) and
- * translator/response/kiro-to-openai.ts (response reverse-mapping).
+ * can be mapped back for the client by the executor's response stream encoder.
  */
 import { createHash } from "node:crypto";
 

@@ -1,11 +1,13 @@
 import { v4 as uuidv4 } from "uuid";
 import type { ResponseCreateParamsBase } from "openai/resources/responses/responses";
-import { imageSizeViolation } from "../imageLimit.ts";
+import { imageSizeViolation, parseInlineImage, REMOTE_IMAGE, UNSUPPORTED_MODEL_IMAGE } from "../imageLimit.ts";
 import { remapKiroToolHistory, sanitizeKiroTools } from "../kiro/sanitizer.ts";
 import type { ProviderCredentials } from "../kiro/base.ts";
-import { getKiroModelCapabilities } from "../kiro/modelCapabilities.ts";
+import { getKiroModelCapabilities, supportsKiroImages } from "../kiro/modelCapabilities.ts";
 import { decodeReasoning, mergeKiroReasoning, type KiroReasoningContent } from "../kiro/reasoning.ts";
 import { buildKiroThinkingEnvelope } from "../kiro/request/adaptiveThinking.ts";
+import { normalizeKiroConversation, synthesizeHistoryToolSpecs, lowerKiroToolChoice, type KiroCurrentMessage } from "../kiro/request/history.ts";
+import type { KiroHistoryItem, KiroUserInputMessageContext } from "../kiro/request/openai-to-kiro.ts";
 
 /**
  * Responses request accepted by the native Kiro adapter. `input` 由
@@ -24,7 +26,7 @@ export type KiroResponsesRequest = Omit<Partial<ResponseCreateParamsBase>, "inpu
 };
 
 export type KiroResponsesPayload = {
-  conversationState: { chatTriggerType: "MANUAL"; conversationId: string; currentMessage: { userInputMessage: { content: string; modelId: string; origin: "AI_EDITOR"; images?: Array<{ format: string; source: { bytes: string } }>; userInputMessageContext?: { tools?: unknown[]; toolResults?: KiroToolResult[]; toolChoice?: unknown } } }; history: KiroHistoryItem[] };
+  conversationState: { chatTriggerType: "MANUAL"; conversationId: string; currentMessage: KiroCurrentMessage; history: KiroHistoryItem[] };
   profileArn?: string;
   inferenceConfig?: { maxTokens?: number };
   additionalModelRequestFields?: { reasoning: { effort: string; summary?: string } };
@@ -66,21 +68,6 @@ type InputParts = {
   images: Array<{ format: string; bytes: string }>;
 };
 type KiroToolUse = { toolUseId: string; name: string; input: Obj };
-type KiroToolResult = { toolUseId: string; status: "success"; content: Array<{ text: string }> };
-type KiroHistoryItem = {
-  userInputMessage?: {
-    content: string;
-    modelId: string;
-    origin: "AI_EDITOR";
-    images?: Array<{ format: string; source: { bytes: string } }>;
-    userInputMessageContext?: { toolResults: KiroToolResult[] };
-  };
-  assistantResponseMessage?: {
-    content: string;
-    toolUses?: KiroToolUse[];
-    reasoningContent?: KiroReasoningContent;
-  };
-};
 
 function historyUserMessage(parts: InputParts, model: string): KiroHistoryItem {
   return {
@@ -137,15 +124,19 @@ function reasoningHistoryItem(item: Obj, model: string): KiroReasoningContent | 
   return text ? { reasoningText: { text } } : undefined;
 }
 
-function imageOf(value: unknown, path: string): { format: string; bytes: string } {
+function imageOf(value: unknown, path: string, supportsImages: boolean, toolResult = false): InputParts {
   if (!isObj(value) || value.type !== "input_image" || typeof value.image_url !== "string") throw new Error("input_image requires image_url");
-  const m = /^data:image\/(png|jpe?g|gif|webp);base64,([A-Za-z0-9+/]+={0,2})$/i.exec(value.image_url);
-  if (!m) throw new Error("input_image requires a base64 data URL");
-  const violation = imageSizeViolation(m[2]);
+  const image = parseInlineImage(value);
+  if (!image) {
+    if (/^https?:\/\//i.test(value.image_url)) return { text: REMOTE_IMAGE, images: [] };
+    throw new Error("input_image requires a base64 data URL");
+  }
+  const violation = imageSizeViolation(image.bytes);
   if (violation) throw new Error(`Invalid '${path}.image_url': ${violation}`);
-  return { format: m[1].toLowerCase() === "jpg" ? "jpeg" : m[1].toLowerCase(), bytes: m[2] };
+  if (!supportsImages) return { text: UNSUPPORTED_MODEL_IMAGE, images: [] };
+  return { text: toolResult ? `[image: image/${image.format}]` : "", images: [image] };
 }
-function contentParts(value: unknown, path: string): { text: string; images: Array<{ format: string; bytes: string }> } {
+function contentParts(value: unknown, path: string, supportsImages: boolean): InputParts {
   if (typeof value === "string") return { text: value, images: [] };
   if (!Array.isArray(value)) throw new Error("message content must be a string or array");
   const text: string[] = []; const images: Array<{ format: string; bytes: string }> = [];
@@ -155,7 +146,10 @@ function contentParts(value: unknown, path: string): { text: string; images: Arr
       if (typeof part.text !== "string") throw new Error("Text content must be a string");
       text.push(part.text);
     }
-    else if (part.type === "input_image") images.push(imageOf(part, `${path}[${index}]`));
+    else if (part.type === "input_image") {
+      const image = imageOf(part, `${path}[${index}]`, supportsImages);
+      text.push(image.text); images.push(...image.images);
+    }
     else throw new Error(`Unsupported content part type: ${String(part.type)}`);
   }
   return { text: text.join(""), images };
@@ -170,7 +164,7 @@ function functionInput(value: unknown): Obj {
  * 工具结果的文本进 toolResult；图片与 Anthropic 入口一致，挂到承载这批
  * toolResults 的 user 回合 images 上，并在文本中留下 `[image: …]` 占位。
  */
-function toolOutput(value: unknown, path: string): InputParts {
+function toolOutput(value: unknown, path: string, supportsImages: boolean): InputParts {
   if (typeof value === "string") return { text: value, images: [] };
   if (Array.isArray(value)) {
     const text: string[] = [];
@@ -178,9 +172,9 @@ function toolOutput(value: unknown, path: string): InputParts {
     for (const [index, part] of value.entries()) {
       if (isObj(part) && part.type === "input_text" && typeof part.text === "string") text.push(part.text);
       else if (isObj(part) && part.type === "input_image") {
-        const image = imageOf(part, `${path}[${index}]`);
-        images.push(image);
-        text.push(`${text.length ? "\n" : ""}[image: image/${image.format}]`);
+        const image = imageOf(part, `${path}[${index}]`, supportsImages, true);
+        images.push(...image.images);
+        text.push(`${text.length ? "\n" : ""}${image.text}`);
       } else throw new Error("function_call_output output must contain input_text or input_image parts");
     }
     return { text: text.join(""), images };
@@ -247,7 +241,7 @@ function flattenToolDefinitions(
   }
 }
 /** Build the exact conversationState wire payload consumed by the Kiro executor. */
-export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequest, stream: boolean, credentials: ProviderCredentials): KiroResponsesPayload {
+export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequest, stream: boolean, credentials: ProviderCredentials, supportsImages = supportsKiroImages(model)): KiroResponsesPayload {
   void stream;
   const capabilities = getKiroModelCapabilities(model);
   const includeEncryptedContent = Array.isArray(body.include) && body.include.includes("reasoning.encrypted_content");
@@ -269,16 +263,13 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   let reasoningEffort = "";
   let reasoningSummary = "";
   if (body.reasoning !== undefined && body.reasoning !== null) {
-    if (
-      !isObj(body.reasoning) ||
-      typeof body.reasoning.effort !== "string" ||
-      !Object.hasOwn(EFFORTS, body.reasoning.effort)
-    ) {
-      throw new Error(
-        "reasoning.effort must be one of minimal, low, medium, high, xhigh, max, or none"
-      );
+    if (!isObj(body.reasoning)) throw new Error("reasoning must be an object");
+    if (body.reasoning.effort !== undefined && body.reasoning.effort !== null) {
+      if (typeof body.reasoning.effort !== "string" || !Object.hasOwn(EFFORTS, body.reasoning.effort)) {
+        throw new Error("reasoning.effort must be one of minimal, low, medium, high, xhigh, max, or none");
+      }
+      reasoningEffort = EFFORTS[body.reasoning.effort];
     }
-    reasoningEffort = EFFORTS[body.reasoning.effort];
     if (body.reasoning.summary !== undefined && body.reasoning.summary !== null) {
       const validSummaries: Readonly<Record<string, true>> = {
         auto: true,
@@ -295,6 +286,9 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
     }
   }
   if (body.max_output_tokens !== undefined && body.max_output_tokens !== null && (typeof body.max_output_tokens !== "number" || !Number.isInteger(body.max_output_tokens) || body.max_output_tokens < 1)) throw new Error("max_output_tokens must be a positive integer");
+  if (isObj(body.text) && isObj(body.text.format) && body.text.format.type !== undefined && body.text.format.type !== "text") {
+    throw new Error("Unsupported text.format on this relay");
+  }
   const rawInput = body.input ?? "";
   if (typeof rawInput !== "string" && !Array.isArray(rawInput)) throw new Error("input must be a string or array");
   const items: Obj[] = typeof rawInput === "string" ? [{ type: "message", role: "user", content: [{ type: "input_text", text: rawInput }] }] : rawInput.map((v) => { if (!isObj(v)) throw new Error("input items must be objects"); return v; });
@@ -302,6 +296,7 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   const instructionTexts: string[] = [];
   if (typeof body.instructions === "string" && body.instructions) instructionTexts.push(body.instructions);
   const additionalToolDefinitions: unknown[] = [];
+  const historyToolMetadata: Record<string, { name: string; namespace?: string; custom: boolean }> = Object.create(null);
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     const type = typeof item.type === "string" ? item.type : typeof item.role === "string" ? "message" : undefined;
@@ -334,8 +329,8 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
         history.push(turn);
         user = turn.userInputMessage!;
       }
-      const output = toolOutput(item.output, `input[${i}].output`);
-      (user.userInputMessageContext ??= { toolResults: [] }).toolResults.push({ toolUseId: item.call_id, status: "success", content: [{ text: output.text }] });
+      const output = toolOutput(item.output, `input[${i}].output`, supportsImages);
+      ((user.userInputMessageContext ??= {}).toolResults ??= []).push({ toolUseId: item.call_id, status: "success", content: [{ text: output.text }] });
       if (output.images.length) (user.images ??= []).push(...output.images.map(image => ({ format: image.format, source: { bytes: image.bytes } })));
       continue;
     }
@@ -343,12 +338,13 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
       if (typeof item.call_id !== "string" || !item.call_id || typeof item.name !== "string" || !item.name) throw new Error(`${type} requires call_id and name`);
       const input = type === "custom_tool_call" ? (typeof item.input === "string" ? { input: item.input } : (() => { throw new Error("custom_tool_call input must be a string"); })()) : functionInput(item.arguments);
       const historyName = typeof item.namespace === "string" && item.namespace ? `${item.namespace}__${item.name}` : item.name;
+      historyToolMetadata[historyName] = { name: item.name, ...(typeof item.namespace === "string" && item.namespace ? { namespace: item.namespace } : {}), custom: type === "custom_tool_call" };
       appendAssistantHistory(history, "", { toolUseId: item.call_id, name: historyName, input });
       continue;
     }
     if (type !== "message") throw new Error(`Unsupported input item type: ${String(type)}`);
     if (item.role !== "user" && item.role !== "assistant" && item.role !== "system" && item.role !== "developer") throw new Error("message role is invalid");
-    const parts = contentParts(item.content, `input[${i}].content`);
+    const parts = contentParts(item.content, `input[${i}].content`, supportsImages);
     if (item.role === "system" || item.role === "developer") { instructionTexts.push(parts.text); continue; }
     if (item.role === "assistant") { appendAssistantHistory(history, parts.text); continue; }
     const previous = history.at(-1)?.userInputMessage;
@@ -359,11 +355,6 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   }
   const lastUser = history.at(-1)?.userInputMessage;
   if (lastUser) history.pop();
-  // Kiro 拒收正文为空且不带工具结果或图片的用户回合（REQUEST_BODY_INVALID），填中性占位。
-  for (const item of history) {
-    const user = item.userInputMessage;
-    if (user && !user.content.trim() && !user.images?.length && !user.userInputMessageContext?.toolResults?.length) user.content = "...";
-  }
   const currentText = lastUser?.content ?? "";
   const currentImages = lastUser?.images?.map(image => ({ format: image.format, bytes: image.source.bytes })) ?? [];
   const current: InputParts = {
@@ -371,7 +362,7 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
     images: currentImages,
   };
   const instruction = instructionTexts.length ? instructionTexts.map((text) => `<system-reminder>\n${text}\n</system-reminder>`).join("\n\n") + "\n\n" : "";
-  const context: { tools?: unknown[]; toolResults?: KiroToolResult[]; toolChoice?: unknown } = {};
+  const context: KiroUserInputMessageContext = {};
   if (lastUser?.userInputMessageContext) context.toolResults = lastUser.userInputMessageContext.toolResults;
   const declaredTools: unknown[] = [];
   if (body.tools !== undefined && body.tools !== null) {
@@ -381,41 +372,32 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
   declaredTools.push(...additionalToolDefinitions);
   let nameMap: Record<string, string> | undefined;
   let responseToolMetadata: Record<string, { name: string; namespace?: string; custom: boolean }> | undefined;
+  const metadata: Record<string, { name: string; namespace?: string; custom: boolean }> = Object.create(null);
+  let tools: NonNullable<KiroUserInputMessageContext["tools"]>;
   if (declaredTools.length) {
     const flattened: Obj[] = [];
-    const metadata: Record<string, { name: string; namespace?: string; custom: boolean }> = Object.create(null);
     flattenToolDefinitions(declaredTools, flattened, metadata, Object.create(null));
-    const tools = flattened.map((tool) => {
+    tools = flattened.map((tool) => {
       const fn = isObj(tool.function) ? tool.function : tool;
       if (typeof fn.name !== "string" || !fn.name) throw new Error("function tool requires a name");
-      return { toolSpecification: { name: fn.name, description: typeof fn.description === "string" ? fn.description : undefined, inputSchema: { json: isObj(fn.parameters) ? fn.parameters : { type: "object", properties: {} } } } };
+      return { toolSpecification: { name: fn.name, description: typeof fn.description === "string" ? fn.description : `Tool: ${fn.name}`, inputSchema: { json: isObj(fn.parameters) ? fn.parameters : { type: "object", properties: {} } } } };
     });
-    const sanitized = sanitizeKiroTools(tools);
-    remapKiroToolHistory(history, sanitized.nameMap);
-    context.tools = sanitized.tools;
-    if (sanitized.nameMap.size) nameMap = Object.fromEntries(sanitized.nameMap);
-    const restoredMetadata: Record<string, { name: string; namespace?: string; custom: boolean }> = Object.create(null);
-    for (const tool of sanitized.tools) {
-      const sanitizedName = tool.toolSpecification.name;
-      const flattenedName = sanitized.nameMap.get(sanitizedName) ?? sanitizedName;
-      const toolMetadata = metadata[flattenedName];
-      if (toolMetadata) restoredMetadata[flattenedName] = toolMetadata;
-    }
-    if (Object.keys(restoredMetadata).length) responseToolMetadata = restoredMetadata;
+  } else {
+    Object.assign(metadata, historyToolMetadata);
+    tools = synthesizeHistoryToolSpecs(history).map(tool => metadata[tool.toolSpecification.name]?.custom
+      ? { toolSpecification: { ...tool.toolSpecification, inputSchema: { json: { type: "object", properties: { input: { type: "string" } }, required: ["input"], additionalProperties: false } } } }
+      : tool);
   }
+  const sanitized = sanitizeKiroTools(tools);
+  remapKiroToolHistory(history, sanitized.nameMap);
+  if (sanitized.tools.length) context.tools = sanitized.tools;
+  if (sanitized.nameMap.size) nameMap = Object.fromEntries(sanitized.nameMap);
+  if (Object.keys(metadata).length) responseToolMetadata = metadata;
   if (body.tool_choice !== undefined) {
     const choice = body.tool_choice;
-    if (choice === "auto") context.toolChoice = { auto: {} };
-    else if (choice === "required") context.toolChoice = { any: {} };
-    else if (choice === "none") context.toolChoice = { none: {} };
-    else if (isObj(choice) && (choice.type === "function" || choice.type === "custom") && typeof choice.name === "string" && choice.name) {
-      const flattenedName = typeof choice.namespace === "string" && choice.namespace ? `${choice.namespace}__${choice.name}` : choice.name;
-      const sanitizedName = Object.entries(nameMap ?? {}).find(([, original]) => original === flattenedName)?.[0] ?? flattenedName;
-      const declared = responseToolMetadata && Object.hasOwn(responseToolMetadata, flattenedName);
-      const ordinaryDeclared = context.tools?.some((tool) => isObj(tool) && isObj(tool.toolSpecification) && tool.toolSpecification.name === sanitizedName);
-      if (!declared && !ordinaryDeclared) throw new Error(`tool_choice references undeclared tool: ${flattenedName}`);
-      context.toolChoice = { tool: { name: sanitizedName } };
-    } else throw new Error("Invalid tool_choice");
+    const flattened = isObj(choice) && typeof choice.name === "string" && typeof choice.namespace === "string" && choice.namespace
+      ? { type: choice.type, name: `${choice.namespace}__${choice.name}` } : choice;
+    context.toolChoice = lowerKiroToolChoice(flattened, { sanitizedNames: new Set(sanitized.tools.map(tool => tool.toolSpecification.name)), nameMap: sanitized.nameMap });
   }
   const payload: KiroResponsesPayload = {
     conversationState: {
@@ -440,6 +422,9 @@ export function buildKiroResponsesPayload(model: string, body: KiroResponsesRequ
       history,
     },
   };
+  const normalized = normalizeKiroConversation(history, payload.conversationState.currentMessage, model);
+  payload.conversationState.history = normalized.history;
+  payload.conversationState.currentMessage = normalized.currentMessage;
   payload._includeEncryptedContent = includeEncryptedContent;
   const profileArn = credentials.providerSpecificData?.profileArn; if (typeof profileArn === "string" && profileArn) payload.profileArn = profileArn;
   if (typeof body.max_output_tokens === "number") payload.inferenceConfig = { maxTokens: body.max_output_tokens };

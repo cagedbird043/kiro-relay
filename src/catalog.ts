@@ -20,6 +20,7 @@ import type { AppConfig } from "./config.ts";
 import type { ProviderCredentials } from "./kiro/base.ts";
 import { MODEL_CONTEXT_LENGTHS } from "./kiro/config.ts";
 import { fetchKiroAvailableModels, type KiroModel } from "./kiro/models.ts";
+import { supportsKiroImages } from "./kiro/modelCapabilities.ts";
 import {
   staticKiroThinkingMode,
   type KiroThinkingMode,
@@ -28,6 +29,7 @@ import {
 export type CatalogEntry = {
   id: string;
   contextLength: number;
+  supportsImages: boolean;
   /** Which `additionalModelRequestFields` envelope the model accepts upstream. */
   thinkingMode: KiroThinkingMode;
 };
@@ -38,6 +40,7 @@ export type Catalog = {
   has(id: string): boolean;
   contextLengthFor(id: string): number | undefined;
   thinkingModeFor(id: string): KiroThinkingMode | undefined;
+  supportsImagesFor(id: string): boolean | undefined;
   /** Await a discovery pass. Used by tests and by startup warm-up. */
   refresh(): Promise<void>;
 };
@@ -73,7 +76,7 @@ function fallbackEntries(models: AppConfig["models"]): Map<string, CatalogEntry>
   const entries = new Map<string, CatalogEntry>();
   for (const [id, contextLength] of Object.entries(MODEL_CONTEXT_LENGTHS)) {
     if (!EXCLUDED_MODEL_IDS[id]) {
-      entries.set(id, { id, contextLength, thinkingMode: staticKiroThinkingMode(id) });
+      entries.set(id, { id, contextLength, thinkingMode: staticKiroThinkingMode(id), supportsImages: supportsKiroImages(id) });
     }
   }
   for (const [id, spec] of Object.entries(models)) {
@@ -82,6 +85,7 @@ function fallbackEntries(models: AppConfig["models"]): Map<string, CatalogEntry>
         id,
         contextLength: spec.contextLength,
         thinkingMode: entries.get(id)?.thinkingMode ?? staticKiroThinkingMode(id),
+        supportsImages: supportsKiroImages(id),
       });
     }
   }
@@ -115,6 +119,7 @@ function discoveredEntries(
       id: model.id,
       contextLength,
       thinkingMode: model.thinkingMode ?? staticKiroThinkingMode(model.id),
+      supportsImages: model.supportsImages ?? true,
     });
   }
   for (const [id, spec] of Object.entries(models)) {
@@ -187,6 +192,10 @@ export function createCatalog(options: CatalogOptions): Catalog {
     thinkingModeFor(id: string) {
       ensureFresh();
       return entries.get(id)?.thinkingMode;
+    },
+    supportsImagesFor(id: string) {
+      ensureFresh();
+      return entries.get(id)?.supportsImages;
     },
     refresh,
   };

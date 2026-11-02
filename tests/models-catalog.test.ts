@@ -13,7 +13,7 @@ function config(models: ModelConfig["models"]): ModelConfig {
 
 const emptyExecutor = {
   execute: async () => ({ response: new Response() }),
-  refreshCredentials: async () => null,
+  refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
 };
 
 describe("GET /v1/models catalog", () => {
@@ -35,6 +35,7 @@ describe("GET /v1/models catalog", () => {
         created: 0,
         owned_by: "kiro",
         context_length: 1_000_000,
+        input_modalities: ["text", "image"],
       },
       {
         id: "gpt-5.6-sol",
@@ -42,6 +43,7 @@ describe("GET /v1/models catalog", () => {
         created: 0,
         owned_by: "kiro",
         context_length: 272_000,
+        input_modalities: ["text", "image"],
       },
     ]);
     expect(body.models).toHaveLength(1);

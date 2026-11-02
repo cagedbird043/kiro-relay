@@ -6,7 +6,7 @@ test("readKiroEvents handles fragmented SSE frames and DONE", async () => {
     'data: {"id":"r1","choices":[{"delta":{"role":"assistant","content":"hel',
     'lo"}}]}\n\n',
     'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"lookup","arguments":"{\\"q\\":"}}]}}]}\n\n',
-    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"x\\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"cache_read_input_tokens":0}}\n\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"x\\"}"}}]},"finish_reason":"tool_use"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"cache_read_input_tokens":0}}\n\n',
     "data: [DONE]\n\n",
   ];
   const stream = new ReadableStream<Uint8Array>({
@@ -26,7 +26,7 @@ test("readKiroEvents handles fragmented SSE frames and DONE", async () => {
 test("late tool metadata starts exactly one block and preserves arguments", async () => {
   const response = new Response([
     'data: {"choices":[{"delta":{"tool_calls":[{"index":2,"function":{"arguments":"{\\"q\\":"}}]}}]}\n\n',
-    'data: {"choices":[{"delta":{"tool_calls":[{"index":2,"id":"late-id","function":{"name":"lookup","arguments":"\\"x\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":2,"id":"late-id","function":{"name":"lookup","arguments":"\\"x\\"}"}}]},"finish_reason":"tool_use"}]}\n\n',
     'data: [DONE]\n\n',
   ].join(""), { headers: { "content-type": "text/event-stream" } });
   const events = [];
@@ -36,7 +36,7 @@ test("late tool metadata starts exactly one block and preserves arguments", asyn
 });
 
 test("readKiroEvents emits terminal stop on ordinary JSON response", async () => {
-  const response = new Response(JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }] }), { headers: { "content-type": "application/json" } });
+  const response = new Response(JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "end_turn" }] }), { headers: { "content-type": "application/json" } });
   const events = [];
   for await (const event of readKiroEvents(response, "gpt-5.6")) events.push(event);
   expect(events.at(-1)).toEqual({ type: "stop", reason: "end_turn" });

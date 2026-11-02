@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Response as OpenAIResponse, ResponseStreamEvent, ResponseUsage } from "openai/resources/responses/responses";
-import { readKiroEvents, type KiroEvent } from "../kiro/events.ts";
+import { KiroStreamProtocolError, readKiroEvents, type KiroEvent } from "../kiro/events.ts";
 import { encodeReasoning } from "../kiro/reasoning.ts";
 
 const id = (prefix: string) => `${prefix}_${randomUUID().replaceAll("-", "")}`;
@@ -10,7 +10,7 @@ type Usage = Omit<ResponseUsage, "output_tokens_details"> & {
 };
 export type RelayResponse = Omit<OpenAIResponse, "usage"> & { usage: Usage | null; stop_details?: Record<string, unknown> };
 export type ResponseToolMetadata = Readonly<Record<string, { name: string; namespace?: string; custom: boolean }>>;
-export type ResponsesOptions = Readonly<{ includeEncryptedContent?: boolean }>;
+export type ResponsesOptions = Readonly<{ includeEncryptedContent?: boolean; onStreamFailure?: (code: string) => void }>;
 type Reasoning = { kind: "reasoning"; id: string; index: number; text: string; signature?: string; redacted?: string; summaryStarted: boolean };
 type Message = { kind: "message"; id: string; index: number; text: string };
 type Call = { kind: "tool"; id: string; index: number; callId: string; name: string; args: string; metadata?: { name: string; namespace?: string; custom: boolean } };
@@ -87,7 +87,7 @@ function finishEntry(s: State, entry: Entry, emit?: Emit): void {
   } else if (entry.kind === "tool") {
     const name = entry.metadata?.custom ? "response.custom_tool_call_input.done" : "response.function_call_arguments.done";
     emit?.(name, { type: name, item_id: entry.id, output_index: entry.index, call_id: entry.callId,
-      ...(entry.metadata?.custom ? { input: customInput(entry.args) } : { arguments: entry.args }) });
+      ...(entry.metadata?.custom ? { input: customInput(entry.args) } : { name: entry.metadata?.name ?? entry.name, arguments: entry.args }) });
   }
   emit?.("response.output_item.done", { type: "response.output_item.done", output_index: entry.index, item: outputItem(s, entry) });
 }
@@ -154,18 +154,22 @@ export function responsesStream(response: globalThis.Response, model: string, re
   const encoder = new TextEncoder();
   const abort = new AbortController();
   let sequenceNumber = 0;
+  let failureLogged = false;
+  const fail = (code: string) => { if (!failureLogged) { failureLogged = true; options.onStreamFailure?.(code); } };
   const readable = new ReadableStream<Uint8Array>({ async start(controller) {
     const emit: Emit = (name, data) => controller.enqueue(encoder.encode(`event: ${name}\ndata: ${JSON.stringify({ ...data, sequence_number: sequenceNumber++ })}\n\n`));
     try {
       for await (const event of readKiroEvents(response, model, abort.signal)) {
         if (abort.signal.aborted) return;
         applyEvent(s, event, emit);
+        if (event.type === "stop" && event.reason === "pause_turn") fail("pause_turn");
       }
       if (abort.signal.aborted) return;
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       controller.close();
     } catch (error) {
       if (abort.signal.aborted) return;
+      fail(error instanceof KiroStreamProtocolError ? error.code : "stream_error");
       s.status = "failed";
       s.error = { code: "server_error", message: error instanceof Error ? error.message : "Response stream failed" };
       emit("response.failed", { type: "response.failed", response: baseResponse(s) });

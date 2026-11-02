@@ -29,8 +29,8 @@ const UPSTREAM_PAYLOAD = {
   models: [
     { modelId: "auto", modelName: "Auto", rateMultiplier: 1.0, tokenLimits: { maxInputTokens: 1_000_000 } },
     { modelId: "claude-opus-5", modelName: "Claude Opus 5", rateMultiplier: 2.2, tokenLimits: { maxInputTokens: 1_000_000 }, additionalModelRequestFieldsSchema: ADAPTIVE_SCHEMA },
-    { modelId: "deepseek-3.2", modelName: "Deepseek v3.2", rateMultiplier: 0.25, tokenLimits: { maxInputTokens: 164_000 } },
-    { modelId: "qwen3-coder-next", modelName: "Qwen3 Coder Next", rateMultiplier: 0.05, tokenLimits: { maxInputTokens: 256_000 } },
+    { modelId: "deepseek-3.2", modelName: "Deepseek v3.2", rateMultiplier: 0.25, tokenLimits: { maxInputTokens: 164_000 }, supportedInputTypes: ["TEXT"] },
+    { modelId: "qwen3-coder-next", modelName: "Qwen3 Coder Next", rateMultiplier: 0.05, tokenLimits: { maxInputTokens: 256_000 }, supportedInputTypes: ["TEXT"] },
   ],
 };
 
@@ -65,9 +65,9 @@ describe("live model catalog", () => {
     await catalog.refresh();
 
     expect(catalog.list()).toEqual([
-      { id: "claude-opus-5", contextLength: 1_000_000, thinkingMode: "adaptive" },
-      { id: "deepseek-3.2", contextLength: 164_000, thinkingMode: "none" },
-      { id: "qwen3-coder-next", contextLength: 256_000, thinkingMode: "none" },
+      { id: "claude-opus-5", contextLength: 1_000_000, thinkingMode: "adaptive", supportsImages: true },
+      { id: "deepseek-3.2", contextLength: 164_000, thinkingMode: "none", supportsImages: false },
+      { id: "qwen3-coder-next", contextLength: 256_000, thinkingMode: "none", supportsImages: false },
     ]);
     expect(catalog.has("auto")).toBe(false);
     expect(catalog.has("claude-opus-5-thinking")).toBe(false);
@@ -272,12 +272,12 @@ describe("catalog-backed server routes", () => {
           seen.push({ model: input.model, contextLength: input.contextLength });
           return {
             response: new Response(
-              JSON.stringify({ choices: [{ message: { content: "hello" }, finish_reason: "stop" }] }),
+              JSON.stringify({ choices: [{ message: { content: "hello" }, finish_reason: "end_turn" }] }),
               { headers: { "content-type": "application/json" } }
             ),
           };
         },
-        refreshCredentials: async () => null,
+        refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
       },
       { catalog }
     );
@@ -288,12 +288,12 @@ describe("catalog-backed server routes", () => {
     const { directory, handler } = await servedByCatalog();
     try {
       const response = await handler(new Request("http://relay/v1/models"));
-      const body = (await response.json()) as { data: Array<{ id: string; object: string; created: number; owned_by: string; context_length: number }> };
+      const body = (await response.json()) as { data: Array<{ id: string; object: string; created: number; owned_by: string; context_length: number; input_modalities: string[] }> };
 
       expect(body.data).toEqual([
-        { id: "claude-opus-5", object: "model", created: 0, owned_by: "kiro", context_length: 1_000_000 },
-        { id: "deepseek-3.2", object: "model", created: 0, owned_by: "kiro", context_length: 164_000 },
-        { id: "qwen3-coder-next", object: "model", created: 0, owned_by: "kiro", context_length: 256_000 },
+        { id: "claude-opus-5", object: "model", created: 0, owned_by: "kiro", context_length: 1_000_000, input_modalities: ["text", "image"] },
+        { id: "deepseek-3.2", object: "model", created: 0, owned_by: "kiro", context_length: 164_000, input_modalities: ["text"] },
+        { id: "qwen3-coder-next", object: "model", created: 0, owned_by: "kiro", context_length: 256_000, input_modalities: ["text"] },
       ]);
     } finally {
       await rm(directory, { recursive: true, force: true });

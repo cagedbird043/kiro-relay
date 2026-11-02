@@ -10,10 +10,10 @@
 
 ## 设计取向
 
-- **协议保真**：流式节奏、思考内容与签名、并行工具调用都按上游原样转发。不注入思考提示词，也不伪造推理内容。
-- **不支持就明确拒绝**：Kiro 做不到的功能直接返回 400 并说明原因，例如 `stop` / `stop_sequences`、JSON `response_format`、Responses 的服务端存储与 `previous_response_id`。不会悄悄忽略。
+- **协议保真**：保持增量流式节奏与并行工具调用；Anthropic 与 Responses 保留思考签名和隐藏推理，Chat 只提供 `reasoning_content`。不注入思考提示词，也不伪造推理内容。
+- **明确能力边界**：`stop` / `stop_sequences`、JSON `response_format`、Responses 的服务端存储与 `previous_response_id` 等不支持的功能返回 400 并说明原因；图片占位、工具约束的尽力兼容行为见“已知限制”。
 - **保持精简**：没有数据库、管理后台、WebUI，也不做多供应商路由。只有一个 YAML 配置和一个凭据文件。
-- **日志脱敏**：只记录请求 ID、模型、状态码、阶段、错误类别等元数据，不记录密钥、提示词、思考内容和签名。
+- **日志脱敏**：只记录请求 ID、模型、状态码、阶段、固定错误码及经过校验的异常类型，不记录密钥、提示词、思考内容、签名或异常消息原文。流式失败以 `stream_failed` 阶段单独记录。
 
 ## 快速开始
 
@@ -46,7 +46,7 @@ bun run start
 | `--client-id` / `--client-secret` | 复用已注册的 OIDC 客户端 |
 | `--client-registration <file>` | 从含 `clientId`、`clientSecret` 的 JSON 文件读取客户端信息 |
 
-凭据中的 token 快过期时会自动刷新，并原子写回凭据文件；多个请求同时触发刷新时只会真正刷新一次。
+凭据中的 token 快过期时会自动刷新，并原子写回凭据文件；多个请求同时触发刷新时只会真正刷新一次。每次刷新最多等待 15 秒（含响应体读取），临时网络故障、限流或上游 5xx 返回 503；主动刷新遇到临时故障且旧 token 仍有效时继续使用旧 token。凭据失效或配置无效返回 401，需重新运行 `auth:login`。登录取得 token 后立即落盘，再尽力发现并补存 profile ARN。凭据写入使用跨进程文件锁；补存 profile 时若 token 已轮换，保留当前凭据并跳过补存。凭据所在目录必须可写，以便创建临时文件和锁目录。
 
 ## 配置
 
@@ -100,14 +100,21 @@ const reply = await client.chat.completions.create({
 });
 ```
 
-`GET /v1/models` 返回当前可用模型及其 `context_length`，支持 `ETag` / `If-None-Match`。`GET /healthz` 用于健康检查，不需要鉴权。
+`GET /v1/models` 返回当前可用模型及其 `context_length`、`input_modalities`（`["text","image"]` 或 `["text"]`），支持 `ETag` / `If-None-Match`。图片能力优先采用 Kiro 目录的 `supportedInputTypes`；离线时仅 deepseek-3.2、minimax-m2.1、minimax-m2.5、glm-5、qwen3-coder-next 禁用图片，其余模型默认支持。浏览器预检允许 `If-None-Match`，客户端可读取 `ETag` 和 `Retry-After` 响应头。`GET /healthz` 用于健康检查，不需要鉴权。
 
 ## 已知限制
 
-- 图片只接受 base64 内联，单张 base64 不超过 5 MB；不支持远程图片 URL 和 `document` 内容块。超限时的报错措辞与 Anthropic 官方一致，客户端可以据此自动压缩后重试。
+- 图片只发送 base64 内联，单张 base64 不超过 5 MB（含工具结果内嵌图片）；超限仍报错，客户端可以据此自动压缩后重试。远程 URL 在原位置替换为 `[image omitted: remote image URLs are not supported, send base64 inline]`，不支持图片的模型收到内联图时替换为 `[image omitted: this model does not support image input]`；两种情况均不发送图片字节，也不拒绝请求。`document` 内容块仍不支持。
 - Responses 接口仅支持 GPT-5.6 系列这类原生推理模型；`store` 必须为 `false`，不支持 `previous_response_id`、`conversation`、`background`、`prompt`、`truncation`。
+- Responses 的 `text.format.type` 仅接受 `text`；Anthropic 不支持 `top_k`，存在即返回 400。
+- Responses 的 `reasoning.effort` 可省略或为 `null`；`summary` 独立校验，仅有 summary 时沿用上游默认推理设置，不发送推理信封。
+- Chat 流式与非流式响应均输出标准停止原因，usage 的输入 token 包含缓存读取与写入，`cached_tokens` 仅为缓存读取。Chat 不暴露内部停止详情、签名、隐藏推理和估算标记。
+- 工具参数按调用 ID 统一组装：字符串片段即时流出，对象快照只发布最终值；嵌套工具包装校验通过才公开，混用片段类型返回流错误。Responses 的 `response.function_call_arguments.done.name` 使用恢复后的公开工具名。
+- 验证变更路径时可用 `bun run live-check --quick`，只发送 developer、required 工具选择、Responses 助手开头、glm-5 图片占位四个请求，不采集签名；完整历史形状检查沿用默认模式。`--summary-only` 可额外探测仅 summary 请求。脚本只打印用例名和安全状态，不输出响应正文或凭据。
 - 当前只使用 `accounts` 中的第一个账号。
 - Anthropic / Chat 的工具说明超过 Kiro 单项长度限制时，全文保留在带 `<system-reminder>` 标记的初始上下文中；后续用户消息和工具结果续接不再追加文档。相同工具集与初始输入保持该段字节稳定；实际缓存命中仍取决于上游，不能据此保证命中率。
+- Chat / Anthropic 的 `system` 与 `developer` 消息统一包在 `<system-reminder>` 中。三个入口共用历史规整：补齐中性起始回合、按工具 ID 配对结果、孤儿结果降为正文、空结果填 `(no output)`；省略工具声明时由历史调用合成最小声明，Responses 保留 custom / namespace 元数据。
+- 接受 `strict: true`，但 Kiro 不保证严格的参数格式，只能尽力遵循 schema。`parallel_tool_calls` 与 `disable_parallel_tool_use` 均忽略，不限制或丢弃并行调用。`tool_choice` 支持 auto、none、required / any 和各入口的指定工具形状；指定工具必须有声明（含历史合成声明）。
 
 ## 部署
 

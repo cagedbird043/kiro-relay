@@ -13,7 +13,7 @@ function upstream(text: string): Response {
   const frames = [
     { id: "resp_upstream", choices: [{ index: 0, delta: { role: "assistant" } }] },
     {
-      choices: [{ index: 0, delta: { content: text }, finish_reason: "stop" }],
+      choices: [{ index: 0, delta: { content: text }, finish_reason: "end_turn" }],
       usage: { prompt_tokens: 3, completion_tokens: 2 },
     },
   ];
@@ -42,7 +42,7 @@ async function fixture() {
       seen.push(input);
       return { response: upstream("sdk-ok") };
     },
-    refreshCredentials: async () => null,
+    refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
   };
   const server = Bun.serve({
     hostname: "127.0.0.1",

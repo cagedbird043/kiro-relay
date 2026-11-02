@@ -25,7 +25,7 @@ describe("Responses formatter", () => {
       { choices: [{ delta: { reasoning_content: "more", content: "hel" } }] },
       { choices: [{ delta: { content: "lo", tool_calls: [{ index: 0, id: "call_1", function: { name: "lookup", arguments: '{"q":' } }] } }] },
       { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] } }] },
-      { usage: { prompt_tokens: 4, completion_tokens: 3, cache_read_input_tokens: 2 }, choices: [{ finish_reason: "tool_calls" }] },
+      { usage: { prompt_tokens: 4, completion_tokens: 3, cache_read_input_tokens: 2 }, choices: [{ finish_reason: "tool_use" }] },
     ]), "gpt-5.6-sol", {}, { includeEncryptedContent: true });
     expect(result.id).toBe("up_1");
     expect(result.output_text).toBe("hello");
@@ -44,7 +44,7 @@ describe("Responses formatter", () => {
     const output = await events(responsesStream(upstream([
       { id: "up_2", choices: [{ delta: { reasoning_content: "why", reasoning_signature: "sig_2" } }] },
       { choices: [{ delta: { content: "ok", tool_calls: [{ index: 1, id: "call_2", function: { name: "f", arguments: "{}" } }] } }] },
-      { usage: { prompt_tokens: 1, completion_tokens: 2 }, choices: [{ finish_reason: "stop" }] },
+      { usage: { prompt_tokens: 1, completion_tokens: 2 }, choices: [{ finish_reason: "end_turn" }] },
     ]), "gpt-5.6-sol", {}, { includeEncryptedContent: true }));
     expect(output.filter((e) => e.type === "response.completed")).toHaveLength(1);
     const added = output.filter((e) => e.type === "response.output_item.added");
@@ -65,7 +65,7 @@ describe("Responses formatter", () => {
     const response = upstream([
       { id: "up_sig", choices: [{ delta: { reasoning_signature: "opaque-signature" } }] },
       { choices: [{ delta: { content: "answer" } }] },
-      { choices: [{ delta: {}, finish_reason: "stop" }] },
+      { choices: [{ delta: {}, finish_reason: "end_turn" }] },
     ]);
     const result = await collectResponses(response, "gpt-5.6-luna", {}, { includeEncryptedContent: true });
     expect(result.output[0]).toMatchObject({
@@ -79,7 +79,7 @@ describe("Responses formatter", () => {
       upstream([
         { id: "up_sig_stream", choices: [{ delta: { reasoning_signature: "stream-signature" } }] },
         { choices: [{ delta: { content: "answer" } }] },
-        { choices: [{ delta: {}, finish_reason: "stop" }] },
+        { choices: [{ delta: {}, finish_reason: "end_turn" }] },
       ]),
       "gpt-5.6-luna",
       {},
@@ -117,7 +117,7 @@ describe("Responses formatter", () => {
           },
         ],
       },
-      { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+      { choices: [{ delta: {}, finish_reason: "tool_use" }] },
     ];
     const responseTools = {
       functions__exec: { name: "exec", namespace: "functions", custom: true },
@@ -153,7 +153,7 @@ describe("Responses formatter", () => {
     const chunks = [
       { id: "up_include", choices: [{ delta: { reasoning_signature: "secret" } }] },
       { choices: [{ delta: { content: "ok" } }] },
-      { choices: [{ delta: {}, finish_reason: "stop" }] },
+      { choices: [{ delta: {}, finish_reason: "end_turn" }] },
     ];
     const included = await collectResponses(upstream(chunks), "gpt-5.6-luna", {}, { includeEncryptedContent: true });
     expect(replayed(included.output[0], "gpt-5.6-luna")).toEqual({ reasoningText: { text: "", signature: "secret" } });
@@ -177,7 +177,7 @@ describe("Responses formatter", () => {
       { choices: [{ delta: { reasoning_signature: "签名甲" } }] },
       { choices: [{ delta: { reasoning_signature: "签名乙" } }] },
       { choices: [{ delta: { reasoning_redacted: "UkVEQUNURUQ=" } }] },
-      { choices: [{ finish_reason: "stop" }] },
+      { choices: [{ finish_reason: "end_turn" }] },
     ]), "gpt-5.6-sol", {}, { includeEncryptedContent: true }));
     const done = output.filter(event => event.type === "response.output_item.done").map(event => event.item);
     expect(output.at(-1)?.response).toMatchObject({ output: done });
@@ -185,4 +185,22 @@ describe("Responses formatter", () => {
     expect(replayed(done[2], "gpt-5.6-sol")).toEqual({ redactedContent: "UkVEQUNURUQ=" });
     expect(() => replayed(done[0], "gpt-5.6-luna")).toThrow("requested model");
   });
+});
+
+test("function arguments done carries restored public name", async () => {
+  const output = await events(responsesStream(upstream([
+    { choices: [{ delta: { tool_calls: [{ index: 0, id: "call", function: { name: "ns__lookup", arguments: "{}" } }] }, finish_reason: "tool_use" }] },
+  ]), "gpt-5.6-sol", { ns__lookup: { name: "lookup", namespace: "ns", custom: false } }));
+  const done = output.find(event => event.type === "response.function_call_arguments.done");
+  expect(done).toMatchObject({ name: "lookup", arguments: "{}" });
+  expect(output.find(event => event.type === "response.output_item.done")?.item).toMatchObject({ name: done?.name });
+});
+
+test("Responses stream failure callbacks distinguish pause_turn and protocol failure once", async () => {
+  for (const reason of ["pause_turn", undefined]) {
+    const codes: string[] = [];
+    const output = await events(responsesStream(upstream([{ choices: [{ delta: { content: "partial" }, ...(reason ? { finish_reason: reason } : {}) }] }]), "gpt-5.6-sol", {}, { onStreamFailure: code => codes.push(code) }));
+    expect(output.filter(event => event.type === "response.failed")).toHaveLength(1);
+    expect(codes).toEqual([reason ?? "unexpected_eof"]);
+  }
 });

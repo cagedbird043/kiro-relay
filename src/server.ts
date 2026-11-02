@@ -10,8 +10,10 @@ import {
 import { chatImageSizeError } from "./imageLimit.ts";
 import { buildKiroPayload } from "./kiro/request/openai-to-kiro.ts";
 import { kiroModelId, publicModelId } from "./kiro/request/adaptiveThinking.ts";
+import { supportsKiroImages } from "./kiro/modelCapabilities.ts";
 import { KiroExecutor } from "./kiro/executor.ts";
 import type { ProviderCredentials } from "./kiro/base.ts";
+import type { KiroRefreshResult } from "./kiro/refresh.ts";
 import {
   buildKiroResponsesPayload,
   type KiroResponsesRequest,
@@ -23,7 +25,7 @@ import {
   type ResponseToolMetadata,
 } from "./responses/response.ts";
 import { createCatalog, type Catalog } from "./catalog.ts";
-import { collectChatCompletion } from "./chat.ts";
+import { chatCompletionStream, collectChatCompletion } from "./chat.ts";
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
 
@@ -37,8 +39,8 @@ const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, OPTIONS",
   "access-control-allow-headers":
-    "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, openai-beta, openai-organization, openai-project",
-  "access-control-expose-headers": "request-id, etag",
+    "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, openai-beta, openai-organization, openai-project, if-none-match",
+  "access-control-expose-headers": "request-id, etag, retry-after",
   "access-control-max-age": "86400",
 };
 
@@ -125,6 +127,11 @@ function listenAddress(value: string): { hostname: string; port: number } {
   return { hostname, port };
 }
 
+type RequestErrorCode =
+  | "invalid_json" | "unknown_model" | "invalid_request" | "translate_failed"
+  | "credential_load_failed" | "credential_expired" | "refresh_transient" | "persist_failed"
+  | "upstream_fetch_failed" | "response_translate_failed";
+
 const SAFE_LOG_KEYS: Record<string, true> = {
   model: true,
   stream: true,
@@ -135,31 +142,19 @@ const SAFE_LOG_KEYS: Record<string, true> = {
   category: true,
   code: true,
   requestId: true,
+  errorName: true,
 };
 
 function metadataLog(tag: string, data: Record<string, unknown>) {
-  const safe = Object.fromEntries(Object.entries(data).filter(([key, value]) => SAFE_LOG_KEYS[key] && (typeof value === "string" || typeof value === "number" || typeof value === "boolean")));
+  const safe = Object.fromEntries(Object.entries(data).filter(([key, value]) => SAFE_LOG_KEYS[key] && (typeof value === "string" || typeof value === "number" || typeof value === "boolean") && (key !== "errorName" || typeof value === "string" && /^[A-Za-z]{1,40}$/.test(value))));
   console.info(`[${tag}]`, safe);
 }
 
 export type ExecutorLike = {
   execute(input: { model: string; body: unknown; stream: boolean; credentials: ProviderCredentials; signal?: AbortSignal; log?: unknown; contextLength?: number }): Promise<{ response: Response }>;
-  refreshCredentials(credentials: ProviderCredentials, log?: unknown): Promise<unknown>;
+  refreshCredentials(credentials: ProviderCredentials, log?: unknown): Promise<KiroRefreshResult>;
 };
 
-type RefreshResult = {
-  accessToken?: unknown;
-  refreshToken?: unknown;
-  expiresIn?: unknown;
-  expiresAt?: unknown;
-  providerSpecificData?: unknown;
-  error?: unknown;
-  code?: unknown;
-};
-
-function isRefreshResult(value: unknown): value is RefreshResult {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
 
 function safeErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? error.message : fallback;
@@ -173,7 +168,7 @@ const REFRESH_LEAD_MS = 5 * 60_000;
 
 type CredentialRefreshOutcome =
   | { credentials: ProviderCredentials }
-  | { error: "refresh_failed" | "persist_failed"; code?: string };
+  | { error: "unrecoverable" | "transient" | "persist_failed"; code: string };
 
 function credentialExpiry(credentials: ProviderCredentials): number | undefined {
   if (typeof credentials.expiresAt !== "string") return undefined;
@@ -186,39 +181,16 @@ function expiresWithin(credentials: ProviderCredentials, leadMs: number): boolea
   return expiry !== undefined && expiry <= Date.now() + leadMs;
 }
 
-function refreshCode(value: unknown): string | undefined {
-  if (!isRecord(value)) return undefined;
-  for (const key of ["code", "oauthErr", "awsErrorType"]) {
-    if (typeof value[key] === "string" && value[key].length <= 80) return value[key];
-  }
-  return undefined;
-}
 
 function normalizeRefreshedCredentials(
   current: ProviderCredentials,
-  refreshed: RefreshResult,
-): ProviderCredentials | undefined {
-  if (refreshed.error || typeof refreshed.accessToken !== "string" || !refreshed.accessToken) {
-    return undefined;
-  }
-  let expiresAt: string | undefined;
-  if (typeof refreshed.expiresAt === "string" && Number.isFinite(Date.parse(refreshed.expiresAt))) {
-    expiresAt = new Date(refreshed.expiresAt).toISOString();
-  } else if (typeof refreshed.expiresIn === "number" && Number.isFinite(refreshed.expiresIn) && refreshed.expiresIn > 0) {
-    const expiry = Date.now() + refreshed.expiresIn * 1000;
-    if (Number.isFinite(expiry)) expiresAt = new Date(expiry).toISOString();
-  }
-  const { expiresAt: _staleExpiry, ...base } = current;
+  refreshed: Extract<KiroRefreshResult, { ok: true }>,
+): ProviderCredentials {
   return {
-    ...base,
+    ...current,
     accessToken: refreshed.accessToken,
-    ...(typeof refreshed.refreshToken === "string" && refreshed.refreshToken
-      ? { refreshToken: refreshed.refreshToken }
-      : {}),
-    ...(expiresAt ? { expiresAt } : {}),
-    providerSpecificData: isRecord(refreshed.providerSpecificData)
-      ? refreshed.providerSpecificData
-      : current.providerSpecificData,
+    refreshToken: refreshed.refreshToken,
+    expiresAt: new Date(Date.now() + refreshed.expiresIn * 1000).toISOString(),
   };
 }
 
@@ -232,7 +204,7 @@ type CredentialRefreshLog = {
 function executorLog(model: string): CredentialRefreshLog {
   const write = (phase: string, tag: string, data?: unknown) => {
     const record = isRecord(data) ? data : {};
-    const code = refreshCode(record);
+    const code = typeof record.code === "string" && record.code.length <= 80 ? record.code : undefined;
     metadataLog(tag, {
       model,
       phase,
@@ -298,7 +270,7 @@ export function createHandler(
         latest = pendingCredentials ?? await loadCredentials(path);
       } catch {
         metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_reload", code: "credential_reload_failed" });
-        return { error: "refresh_failed", code: "credential_reload_failed" };
+        return { error: "unrecoverable", code: "credential_reload_failed" };
       }
       if (pendingCredentials) {
         try {
@@ -320,23 +292,18 @@ export function createHandler(
       }
 
       metadataLog("TOKEN_REFRESH", { model, phase: "started", category: "credential_refresh" });
-      let value: unknown;
+      let value: KiroRefreshResult;
       try {
         value = await executor.refreshCredentials(latest, log);
       } catch {
         metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_refresh", code: "refresh_exception" });
-        return { error: "refresh_failed", code: "refresh_exception" };
+        return { error: "transient", code: "refresh_exception" };
       }
-      if (!isRefreshResult(value)) {
-        metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_refresh", code: "refresh_failed" });
-        return { error: "refresh_failed", code: "refresh_failed" };
+      if (value.ok === false) {
+        metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_refresh", code: value.code });
+        return { error: value.kind === "transient" ? "transient" : "unrecoverable", code: value.code };
       }
       const refreshed = normalizeRefreshedCredentials(latest, value);
-      if (!refreshed) {
-        const code = refreshCode(value) ?? "refresh_rejected";
-        metadataLog("TOKEN_REFRESH", { model, phase: "failed", category: "credential_refresh", code });
-        return { error: "refresh_failed", code };
-      }
       pendingCredentials = refreshed;
       try {
         await saveCredentials(path, refreshed);
@@ -383,11 +350,11 @@ export function createHandler(
     if (method === "GET" && url.pathname === "/v1/models") {
       // With discovery active the catalog is Kiro's own entitlement list; without
       // it the hand-listed config models are served exactly as before.
-      const entries: Array<[string, { contextLength: number }]> = catalog
-        ? catalog.list().map((entry) => [publicModelId(entry.id), { contextLength: entry.contextLength }])
-        : Object.entries(config.models).map(([id, spec]) => [publicModelId(id), spec]);
+      const entries: Array<[string, { contextLength: number; supportsImages: boolean }]> = catalog
+        ? catalog.list().map((entry) => [publicModelId(entry.id), { contextLength: entry.contextLength, supportsImages: entry.supportsImages }])
+        : Object.entries(config.models).map(([id, spec]) => [publicModelId(id), { ...spec, supportsImages: supportsKiroImages(kiroModelId(id)) }]);
       const catalogFingerprint = entries
-        .map(([id, spec]) => ({ id, contextLength: spec.contextLength }))
+        .map(([id, spec]) => ({ id, contextLength: spec.contextLength, supportsImages: spec.supportsImages }))
         .sort((a, b) => a.id.localeCompare(b.id));
       const etag = `"${createHash("sha256").update(JSON.stringify(catalogFingerprint)).digest("hex")}"`;
       const responseBody = {
@@ -398,6 +365,7 @@ export function createHandler(
           created: 0,
           owned_by: "kiro",
           context_length: spec.contextLength,
+          input_modalities: spec.supportsImages ? ["text", "image"] : ["text"],
         })),
         models: entries
           .filter(([id]) => id.startsWith("gpt-5.6-"))
@@ -450,8 +418,8 @@ export function createHandler(
     let model = "";
     let stream = false;
     const identify = (response: Response) => { response.headers.set("request-id", requestId); return response; };
-    const requestError = (message: string, status = 400, type = "invalid_request_error") => {
-      metadataLog("REQUEST", { requestId, model, stream, status, phase: "failed", category: type });
+    const requestError = (message: string, code: RequestErrorCode, status = 400, type = "invalid_request_error", error?: unknown) => {
+      metadataLog("REQUEST", { requestId, model, stream, status, phase: "failed", category: type, code, ...(error instanceof Error ? { errorName: error.name } : {}) });
       return identify(isResponses || isChat ? openAIError(message, status, type) : anthropicError(message, status, type));
     };
 
@@ -461,7 +429,7 @@ export function createHandler(
       if (!isRecord(parsed)) throw new Error("body must be an object");
       body = parsed;
     } catch {
-      return requestError("Request body must be valid JSON");
+      return requestError("Request body must be valid JSON", "invalid_json");
     }
 
     model = typeof body.model === "string" ? body.model : "";
@@ -473,42 +441,43 @@ export function createHandler(
     // Only a live catalog knows which envelope Kiro accepts for this model;
     // with discovery off the translator's static table decides as before.
     const modelThinkingMode = catalog?.thinkingModeFor(upstreamModel);
+    const modelSupportsImages = catalog?.supportsImagesFor(upstreamModel) ?? supportsKiroImages(upstreamModel);
     if (!model || modelContextLength === undefined) {
-      return requestError(`Unknown model: ${model || "(missing)"}`);
+      return requestError(`Unknown model: ${model || "(missing)"}`, "unknown_model");
     }
     if (isCountTokens) {
       try {
         return Response.json({ input_tokens: countAnthropicTokens(body) });
       } catch (error) {
-        return requestError(safeErrorMessage(error, "Unable to count tokens"));
+        return requestError(safeErrorMessage(error, "Unable to count tokens"), "invalid_request");
       }
     }
     if (isMessages && !Array.isArray(body.messages)) {
-      return requestError("messages must be an array");
+      return requestError("messages must be an array", "invalid_request");
     }
     if (isChat) {
-      if (!Array.isArray(body.messages)) return requestError("messages must be an array");
+      if (!Array.isArray(body.messages)) return requestError("messages must be an array", "invalid_request");
       // Kiro cannot honor stop sequences. An empty or null `stop` is the default
       // most web clients send and means "none", so only a populated one is a
       // request the relay has to turn down.
       const stops = body.stop === undefined || body.stop === null ? [] : Array.isArray(body.stop) ? body.stop : [body.stop];
-      if (stops.length > 0) return requestError("Unsupported stop on this relay");
+      if (stops.length > 0) return requestError("Unsupported stop on this relay", "invalid_request");
       // Kiro has no constrained decoding, so a JSON response_format cannot be guaranteed.
       // Plain `{type: "text"}` is the default and asks for nothing.
       const responseFormat = body.response_format;
       const formatType = responseFormat && typeof responseFormat === "object" ? (responseFormat as Record<string, unknown>).type : undefined;
       if (responseFormat !== undefined && responseFormat !== null && formatType !== "text") {
-        return requestError("Unsupported response_format on this relay");
+        return requestError("Unsupported response_format on this relay", "invalid_request");
       }
       const oversizedImage = chatImageSizeError(body.messages);
-      if (oversizedImage) return requestError(oversizedImage);
+      if (oversizedImage) return requestError(oversizedImage, "invalid_request");
     }
 
     let credentials: ProviderCredentials;
     try {
       credentials = pendingCredentials ?? await loadCredentials(account.credentialFile);
     } catch {
-      return requestError("Unable to load configured credentials", 500, "api_error");
+      return requestError("Unable to load configured credentials", "credential_load_failed", 500, "api_error");
     }
 
     stream = body.stream === true;
@@ -518,9 +487,11 @@ export function createHandler(
       if ("credentials" in proactive) {
         credentials = proactive.credentials;
       } else if (proactive.error === "persist_failed") {
-        return requestError("Unable to persist refreshed credentials", 500, "api_error");
+        return requestError("Unable to persist refreshed credentials", "persist_failed", 500, "api_error");
+      } else if (proactive.error === "unrecoverable") {
+        return requestError("Kiro credentials expired; run auth:login again", "credential_expired", 401, "authentication_error");
       } else if (expiresWithin(credentials, 0)) {
-        return requestError("Kiro credentials expired", 401, "authentication_error");
+        return requestError("Kiro token refresh temporarily failed", "refresh_transient", 503, "api_error");
       }
     }
 
@@ -530,17 +501,17 @@ export function createHandler(
       if (isResponses) {
         const responsesBody = { ...body, model: upstreamModel } satisfies KiroResponsesRequest;
         buildPayload = (currentCredentials) =>
-          buildKiroResponsesPayload(upstreamModel, responsesBody, stream, currentCredentials);
+          buildKiroResponsesPayload(upstreamModel, responsesBody, stream, currentCredentials, modelSupportsImages);
       } else {
         // Chat Completions is already the shape the Kiro translator consumes, so
         // only the Anthropic surface needs converting first.
         const openaiBody = isChat ? body : anthropicToOpenAI(body);
         buildPayload = (currentCredentials) =>
-          buildKiroPayload(upstreamModel, openaiBody, stream, currentCredentials, modelThinkingMode);
+          buildKiroPayload(upstreamModel, openaiBody, stream, currentCredentials, modelThinkingMode, modelSupportsImages);
       }
       payload = buildPayload(credentials);
     } catch (error) {
-      return requestError(safeErrorMessage(error, "Unable to translate request"));
+      return requestError(safeErrorMessage(error, "Unable to translate request"), "translate_failed");
     }
     // Only a live catalog may override the executor's static context table, so
     // with discovery off the usage estimate resolves exactly as it did before.
@@ -548,8 +519,8 @@ export function createHandler(
     let result: { response: Response };
     try {
       result = await execute();
-    } catch {
-      return requestError("Kiro upstream request failed", 502, "api_error");
+    } catch (error) {
+      return requestError("Kiro upstream request failed", "upstream_fetch_failed", 502, "api_error", error);
     }
 
     const credentialsExpired = expiresWithin(credentials, 60_000);
@@ -559,15 +530,17 @@ export function createHandler(
       const reactive = await refreshAccount(model, log, rejectedAccessToken);
       if (!("credentials" in reactive)) {
         return reactive.error === "persist_failed"
-          ? requestError("Unable to persist refreshed credentials", 500, "api_error")
-          : requestError("Kiro credentials expired", 401, "authentication_error");
+          ? requestError("Unable to persist refreshed credentials", "persist_failed", 500, "api_error")
+          : reactive.error === "transient"
+            ? requestError("Kiro token refresh temporarily failed", "refresh_transient", 503, "api_error")
+            : requestError("Kiro credentials expired; run auth:login again", "credential_expired", 401, "authentication_error");
       }
       credentials = reactive.credentials;
       try {
         payload = buildPayload(credentials);
         result = await execute();
-      } catch {
-        return requestError("Kiro upstream request failed", 502, "api_error");
+      } catch (error) {
+        return requestError("Kiro upstream request failed", "upstream_fetch_failed", 502, "api_error", error);
       }
     }
 
@@ -575,29 +548,32 @@ export function createHandler(
       return upstreamError(result.response, isResponses || isChat, { requestId, model, stream });
     }
     metadataLog("REQUEST", { requestId, model, stream, status: result.response.status, phase: "accepted" });
+    let streamFailureLogged = false;
+    const onStreamFailure = (code: string) => {
+      if (streamFailureLogged) return;
+      streamFailureLogged = true;
+      metadataLog("REQUEST", { requestId, model, stream, phase: "stream_failed", code });
+    };
     try {
       if (isResponses) {
         const responseTools = responseToolMetadata(payload);
-        const options = responsesOptions(payload);
+        const options = { ...responsesOptions(payload), onStreamFailure };
         return identify(stream
           ? responsesStream(result.response, model, responseTools, options)
           : Response.json(await collectResponses(result.response, model, responseTools, options)));
       }
       if (isChat) {
-        // The executor already speaks Chat Completions, so a streaming turn is
-        // forwarded verbatim rather than translated and rebuilt.
         return identify(stream
-          ? new Response(result.response.body, {
-              headers: { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache" },
-            })
+          ? chatCompletionStream(result.response, model, { onStreamFailure })
           : await collectChatCompletion(result.response, model));
       }
       return identify(stream
-        ? openAIStreamToAnthropic(result.response, model)
+        ? openAIStreamToAnthropic(result.response, model, { onStreamFailure })
         : await collectAnthropicResponse(result.response, model));
     } catch (error) {
       return requestError(
         safeErrorMessage(error, "Unable to translate upstream response"),
+        "response_translate_failed",
         502,
         "api_error"
       );

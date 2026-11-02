@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { chmod, open, rename, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { chmod, open, realpath, rename, rm } from "node:fs/promises";
+import { basename, dirname, join, resolve } from "node:path";
 import type { ProviderCredentials } from "./kiro/base.ts";
+import { lock } from "proper-lockfile";
 
 function credentialsError(message: string): Error {
   return new Error(`Invalid credentials: ${message}`);
@@ -59,11 +60,40 @@ export async function loadCredentials(path: string): Promise<ProviderCredentials
   }
 }
 
-/** Atomically replace a credentials JSON file with mode 0600. */
-export async function saveCredentials(path: string, credentials: ProviderCredentials): Promise<void> {
+async function withCredentialLock<T>(path: string, update: (canonicalPath: string) => Promise<T>): Promise<T> {
   if (typeof path !== "string" || path.trim() === "") {
     throw new Error("Unable to save credentials: path must be a non-empty string");
   }
+  const absolute = resolve(path);
+  const canonicalPath = await realpath(absolute).catch(async () => join(await realpath(dirname(absolute)), basename(absolute)));
+  const release = await lock(canonicalPath, {
+    realpath: false,
+    retries: { retries: 50, minTimeout: 20, maxTimeout: 100 },
+  });
+  try {
+    return await update(canonicalPath);
+  } finally {
+    await release();
+  }
+}
+
+/** Atomically replace a credentials JSON file with mode 0600, coordinating all writers. */
+export async function saveCredentials(path: string, credentials: ProviderCredentials): Promise<void> {
+  await withCredentialLock(path, (canonicalPath) => writeCredentials(canonicalPath, credentials));
+}
+
+/** Best-effort profile enrichment must never replace credentials that have already rotated. */
+export async function saveCredentialProfile(path: string, initial: ProviderCredentials, profileArn: string): Promise<ProviderCredentials> {
+  return withCredentialLock(path, async (canonicalPath) => {
+    const current = await loadCredentials(canonicalPath);
+    if (current.accessToken !== initial.accessToken || current.refreshToken !== initial.refreshToken) return current;
+    const enriched = { ...current, providerSpecificData: { ...current.providerSpecificData, profileArn } };
+    await writeCredentials(canonicalPath, enriched);
+    return enriched;
+  });
+}
+
+async function writeCredentials(path: string, credentials: ProviderCredentials): Promise<void> {
   validateCredentials(credentials);
   let content: string;
   try {

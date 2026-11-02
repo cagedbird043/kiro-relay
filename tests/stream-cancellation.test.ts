@@ -2,8 +2,9 @@ import { expect, test } from "bun:test";
 import { openAIStreamToAnthropic } from "../src/anthropic.ts";
 import { responsesStream } from "../src/responses/response.ts";
 import { KiroExecutor } from "../src/kiro/executor.ts";
+import { chatCompletionStream } from "../src/chat.ts";
 
-for (const [name, adapt] of [["Anthropic", openAIStreamToAnthropic], ["Responses", responsesStream]] as const) {
+for (const [name, adapt] of [["Anthropic", openAIStreamToAnthropic], ["Responses", responsesStream], ["Chat", chatCompletionStream]] as const) {
   test(`${name} 在首块前和输出中取消均停止上游`, async () => {
     for (const started of [false, true]) {
       const cancelled = Promise.withResolvers<unknown>();

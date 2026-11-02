@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHandler, type ExecutorLike } from "../src/server.ts";
+import type { KiroRefreshResult } from "../src/kiro/refresh.ts";
 
 const config = (credentialFile: string) => ({
   listen: "127.0.0.1:0",
@@ -13,7 +14,7 @@ const config = (credentialFile: string) => ({
   accounts: [{ credentialFile }],
 });
 const request = (path: string, body?: unknown) => new Request(`http://relay${path}`, body === undefined ? undefined : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-const upstream = (stream = false, text = "hello") => new Response(stream ? `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\ndata: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n` : JSON.stringify({ choices: [{ message: { content: text }, finish_reason: "stop" }] }), { headers: { "content-type": stream ? "text/event-stream" : "application/json" } });
+const upstream = (stream = false, text = "hello") => new Response(stream ? `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\ndata: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "end_turn" }] })}\n\ndata: [DONE]\n\n` : JSON.stringify({ choices: [{ message: { content: text }, finish_reason: "end_turn" }] }), { headers: { "content-type": stream ? "text/event-stream" : "application/json" } });
 
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), "kiro-relay-server-"));
@@ -21,6 +22,36 @@ async function fixture() {
   await writeFile(credentials, JSON.stringify({ accessToken: "old", refreshToken: "refresh" }));
   return { dir, credentials, config: config(credentials) };
 }
+
+test("请求拒绝日志区分原因且不输出输入正文", async () => {
+  const f = await fixture();
+  const original = console.info;
+  const logs: unknown[][] = [];
+  console.info = (...args: unknown[]) => { logs.push(args); };
+  try {
+    const handler = createHandler(f.config, {
+      execute: async () => { throw new Error("must not call upstream"); },
+      refreshCredentials: async () => ({ ok: false, kind: "transient", code: "unused" }),
+    });
+    const cases: Array<[Request, string]> = [
+      [new Request("http://relay/v1/messages", { method: "POST", body: "private-invalid-json" }), "invalid_json"],
+      [request("/v1/messages", { model: "private-unknown-model", messages: [{ role: "user", content: "private-prompt" }] }), "unknown_model"],
+      [request("/v1/messages", { model: "claude-opus-5", messages: "private-invalid-messages" }), "invalid_request"],
+      [request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "private-prompt" }], stop_sequences: ["private-stop"] }), "translate_failed"],
+    ];
+    for (const [input, code] of cases) {
+      const response = await handler(input);
+      expect(response.status).toBe(400);
+      expect(logs.at(-1)).toEqual(["[REQUEST]", expect.objectContaining({ requestId: response.headers.get("request-id"), phase: "failed", code })]);
+    }
+    for (const secret of ["private-invalid-json", "private-prompt", "private-invalid-messages", "private-stop"]) {
+      expect(JSON.stringify(logs)).not.toContain(secret);
+    }
+  } finally {
+    console.info = original;
+    await rm(f.dir, { recursive: true, force: true });
+  }
+});
 
 test("刷新重试前释放旧响应且不影响新响应内容", async () => {
   const f = await fixture();
@@ -33,7 +64,7 @@ test("刷新重试前释放旧响应且不影响新响应内容", async () => {
         expect(cancelled).toBe(true);
         return { response: upstream(false, "恢复完成") };
       },
-      refreshCredentials: async () => ({ accessToken: "new", refreshToken: "rotated", expiresIn: 3600 }),
+      refreshCredentials: async () => ({ ok: true, accessToken: "new", refreshToken: "rotated", expiresIn: 3600 }),
     });
     const response = await handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "任务" }] }));
     expect(response.status).toBe(200);
@@ -52,7 +83,7 @@ test("官方模型名优先展示且点号写法路由到同一上游模型", as
         seen.push(input.model, payload.conversationState.currentMessage.userInputMessage.modelId);
         return { response: upstream() };
       },
-      refreshCredentials: async () => null,
+      refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
     });
     const models = await (await handler(new Request("http://relay/v1/models"))).json();
     expect(models.data.map((m: { id: string }) => m.id)).toEqual(["claude-opus-5-5"]);
@@ -75,11 +106,11 @@ test("轮换后保存失败保留新凭据并在文件恢复后共享重试保�
     const handler = createHandler(f.config, {
       refreshCredentials: async () => {
         refreshes++;
-        if (refreshes > 1) return { error: "unrecoverable_refresh_error", code: "invalid_grant" };
+        if (refreshes > 1) return { ok: false, kind: "unrecoverable", code: "invalid_grant" };
         // 目录占用目标文件名，确定性地令原子替换失败，不依赖进程权限。
         await rename(f.credentials, backup);
         await mkdir(f.credentials);
-        return { accessToken: "new", refreshToken: "rotated", expiresIn: 3600 };
+        return { ok: true, accessToken: "new", refreshToken: "rotated", expiresIn: 3600 };
       },
       execute: async ({ credentials }) => {
         executions++;
@@ -108,7 +139,7 @@ test("失败响应保留协议原因与关联编号且不泄漏原始正文", as
   try {
     for (const path of ["/v1/messages", "/v1/responses"]) {
       for (const reason of ["INVALID_MODEL_ID", "THINKING_SIGNATURE_INVALID"]) {
-        const handler = createHandler(f.config, { execute: async () => ({ response: Response.json({ reason, message: "敏感原始正文" }, { status: 400 }) }), refreshCredentials: async () => null });
+        const handler = createHandler(f.config, { execute: async () => ({ response: Response.json({ reason, message: "敏感原始正文" }, { status: 400 }) }), refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }) });
         const response = await handler(request(path, path.endsWith("responses") ? { model: "gpt-5.6-sol", input: "hi" } : { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }));
         expect(response.status).toBe(400);
         const text = await response.text();
@@ -125,7 +156,7 @@ test("不支持的停止序列在发送上游前明确拒绝", async () => {
   const f = await fixture();
   let calls = 0;
   try {
-    const handler = createHandler(f.config, { execute: async () => { calls++; return { response: upstream() }; }, refreshCredentials: async () => null });
+    const handler = createHandler(f.config, { execute: async () => { calls++; return { response: upstream() }; }, refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }) });
     const body = { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] };
     const rejected = await handler(request("/v1/messages", { ...body, stop_sequences: ["END"] }));
     expect(rejected.status).toBe(400);
@@ -141,7 +172,7 @@ test("Chat 入口拒绝 JSON 结构化输出且放行默认文本格式", async 
   const f = await fixture();
   let calls = 0;
   try {
-    const handler = createHandler(f.config, { execute: async () => { calls++; return { response: upstream() }; }, refreshCredentials: async () => null });
+    const handler = createHandler(f.config, { execute: async () => { calls++; return { response: upstream() }; }, refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }) });
     const body = { model: "claude-opus-5", messages: [{ role: "user", content: "起个标题" }] };
     for (const responseFormat of [{ type: "json_object" }, { type: "json_schema", json_schema: { name: "t", schema: { type: "object" } } }]) {
       const rejected = await handler(request("/v1/chat/completions", { ...body, response_format: responseFormat }));
@@ -158,7 +189,7 @@ test("三个入口都在发送上游前按名称拒绝超过 5 MB 的图片", as
   const f = await fixture();
   let calls = 0;
   try {
-    const handler = createHandler(f.config, { execute: async () => { calls++; return { response: upstream() }; }, refreshCredentials: async () => null });
+    const handler = createHandler(f.config, { execute: async () => { calls++; return { response: upstream() }; }, refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }) });
     const limit = 5 * 1024 * 1024;
     const bodies = (length: number) => {
       const data = "A".repeat(length);
@@ -184,7 +215,7 @@ describe("server routes", () => {
   test("health, models, and token count routes", async () => {
     const f = await fixture();
     try {
-      const handler = createHandler(f.config, { execute: async () => ({ response: upstream() }), refreshCredentials: async () => null });
+      const handler = createHandler(f.config, { execute: async () => ({ response: upstream() }), refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }) });
       expect((await handler(new Request("http://relay/healthz"))).status).toBe(200);
       expect((await handler(new Request("http://relay/v1/models"))).json()).resolves.toMatchObject({
         data: [
@@ -208,7 +239,7 @@ describe("server routes", () => {
     const f = await fixture();
     try {
       const calls: unknown[] = [];
-      const handler = createHandler(f.config, { execute: async (input) => { calls.push(input); return { response: upstream(input.stream) }; }, refreshCredentials: async () => null });
+      const handler = createHandler(f.config, { execute: async (input) => { calls.push(input); return { response: upstream(input.stream) }; }, refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }) });
       const nonstream = await handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }));
       expect(nonstream.status).toBe(200); expect((await nonstream.json()).content[0].text).toBe("hello");
       const stream = await handler(request("/v1/messages", { model: "claude-opus-5", stream: true, messages: [{ role: "user", content: "hi" }] }));
@@ -220,7 +251,7 @@ describe("server routes", () => {
     const f = await fixture();
     try {
       const seen: Parameters<ExecutorLike["execute"]>[0][] = [];
-      const executor: ExecutorLike = { execute: async (input) => { seen.push(input); return { response: seen.length === 1 ? new Response("expired", { status: 401 }) : upstream() }; }, refreshCredentials: async () => ({ accessToken: "new", refreshToken: "refresh2", expiresIn: 3600 }) };
+      const executor: ExecutorLike = { execute: async (input) => { seen.push(input); return { response: seen.length === 1 ? new Response("expired", { status: 401 }) : upstream() }; }, refreshCredentials: async () => ({ ok: true, accessToken: "new", refreshToken: "refresh2", expiresIn: 3600 }) };
       const before = Date.now();
       const response = await createHandler(f.config, executor).call(null, request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }));
       const saved = JSON.parse(await Bun.file(f.credentials).text()) as { accessToken: string; expiresAt: string };
@@ -244,7 +275,7 @@ describe("server routes", () => {
         },
         refreshCredentials: async () => {
           refreshes += 1;
-          return { accessToken: "new", refreshToken: "refresh2", expiresIn: 3600 };
+          return { ok: true, accessToken: "new", refreshToken: "refresh2", expiresIn: 3600 };
         },
       };
       const response = await createHandler(f.config, executor)(
@@ -266,14 +297,8 @@ describe("server routes", () => {
     const f = await fixture();
     try {
       await writeFile(f.credentials, JSON.stringify({ accessToken: "old", refreshToken: "refresh", expiresAt: "2020-01-01T00:00:00Z" }));
-      let releaseRefresh: (value: unknown) => void = () => undefined;
-      const refreshGate = new Promise<unknown>((resolve) => {
-        releaseRefresh = resolve;
-      });
-      let announceRefresh: () => void = () => undefined;
-      const refreshStarted = new Promise<void>((resolve) => {
-        announceRefresh = resolve;
-      });
+      const { promise: refreshGate, resolve: releaseRefresh } = Promise.withResolvers<KiroRefreshResult>();
+      const { promise: refreshStarted, resolve: announceRefresh } = Promise.withResolvers<void>();
       let refreshes = 0;
       const seen: Parameters<ExecutorLike["execute"]>[0][] = [];
       const executor: ExecutorLike = {
@@ -291,7 +316,7 @@ describe("server routes", () => {
       const first = handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "one" }] }));
       await refreshStarted;
       const second = handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "two" }] }));
-      releaseRefresh({ accessToken: "shared", refreshToken: "rotated", expiresIn: 3600 });
+      releaseRefresh({ ok: true, accessToken: "shared", refreshToken: "rotated", expiresIn: 3600 });
       const responses = await Promise.all([first, second]);
       expect(responses.map((response) => response.status)).toEqual([200, 200]);
       expect(refreshes).toBe(1);
@@ -306,14 +331,8 @@ describe("server routes", () => {
   test("concurrent 401 responses share one refresh-token rotation", async () => {
     const f = await fixture();
     try {
-      let releaseRefresh: (value: unknown) => void = () => undefined;
-      const refreshGate = new Promise<unknown>((resolve) => {
-        releaseRefresh = resolve;
-      });
-      let announceRefresh: () => void = () => undefined;
-      const refreshStarted = new Promise<void>((resolve) => {
-        announceRefresh = resolve;
-      });
+      const { promise: refreshGate, resolve: releaseRefresh } = Promise.withResolvers<KiroRefreshResult>();
+      const { promise: refreshStarted, resolve: announceRefresh } = Promise.withResolvers<void>();
       let refreshes = 0;
       const seen: Parameters<ExecutorLike["execute"]>[0][] = [];
       const executor: ExecutorLike = {
@@ -335,7 +354,7 @@ describe("server routes", () => {
       const first = handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "one" }] }));
       const second = handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "two" }] }));
       await refreshStarted;
-      releaseRefresh({ accessToken: "shared", refreshToken: "rotated", expiresIn: 3600 });
+      releaseRefresh({ ok: true, accessToken: "shared", refreshToken: "rotated", expiresIn: 3600 });
       const responses = await Promise.all([first, second]);
       expect(responses.map((response) => response.status)).toEqual([200, 200]);
       expect(refreshes).toBe(1);
@@ -356,7 +375,7 @@ describe("server routes", () => {
           seen.push(input);
           return { response: upstream() };
         },
-        refreshCredentials: async () => null,
+        refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
       };
       const response = await createHandler(f.config, executor)(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }));
       expect(response.status).toBe(200);
@@ -377,7 +396,7 @@ describe("server routes", () => {
           executions += 1;
           return { response: upstream() };
         },
-        refreshCredentials: async () => ({ error: "unrecoverable_refresh_error", code: "invalid_grant" }),
+        refreshCredentials: async () => ({ ok: false, kind: "unrecoverable", code: "invalid_grant" }),
       };
       const response = await createHandler(f.config, executor)(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }));
       expect(response.status).toBe(401);
@@ -398,7 +417,7 @@ describe("server routes", () => {
           seen.push(input);
           return { response: upstream(true, "responses-ok") };
         },
-        refreshCredentials: async () => null,
+        refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
       };
       const handler = createHandler(f.config, executor);
       const nonstream = await handler(
@@ -426,7 +445,7 @@ describe("server routes", () => {
     try {
       const executor: ExecutorLike = {
         execute: async () => ({ response: upstream(true) }),
-        refreshCredentials: async () => null,
+        refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
       };
       const handler = createHandler(f.config, executor);
       const unknown = await handler(
@@ -463,7 +482,7 @@ describe("server routes", () => {
         try {
           const handler = createHandler(f.config, {
             execute: async () => ({ response: new Response("upstream secret", { status, headers: { "retry-after": "17", "x-upstream-secret": "no" } }) }),
-            refreshCredentials: async () => null,
+            refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
           });
           const response = await handler(request(protocol.path, protocol.body));
           const body = await response.json() as { error: { type: string; message: string } };
@@ -488,7 +507,7 @@ describe("server routes", () => {
       try {
         const handler = createHandler(f.config, {
           execute: async () => ({ response: new Response("upstream secret", { status: 503, headers: { "retry-after": "17" } }) }),
-          refreshCredentials: async () => null,
+          refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
         });
         const response = await handler(request(path, body));
         const payload = await response.json() as { error: { type: string } };
@@ -515,7 +534,7 @@ describe("server routes", () => {
       try {
         const handler = createHandler(f.config, {
           execute: async () => ({ response: new Response(upstreamBody, { status: 500 }) }),
-          refreshCredentials: async () => null,
+          refreshCredentials: async () => ({ ok: false as const, kind: "transient" as const, code: "refresh_unavailable" }),
         });
         const response = await handler(request(path, body));
         const payload = await response.json() as { error: { type: string; message: string; code?: string } };
@@ -527,13 +546,92 @@ describe("server routes", () => {
     }
   });
 
-  test("executor and translator errors become Anthropic JSON errors", async () => {
+  test("上游异常按安全类别记录且正文与日志不泄露异常消息", async () => {
+    const f = await fixture();
+    const original = console.info;
+    const logs: unknown[][] = [];
+    console.info = (...args: unknown[]) => { logs.push(args); };
+    try {
+      for (const name of ["TimeoutError", "private-value-123"]) {
+        const handler = createHandler(f.config, {
+          execute: async () => {
+            const error = new Error("secret upstream payload");
+            error.name = name;
+            throw error;
+          },
+          refreshCredentials: async () => ({ ok: false, kind: "transient", code: "unused" }),
+        });
+        const response = await handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }));
+        expect(response.status).toBe(502);
+        expect(await response.json()).toEqual({ type: "error", error: { type: "api_error", message: "Kiro upstream request failed" } });
+        const metadata = logs.at(-1)?.[1] as Record<string, unknown>;
+        expect(metadata).toMatchObject({ requestId: response.headers.get("request-id"), phase: "failed", code: "upstream_fetch_failed", status: 502 });
+        if (name === "TimeoutError") expect(metadata.errorName).toBe(name);
+        else expect(metadata).not.toHaveProperty("errorName");
+      }
+      expect(JSON.stringify(logs)).not.toContain("secret upstream payload");
+      expect(JSON.stringify(logs)).not.toContain("private-value-123");
+    } finally {
+      console.info = original;
+      await rm(f.dir, { recursive: true, force: true });
+    }
+  });
+});
 
+describe("refresh failure HTTP contract", () => {
+  for (const path of ["/v1/messages", "/v1/chat/completions", "/v1/responses"]) {
+    for (const proactive of [false, true]) {
+      for (const kind of ["transient", "unrecoverable", "invalid_config"] as const) {
+        test(`${path} ${proactive ? "expired" : "rejected"} token maps ${kind} correctly`, async () => {
+          const f = await fixture();
+          try {
+            const initial = { accessToken: "old", refreshToken: "refresh", ...(proactive ? { expiresAt: "2020-01-01T00:00:00Z" } : {}) };
+            await writeFile(f.credentials, JSON.stringify(initial));
+            let executions = 0;
+            const handler = createHandler(f.config, {
+              execute: async () => { executions++; return { response: new Response("expired", { status: 401 }) }; },
+              refreshCredentials: async () => ({ ok: false, kind, code: "classified_failure" }),
+            });
+            const body = path.endsWith("responses")
+              ? { model: "gpt-5.6-sol", input: "hi" }
+              : { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] };
+            const response = await handler(request(path, body));
+            expect(response.status).toBe(kind === "transient" ? 503 : 401);
+            expect((await response.json()).error).toMatchObject({
+              type: kind === "transient" ? "api_error" : "authentication_error",
+              message: kind === "transient" ? "Kiro token refresh temporarily failed" : "Kiro credentials expired; run auth:login again",
+            });
+            expect(executions).toBe(proactive ? 0 : 1);
+            expect(JSON.parse(await Bun.file(f.credentials).text())).toEqual(initial);
+          } finally { await rm(f.dir, { recursive: true, force: true }); }
+        });
+      }
+    }
+  }
+
+  test("early unrecoverable refresh requires login even while the old token is valid", async () => {
     const f = await fixture();
     try {
-      const handler = createHandler(f.config, { execute: async () => { throw new Error("secret upstream payload"); }, refreshCredentials: async () => null });
-      const response = await handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }));
-      expect(response.status).toBe(502); expect(await response.json()).toEqual({ type: "error", error: { type: "api_error", message: "Kiro upstream request failed" } });
+      await writeFile(f.credentials, JSON.stringify({ accessToken: "valid", refreshToken: "refresh", expiresAt: new Date(Date.now() + 60_000).toISOString() }));
+      let executions = 0;
+      const handler = createHandler(f.config, {
+        execute: async () => { executions++; return { response: upstream() }; },
+        refreshCredentials: async () => ({ ok: false, kind: "unrecoverable", code: "invalid_grant" }),
+      });
+      expect((await handler(request("/v1/messages", { model: "claude-opus-5", messages: [{ role: "user", content: "hi" }] }))).status).toBe(401);
+      expect(executions).toBe(0);
+    } finally { await rm(f.dir, { recursive: true, force: true }); }
+  });
+
+  test("CORS permits conditional model requests and exposes retry advice", async () => {
+    const f = await fixture();
+    try {
+      const handler = createHandler(f.config);
+      const preflight = await handler(new Request("http://relay/v1/models", { method: "OPTIONS", headers: { "access-control-request-headers": "if-none-match" } }));
+      expect(preflight.headers.get("access-control-allow-headers")).toContain("if-none-match");
+      const models = await handler(new Request("http://relay/v1/models"));
+      expect(models.headers.get("access-control-expose-headers")).toContain("etag");
+      expect(models.headers.get("access-control-expose-headers")).toContain("retry-after");
     } finally { await rm(f.dir, { recursive: true, force: true }); }
   });
 });

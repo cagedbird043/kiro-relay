@@ -70,7 +70,7 @@ test("命名空间合成超长工具的声明选择和历史使用同一个上�
 test("继承属性同名工具可声明和返回且真正重复仍被拒绝", async () => {
   const tools = ["constructor", "__proto__"].map(name => ({ type: "function", name, parameters: { type: "object", properties: {} } }));
   const payload = buildKiroResponsesPayload(model, req({ input: "调用工具", tools }), false, credentials);
-  const response = await collectResponses(new Response(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: tools.map((tool, index) => ({ index, id: String(index), function: { name: tool.name, arguments: "{}" } })) }, finish_reason: "tool_calls" }] })}\n\n`), model, payload._responseToolMetadata);
+  const response = await collectResponses(new Response(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: tools.map((tool, index) => ({ index, id: String(index), function: { name: tool.name, arguments: "{}" } })) }, finish_reason: "tool_use" }] })}\n\n`), model, payload._responseToolMetadata);
   assert.deepEqual(response.output.filter(item => item.type === "function_call").map(item => item.name), ["constructor", "__proto__"]);
   for (const tool of tools) assert.throws(() => buildKiroResponsesPayload(model, req({ input: "调用工具", tools: [tool, tool] }), false, credentials));
 });
@@ -298,7 +298,6 @@ test("rejects unsupported models and malformed boundaries", () => {
   assert.throws(() => buildKiroResponsesPayload("gpt-5.6", req(), false, {}), /native-reasoning/);
   assert.throws(() => buildKiroResponsesPayload(model, req({ reasoning: { effort: "x" }}), false, {}), /reasoning.effort/);
   assert.throws(() => buildKiroResponsesPayload(model, req({ max_output_tokens: 0 }), false, {}), /positive integer/);
-  assert.throws(() => buildKiroResponsesPayload(model, req({ input: [{ type: "message", role: "user", content: [{ type: "input_image", image_url: "https://example.com/a.png" }]}]}), false, {}), /base64 data URL/);
   assert.throws(() => buildKiroResponsesPayload(model, req({ input: [{ type: "function_call_output", call_id: "c", output: 42 }]}), false, {}), /output must be/);
 });
 
@@ -328,7 +327,7 @@ test("maps namespaced and custom forced tool choices", () => {
 test("工具结果中的文本进 toolResult，图片随该批结果的用户回合原样送达", () => {
   const base = { type: "function_call_output", call_id: "call_1" };
   for (const output of ["ok", [{ type: "input_text", text: "o" }, { type: "input_text", text: "k" }]]) {
-    const payload = buildKiroResponsesPayload(model, req({ input: [{ ...base, output }] }), false, {});
+    const payload = buildKiroResponsesPayload(model, req({ input: [{ type: "function_call", call_id: "call_1", name: "read", arguments: "{}" }, { ...base, output }] }), false, {});
     assert.deepEqual(payload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults?.[0], { toolUseId: "call_1", status: "success", content: [{ text: "ok" }] });
   }
   const withImages = buildKiroResponsesPayload(model, req({ input: [
@@ -349,4 +348,18 @@ test("工具结果中的文本进 toolResult，图片随该批结果的用户回
 test("carries include encrypted content as internal metadata", () => {
   assert.equal(buildKiroResponsesPayload(model, req({ include: ["reasoning.encrypted_content"] }), false, {})._includeEncryptedContent, true);
   assert.equal(buildKiroResponsesPayload(model, req(), false, {})._includeEncryptedContent, false);
+});
+
+test("text.format accepts text and rejects structured output", () => {
+  assert.doesNotThrow(() => buildKiroResponsesPayload(model, req({ text: { format: { type: "text" } } }), false, {}));
+  for (const type of ["json_schema", "json_object"]) assert.throws(() => buildKiroResponsesPayload(model, req({ text: { format: { type } } }), false, {}), /Unsupported text.format on this relay/);
+});
+
+test("reasoning effort is optional and summary is independently validated", () => {
+  for (const reasoning of [{}, { effort: null }, { summary: "auto" }, { effort: null, summary: "concise" }]) {
+    const payload = buildKiroResponsesPayload(model, req({ reasoning }), false, {});
+    assert.equal(payload.additionalModelRequestFields, undefined);
+  }
+  assert.throws(() => buildKiroResponsesPayload(model, req({ reasoning: { summary: "invalid" } }), false, {}), /reasoning.summary/);
+  assert.throws(() => buildKiroResponsesPayload(model, req({ reasoning: { effort: "invalid" } }), false, {}), /reasoning.effort/);
 });

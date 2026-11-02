@@ -1,6 +1,6 @@
 /* Anthropic <-> Kiro wire adapters. */
-import { imageSizeViolation } from "./imageLimit.ts";
-import { readKiroEvents, type KiroEvent } from "./kiro/events.ts";
+import { imageSizeViolation, parseInlineImage } from "./imageLimit.ts";
+import { KiroStreamProtocolError, readKiroEvents, type KiroEvent } from "./kiro/events.ts";
 type Json = Record<string, unknown>;
 
 export function anthropicToOpenAI(body: Json): Json {
@@ -11,6 +11,7 @@ export function anthropicToOpenAI(body: Json): Json {
     if (unsupported) reject(`Unsupported output_config.${unsupported}`);
   }
   if ("speed" in body) reject("Unsupported speed");
+  if ("top_k" in body) reject("Unsupported top_k on this relay");
   if (body.stop_sequences !== undefined) {
     if (!Array.isArray(body.stop_sequences) || body.stop_sequences.some(value => typeof value !== "string")) reject("stop_sequences must be an array of strings");
     if ((body.stop_sequences as unknown[]).length) reject("Unsupported stop_sequences on this relay");
@@ -25,16 +26,8 @@ export function anthropicToOpenAI(body: Json): Json {
     if (!block || typeof block !== "object") return;
     const b = block as Json;
     if (b.type === "document") reject(`Unsupported ${location} document content`);
-    const source = b.source && typeof b.source === "object" ? b.source as Json : undefined;
-    const imageUrl = b.image_url && typeof b.image_url === "object" ? b.image_url as Json : undefined;
-    const remoteImage =
-      (b.type === "image" && source?.type === "url") ||
-      (b.type === "image_url" && typeof imageUrl?.url === "string" && !imageUrl.url.startsWith("data:"));
-    if (remoteImage) reject(`Unsupported ${location} remote image URL`);
-    if (b.type === "image" && source?.type === "base64") checkImageSize(source.data, `${path}.image.source.base64`);
-    if (b.type === "image_url" && typeof imageUrl?.url === "string" && imageUrl.url.startsWith("data:")) {
-      checkImageSize(imageUrl.url.slice(imageUrl.url.indexOf(",") + 1), `${path}.image_url.url`);
-    }
+    const image = parseInlineImage(b);
+    if (image) checkImageSize(image.bytes, `${path}.${b.type === "image" ? "image.source.base64" : "image_url.url"}`);
     if (b.type === "tool_result" && Array.isArray(b.content)) {
       b.content.forEach((item: unknown, index: number) => {
         if (!item || typeof item !== "object" || Array.isArray(item)) {
@@ -42,15 +35,14 @@ export function anthropicToOpenAI(body: Json): Json {
         }
         const structured = item as Json;
         const validText = structured.type === "text" && typeof structured.text === "string";
-        const imageSource = structured.source && typeof structured.source === "object" &&
-          !Array.isArray(structured.source) ? structured.source as Json : undefined;
-        const validBase64Image = structured.type === "image" && imageSource?.type === "base64" &&
-          typeof imageSource.media_type === "string" && imageSource.media_type.startsWith("image/") &&
-          typeof imageSource.data === "string" && imageSource.data.length > 0;
-        if (!validText && !validBase64Image) {
-          reject(`Unsupported ${location} structured tool_result content`);
-        }
-        if (validBase64Image) checkImageSize(imageSource.data, `${path}.content.${index}.image.source.base64`);
+        const source = structured.source && typeof structured.source === "object" ? structured.source as Json : undefined;
+        const validImage = structured.type === "image_url" || (structured.type === "image" && (
+          source?.type === "url" && typeof source.url === "string" ||
+          source?.type === "base64" && typeof source.media_type === "string" && source.media_type.startsWith("image/") && typeof source.data === "string" && source.data.length > 0 ||
+          typeof structured.image === "string"
+        ));
+        if (!validText && !validImage) reject(`Unsupported ${location} structured tool_result content`);
+        if (validImage) validateBlock(structured, location, `${path}.content.${index}`);
       });
     }
   };
@@ -147,7 +139,7 @@ function anthropicUsage(event?: Extract<KiroEvent, { type: "usage" }>): Json {
   };
 }
 
-export function openAIStreamToAnthropic(response: Response, model = "unknown"): Response {
+export function openAIStreamToAnthropic(response: Response, model = "unknown", options: { onStreamFailure?: (code: string) => void } = {}): Response {
   const encoder = new TextEncoder(); const messageId = makeId("msg");
   const abort = new AbortController();
   let ended = false;
@@ -212,6 +204,7 @@ export function openAIStreamToAnthropic(response: Response, model = "unknown"): 
       controller.close();
     } catch (error) {
       if (ended) return;
+      options.onStreamFailure?.(error instanceof KiroStreamProtocolError ? error.code : "stream_error");
       start();
       emit("error", { type: "error", error: { type: "api_error", message: error instanceof Error ? error.message : "upstream stream failed" } });
       ended = true;

@@ -173,20 +173,15 @@ export function parseEventFrame(data: Uint8Array): EventFrame | null {
 
       try {
         payload = JSON.parse(payloadStr);
-      } catch (parseError) {
-        const err = parseError instanceof Error ? parseError : new Error(String(parseError));
-        // Log parse error for debugging
-        console.warn(
-          `[Kiro] Failed to parse payload: ${err.message} | payload: ${payloadStr.substring(0, 100)}`
-        );
+      } catch {
+        console.warn(`[Kiro] payload_parse_failed bytes=${payloadEnd - payloadStart}`);
         payload = { raw: payloadStr };
       }
     }
 
     return { headers, payload };
-  } catch (err) {
-    const error = err instanceof Error ? err : new Error(String(err));
-    console.warn(`[Kiro] Frame parse error: ${error.message}`);
+  } catch {
+    console.warn("[Kiro] frame_parse_failed");
     return null;
   }
 }

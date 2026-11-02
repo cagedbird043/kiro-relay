@@ -305,3 +305,95 @@ describe("Kiro 设备登录", () => {
     expect(await Bun.file(outputPath).exists()).toBe(true);
   });
 });
+
+test("tokens are durable before profile discovery completes, then the shared region probe enriches them", async () => {
+  const outputPath = await destination();
+  const { promise: discoveryStarted, resolve: announceDiscovery } = Promise.withResolvers<void>();
+  const { promise: profile, resolve: releaseProfile } = Promise.withResolvers<Response>();
+  const probes: string[] = [];
+  const responses = [
+    json({ deviceCode: "device", userCode: "CODE", verificationUri: "https://verify", expiresIn: 600, interval: 1 }),
+    json({ accessToken: "durable", refreshToken: "refresh", expiresIn: 3600 }),
+  ];
+  const dependencies: DeviceLoginDependencies = {
+    fetch: async (input, init) => {
+      const next = responses.shift();
+      if (next) return next;
+      probes.push(String(input));
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+      if (probes.length === 1) {
+        announceDiscovery();
+        return profile;
+      }
+      return json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:222:profile/MINE" }] });
+    },
+    sleep: async () => undefined,
+    now: () => 1_000_000,
+    output: () => undefined,
+  };
+  const login = loginWithKiroOidc({ outputPath, region: "eu-north-1", clientId: "client", clientSecret: "secret" }, dependencies);
+  await discoveryStarted;
+  const saved = JSON.parse(await readFile(outputPath, "utf8"));
+  expect(saved.accessToken).toBe("durable");
+  expect(saved.refreshToken).toBe("refresh");
+  expect(saved.providerSpecificData.profileArn).toBeUndefined();
+  expect((await stat(outputPath)).mode & 0o777).toBe(0o600);
+  releaseProfile(json({ profiles: [] }));
+  const credentials = await login;
+  expect(probes).toEqual(["https://q.eu-central-1.amazonaws.com/", "https://codewhisperer.us-east-1.amazonaws.com/"]);
+  expect(credentials.providerSpecificData?.profileArn).toBe("arn:aws:codewhisperer:us-east-1:222:profile/MINE");
+  expect(JSON.parse(await readFile(outputPath, "utf8"))).toEqual(credentials);
+});
+
+test("profile 查询期间另一进程轮换凭据后，登录补存不覆盖新 token", async () => {
+  const outputPath = await destination();
+  const { promise: started, resolve: announce } = Promise.withResolvers<void>();
+  const { promise: profile, resolve: release } = Promise.withResolvers<Response>();
+  const responses = [
+    json({ deviceCode: "device", userCode: "CODE", verificationUri: "https://verify", expiresIn: 600, interval: 1 }),
+    json({ accessToken: "login-access", refreshToken: "login-refresh", expiresIn: 3600 }),
+  ];
+  const login = loginWithKiroOidc({ outputPath, clientId: "client", clientSecret: "secret" }, {
+    fetch: async () => {
+      const next = responses.shift();
+      if (next) return next;
+      announce();
+      return profile;
+    },
+    sleep: async () => undefined,
+    now: () => 1_000_000,
+    output: () => undefined,
+  });
+  try {
+    await started;
+    const worker = Bun.spawn([process.execPath, "--eval", `
+      import { loadCredentials, saveCredentials } from ${JSON.stringify(import.meta.resolve("../src/credentials.ts"))};
+      const path = ${JSON.stringify(outputPath)};
+      const current = await loadCredentials(path);
+      await saveCredentials(path, { ...current, accessToken: "rotated-access", refreshToken: "rotated-refresh", expiresAt: "2030-01-01T00:00:00.000Z" });
+    `], { stdout: "pipe", stderr: "pipe" });
+    expect(await worker.exited).toBe(0);
+  } finally {
+    release(json({ profiles: [{ arn: "arn:aws:codewhisperer:us-east-1:222:profile/MINE" }] }));
+  }
+  const returned = await login;
+  const saved = JSON.parse(await readFile(outputPath, "utf8"));
+  expect(saved.accessToken).toBe("rotated-access");
+  expect(saved.refreshToken).toBe("rotated-refresh");
+  expect(saved.expiresAt).toBe("2030-01-01T00:00:00.000Z");
+  expect(saved.providerSpecificData.profileArn).toBeUndefined();
+  expect(returned).toEqual(saved);
+  expect((await stat(outputPath)).mode & 0o777).toBe(0o600);
+});
+
+test("login uses the shared AWS region validator before network access", async () => {
+  let fetches = 0;
+  const dependencies: DeviceLoginDependencies = {
+    fetch: async () => { fetches++; throw new Error("unexpected fetch"); },
+    sleep: async () => undefined, now: () => 1_000_000, output: () => undefined,
+  };
+  await expect(loginWithKiroOidc({ outputPath: await destination(), region: "us-east-1.attacker.example" }, dependencies)).rejects.toThrow("canonical region");
+  expect(fetches).toBe(0);
+  await expect(loginWithKiroOidc({ outputPath: await destination(), region: "us-gov-west-1" }, dependencies)).rejects.toThrow("unexpected fetch");
+  expect(fetches).toBe(1);
+});

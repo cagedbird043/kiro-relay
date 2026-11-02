@@ -77,6 +77,7 @@ export type KiroModel = {
   };
   /** Envelope the model accepts, read off its live catalog schema. */
   thinkingMode?: KiroThinkingMode;
+  supportsImages?: boolean;
   contextLength?: number;
   rateMultiplier?: number;
   upstreamModelId?: string;
@@ -210,6 +211,7 @@ function expandKiroModels(data: unknown): KiroModel[] {
       seen.add(variant.id);
       expanded.push({
         ...variant,
+        supportsImages: !Array.isArray(item.supportedInputTypes) || item.supportedInputTypes.includes("IMAGE"),
         contextLength,
         rateMultiplier: Number.isFinite(rateMultiplier) ? rateMultiplier : 1.0,
         upstreamModelId: upstreamId,
