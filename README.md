@@ -102,6 +102,14 @@ const reply = await client.chat.completions.create({
 
 `GET /v1/models` 返回当前可用模型及其 `context_length`、`input_modalities`（`["text","image"]` 或 `["text"]`），支持 `ETag` / `If-None-Match`。图片能力优先采用 Kiro 目录的 `supportedInputTypes`；离线时仅 deepseek-3.2、minimax-m2.1、minimax-m2.5、glm-5、qwen3-coder-next 禁用图片，其余模型默认支持。浏览器预检允许 `If-None-Match`，客户端可读取 `ETag` 和 `Retry-After` 响应头。`GET /healthz` 用于健康检查，不需要鉴权。
 
+`GET /v1/usage` 查询 Kiro 账号本期额度（与 `/v1` 同一套鉴权，不消耗额度），数据来自 Kiro 的 `GetUsageLimits`：
+
+```sh
+curl -H "Authorization: Bearer <key>" https://relay.example/v1/usage
+# {"subscription":"KIRO POWER","overage_enabled":false,"resets_at":"2026-12-01T00:00:00.000Z",
+#  "buckets":[{"resource":"CREDIT","unit":"INVOCATIONS","used":4939.23,"limit":10000,"remaining":5060.77,"percent":49.39,...}]}
+```
+
 ## 已知限制
 
 - 图片只发送 base64 内联，单张 base64 不超过 5 MB（含工具结果内嵌图片）；超限仍报错，客户端可以据此自动压缩后重试。远程 URL 在原位置替换为 `[image omitted: remote image URLs are not supported, send base64 inline]`，不支持图片的模型收到内联图时替换为 `[image omitted: this model does not support image input]`；两种情况均不发送图片字节，也不拒绝请求。`document` 内容块仍不支持。

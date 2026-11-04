@@ -26,6 +26,7 @@ import {
 } from "./responses/response.ts";
 import { createCatalog, type Catalog } from "./catalog.ts";
 import { chatCompletionStream, collectChatCompletion } from "./chat.ts";
+import { fetchKiroUsage, type KiroUsageResult } from "./kiro/usage.ts";
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
 
@@ -247,9 +248,9 @@ function responsesOptions(payload: unknown): ResponsesOptions {
 export function createHandler(
   config: AppConfig,
   executor: ExecutorLike = new KiroExecutor(),
-  options: { catalog?: Catalog } = {}
+  options: { catalog?: Catalog; fetchUsage?: (credentials: ProviderCredentials) => Promise<KiroUsageResult> } = {}
 ) {
-  const { catalog } = options;
+  const { catalog, fetchUsage = fetchKiroUsage } = options;
   const account = config.accounts[0];
   const refreshFlights = new Map<string, Promise<CredentialRefreshOutcome>>();
   // 刷新令牌可能已轮换；落盘成功前由当前进程持有，后续请求先重试保存。
@@ -346,6 +347,42 @@ export function createHandler(
       return url.pathname.startsWith("/v1/messages")
         ? anthropicError("Invalid API key", 401, "authentication_error")
         : openAIError("Invalid API key", 401, "invalid_request_error");
+    }
+    if (method === "GET" && url.pathname === "/v1/usage") {
+      const usageError = (message: string, code: string, status: number, type = "api_error") => {
+        metadataLog("USAGE", { status, phase: "failed", category: type, code });
+        return openAIError(message, status, type);
+      };
+      const refreshFailure = (error: "unrecoverable" | "transient" | "persist_failed") =>
+        error === "persist_failed"
+          ? usageError("Unable to persist refreshed credentials", "persist_failed", 500)
+          : error === "transient"
+            ? usageError("Kiro token refresh temporarily failed", "refresh_transient", 503)
+            : usageError("Kiro credentials expired; run auth:login again", "credential_expired", 401, "authentication_error");
+      let credentials: ProviderCredentials;
+      try {
+        credentials = pendingCredentials ?? await loadCredentials(account.credentialFile);
+      } catch {
+        return usageError("Unable to load configured credentials", "credential_load_failed", 500);
+      }
+      const log = executorLog("usage");
+      if (pendingCredentials || expiresWithin(credentials, REFRESH_LEAD_MS)) {
+        const proactive = await refreshAccount("usage", log);
+        if ("credentials" in proactive) credentials = proactive.credentials;
+        else if (proactive.error !== "transient" || expiresWithin(credentials, 0)) return refreshFailure(proactive.error);
+      }
+      let result = await fetchUsage(credentials);
+      if (result.ok === false && (result.status === 401 || (result.status === 403 && expiresWithin(credentials, 60_000)))) {
+        const reactive = await refreshAccount("usage", log, credentials.accessToken);
+        if (!("credentials" in reactive)) return refreshFailure(reactive.error);
+        result = await fetchUsage(reactive.credentials);
+      }
+      if (result.ok === false) {
+        return result.status === 429
+          ? usageError("Kiro usage query rate limited", result.code, 429, "rate_limit_error")
+          : usageError(`Kiro usage query failed: ${result.code}`, result.code, 502);
+      }
+      return Response.json(result.usage);
     }
     if (method === "GET" && url.pathname === "/v1/models") {
       // With discovery active the catalog is Kiro's own entitlement list; without
