@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { KiroExecutor } from "../../src/kiro/executor.ts";
+import { KIRO_RELAY_PREAMBLE, KiroExecutor } from "../../src/kiro/executor.ts";
 import { anthropicToOpenAI, collectAnthropicResponse, openAIStreamToAnthropic } from "../../src/anthropic.ts";
 import { buildKiroPayload } from "../../src/kiro/request/openai-to-kiro.ts";
 import { collectResponses, responsesStream } from "../../src/responses/response.ts";
@@ -400,6 +400,28 @@ test("KiroExecutor.transformRequest forwards additionalModelRequestFields (think
     thinking: { type: "adaptive", display: "summarized" },
     max_tokens: 32000,
   });
+});
+
+test("KiroExecutor.transformRequest 在首个用户回合前置固定的 relay 声明，且不重复、不改动后续回合", () => {
+  const executor = new KiroExecutor();
+  const body = buildKiroPayload("claude-sonnet-4-5", {
+    messages: [
+      { role: "system", content: "client rules" },
+      { role: "user", content: "first" },
+      { role: "assistant", content: "answer" },
+      { role: "user", content: "second" },
+    ],
+  }, true, {});
+  const once = executor.transformRequest("claude-sonnet-4-5", body, true, {}) as unknown as typeof body;
+  const first = once.conversationState.history[0].userInputMessage!.content;
+  assert.equal(first, `${KIRO_RELAY_PREAMBLE}\n\n<system-reminder>\nclient rules\n</system-reminder>\n\nfirst`);
+  assert.equal(once.conversationState.currentMessage.userInputMessage.content, "second");
+  assert.equal(body.conversationState.history[0].userInputMessage!.content.startsWith(KIRO_RELAY_PREAMBLE), false);
+  const twice = executor.transformRequest("claude-sonnet-4-5", once, true, {}) as unknown as typeof body;
+  assert.equal(twice.conversationState.history[0].userInputMessage!.content, first);
+
+  const single = executor.transformRequest("claude-sonnet-4-5", buildKiroPayload("claude-sonnet-4-5", { messages: [{ role: "user", content: "hi" }] }, true, {}), true, {}) as unknown as typeof body;
+  assert.equal(single.conversationState.currentMessage.userInputMessage.content, `${KIRO_RELAY_PREAMBLE}\n\nhi`);
 });
 
 test("KiroExecutor.transformEventStreamToSSE converts text, tool calls, usage and DONE", async () => {
