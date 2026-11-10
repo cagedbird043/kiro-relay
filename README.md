@@ -133,6 +133,17 @@ bun dist/server.js
 
 用 systemd 运行时，建议加上 `ProtectSystem=strict`、`ProtectHome=read-only`，并只给凭据目录写权限（例如 `ReadWritePaths=/home/<user>/.config/kiro-relay`，systemd 不展开 `~`），让 token 刷新后能写回。
 
+若健康检查正常但生成请求返回 403，上游可能在拒绝过期客户端：本次实测返回 `FEATURE_NOT_SUPPORTED`，消息为 “This version of Kiro is no longer supported”。生成请求的 `User-Agent` 与 `X-Amz-User-Agent` 必须包含上游识别的 `KiroIDE-<版本>` 标记；版本可核对[官方稳定版元数据](https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json)。更新 `src/kiro/config.ts` 后重新构建、重启，并以真实生成请求验证，不能只看 `/healthz`。
+
+线上更新通过 Git 同步源码，再安装锁定依赖、构建并重启服务：
+
+```sh
+git pull --ff-only
+bun install --frozen-lockfile
+bun run build
+sudo systemctl restart kiro-relay
+```
+
 ## 开发
 
 ```sh

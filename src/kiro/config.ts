@@ -3,8 +3,8 @@ export const KIRO_PROVIDER = {
     "Content-Type": "application/json",
     Accept: "application/vnd.amazon.eventstream",
     "X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
-    "User-Agent": "AWS-SDK-JS/3.0.0 kiro-ide/1.0.0",
-    "X-Amz-User-Agent": "aws-sdk-js/3.0.0 kiro-ide/1.0.0",
+    "User-Agent": "aws-sdk-js/3.0.0 KiroIDE-1.4.121",
+    "X-Amz-User-Agent": "aws-sdk-js/3.0.0 KiroIDE-1.4.121",
   },
   tokenUrl: "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken",
 } as const;
