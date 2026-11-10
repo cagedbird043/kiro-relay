@@ -138,7 +138,7 @@ bun dist/server.js
 线上更新通过 Git 同步源码，再安装锁定依赖、构建并重启服务：
 
 ```sh
-git pull --ff-only
+git pull --ff-only origin main
 bun install --frozen-lockfile
 bun run build
 sudo systemctl restart kiro-relay
